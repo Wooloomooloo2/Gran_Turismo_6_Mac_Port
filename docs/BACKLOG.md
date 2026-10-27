@@ -12,7 +12,14 @@ Shortcuts taken, with the proper fix logged. Priority order: 1) Stability, 2) Pe
 - `scripts/prepare_play.py` does not reproduce the EBOOT's `K/4D` comparison before each node-info merge (0x161ac, 0x32b88); it only checks that `K/4D` exists. It is exact for v1.22 (hash-checked against the real EBOOT's output), but decode the check before using the script on any other edition or version.
 - EMAIN's first run installs the staged `TPPS-*` data into `USRDIR/PDIPFS` (more than 5 minutes under RPCS3). It runs in the play folder (D32), but check that a cut-off install resumes safely, and decide what the player's app does when the play folder is stale.
 
+- SPURS job chains: GT6 dispatches at least 16 distinct raw SPU job binaries (in EMAIN's data, e.g. 0x0146B400 64,912 B, 0x014C0F00 53,280 B) and a `Wws_Job` policy module (0x01468200, 12,160 B) that the translate step does not find or lift, so the HLE job chain drops them and fabricates completion events (`jc_signal_done`: data2 = job index). GT6's event-queue-3 worker (func_00A96028) uses data2 as a callback index, so a made-up event can call garbage (seen once, round 5). Proper fix: find and lift these images at translate time and let the real job code send its own events (FINDINGS, bring-up log).
+- 312 of EMAIN's 740 imports have no ps3recomp handler (scratch audit by NID hash against the runtime's registrations; most are online, Sail/Rec, NP, USB). Boot-relevant ones still unresolved after round 6: `cellVideoOutGetScreenSize`, `cellSpursInitializeWithAttribute2`, `cellSpursGetWorkloadFlag`, `_cellSpursWorkloadFlagReceiver2`, `cellSpursDestroyTaskset2`, `sys_mempool_create`, `sys_prx_get_module_list`, three `cellUsbd*`. Each faked CELL_OK today; implement or give explicit "not available" answers (RPCS3-modelled), and make the audit a script.
+- `scripts/apply_ps3recomp_patches.sh` detects "already applied" by reverse-applying each patch to the final tree, so a later patch whose hunks sit within 3 lines of an earlier patch's makes the earlier one read as "neither applies". Patches 0002/0003 were laid out to avoid this. Proper fix: apply onto a clean checkout in order (or record applied patches) instead of reverse-checking each.
+- ps3recomp's `cellKb` reports a keyboard always connected on port 0 and caps `CELL_KB_MAX_KEYBOARDS` at 2 (SDK: 127). Check what GT6 does with a keyboard present versus RPCS3's default null keyboard.
+
 ## 2) Performance
+
+- The lwcond waiter queue (patch 0005) is one lock and one condition variable for every lwcond; each signal wakes all waiters to check their own flag. Fine for boot; give each lwcond its own channel if a profile shows wakeup storms.
 
 - Lifted PPU code is compiled at `-O1` (D30). Measure `-O2`/`-O3` compile time and frame
   time in milestone 5 (locked 60) and pick the level from that.
