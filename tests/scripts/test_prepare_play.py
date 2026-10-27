@@ -121,6 +121,63 @@ def test_refuses_existing_play_without_force(tmp_path):
     assert marker.read_text() == "99.98 99.99"
 
 
+def test_force_refuses_a_folder_this_tool_did_not_make(tmp_path):
+    tree = tmp_path / "tree"
+    make_tree(tree)
+    (tree / "play").mkdir()
+    (tree / "play" / "keep.txt").write_text("not ours")
+    with pytest.raises(SystemExit, match="prepare.json"):
+        prepare_play.prepare(tree, force=True)
+    assert (tree / "play" / "keep.txt").read_text() == "not ours"
+    # A prepare.json written by something else does not count either.
+    (tree / "play" / "prepare.json").write_text('{"tool": "something else"}')
+    with pytest.raises(SystemExit, match="prepare.json"):
+        prepare_play.prepare(tree, force=True)
+    assert (tree / "play" / "keep.txt").read_text() == "not ours"
+
+
+def test_force_never_deletes_the_tree_or_its_ancestors(tmp_path):
+    tree = tmp_path / "tree"
+    make_tree(tree)
+    for target in (tree, tmp_path):
+        (target / "prepare.json").write_text('{"tool": "scripts/prepare_play.py"}')
+        with pytest.raises(SystemExit, match="verified tree"):
+            prepare_play.prepare(tree, out=target, force=True)
+        assert (tree / "build.json").is_file()
+
+
+def test_failure_leaves_no_half_prepared_folder(tmp_path, monkeypatch):
+    tree = tmp_path / "tree"
+    make_tree(tree)
+
+    def boom(root):
+        raise RuntimeError("interrupted")
+
+    monkeypatch.setattr(prepare_play, "apply_eboot_effects", boom)
+    with pytest.raises(RuntimeError):
+        prepare_play.prepare(tree)
+    assert not (tree / "play").exists()
+    assert sorted(p.name for p in tree.iterdir()) == ["build.json", "dev_hdd0"]
+    # An existing play folder survives a failed --force.
+    monkeypatch.undo()
+    prepare_play.prepare(tree)
+    first = (tree / "play" / "prepare.json").read_text()
+    monkeypatch.setattr(prepare_play, "apply_eboot_effects", boom)
+    with pytest.raises(RuntimeError):
+        prepare_play.prepare(tree, force=True)
+    assert (tree / "play" / "prepare.json").read_text() == first
+    assert sorted(p.name for p in tree.iterdir()) == ["build.json", "dev_hdd0", "play"]
+
+
+def test_cli_has_no_out_option(tmp_path):
+    tree = tmp_path / "tree"
+    make_tree(tree)
+    r = subprocess.run([sys.executable, str(SCRIPT), str(tree), "--out", str(tmp_path / "x")],
+                       capture_output=True, text=True)
+    assert r.returncode == 2 and "--out" in r.stderr
+    assert not (tmp_path / "x").exists()
+
+
 def test_refuses_output_inside_a_git_work_tree(tmp_path):
     tree = tmp_path / "tree"
     make_tree(tree)

@@ -3,12 +3,12 @@
 """Make the play folder the port runs on (dev-only, never shipped).
 
 Usage:
-    .venv/bin/python scripts/prepare_play.py <tree> [--force] [--out <dir>]
+    .venv/bin/python scripts/prepare_play.py <tree> [--force]
 
 <tree> is a verified gt6unpack build tree. The game never runs on it: EMAIN's first
 run moves thousands of files inside dev_hdd0 (FINDINGS, "What the 1.22 EBOOT leaves
-on disk"). This script clones <tree>/dev_hdd0 to <out>/dev_hdd0 (default
-<tree>/play) as an APFS clone (cp -c -R, no extra space), then applies exactly what
+on disk"). This script clones <tree>/dev_hdd0 to <tree>/play/dev_hdd0 as an
+APFS clone (cp -c -R, no extra space), then applies exactly what
 the 1.22 EBOOT.BIN changes on disk before it spawns EMAIN.SELF (D31, D32):
 
 1. TPPS-01.07/update.txt is overwritten with "99.98 99.99" (boot function 0x123e0).
@@ -17,9 +17,11 @@ the 1.22 EBOOT.BIN changes on disk before it spawns EMAIN.SELF (D31, D32):
    as the EBOOT's 0x1143c does (merge_node_info), written to UPDATENODEINFO.upd and
    renamed over UPDATENODEINFO.
 
-<out>/prepare.json records what was applied, the source tree's build.json identity and
+<tree>/play/prepare.json records what was applied, the source tree's build.json identity and
 the time. An existing play folder is refused without --force (a first run has changed
-it); --force deletes it and clones again. <out> must be outside any git work tree.
+it); --force replaces it, and only if it holds this tool's prepare.json. The folder is
+built beside it and renamed into place once complete, so an interrupted run leaves
+no half-prepared play folder. It must be outside any git work tree.
 """
 import argparse
 import datetime
@@ -180,9 +182,29 @@ def apply_eboot_effects(root):
     return applied
 
 
+TOOL = "scripts/prepare_play.py"
+STAGING_MARK = ".prepare_play-staging"
+
+
+def _made_by_us(folder):
+    """True if folder holds a prepare.json written by this tool."""
+    try:
+        return json.loads((Path(folder) / "prepare.json").read_text()).get("tool") == TOOL
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 def prepare(tree, out=None, force=False):
+    """Make the play folder (default <tree>/play; out= is for tests only, the CLI has none).
+
+    The folder is built in a staging folder beside it and renamed into place only after
+    prepare.json is written, so an interrupted run never leaves a play folder without the
+    EBOOT's effects. Only a folder holding this tool's prepare.json is ever replaced, and
+    never the tree itself or a folder that contains it."""
     tree = Path(tree).resolve()
     out = Path(out).resolve() if out else tree / "play"
+    if out == tree or out in tree.parents:
+        raise SystemExit(f"error: {out} is the verified tree or contains it; refusing")
     if in_git_work_tree(out):
         raise SystemExit(f"error: {out} is inside a git work tree; the play folder holds "
                          "game files and must be outside the repository (D26)")
@@ -193,35 +215,56 @@ def prepare(tree, out=None, force=False):
         if not force:
             raise SystemExit(f"error: {out} exists (a first run has changed it); "
                              "use --force to delete it and clone the verified tree again")
-        shutil.rmtree(out)
-    out.mkdir(parents=True)
-    subprocess.run(["cp", "-c", "-R", str(hdd0), str(out / "dev_hdd0")], check=True)
-    applied = apply_eboot_effects(out)
-    build = tree / "build.json"
-    info = json.loads(build.read_text()) if build.is_file() else {}
-    record = {
-        "tool": "scripts/prepare_play.py",
-        "source": {"tree": str(tree),
-                   "build_json_sha256": _sha256(build) if build.is_file() else None,
-                   **{k: info.get(k) for k in ("tool", "tool_version", "title_id",
-                                               "final_app_ver")}},
-        "applied": applied,
-        "notes": ["The EBOOT also reads TPPS-MM.mm/PDIPFS/K/4D and compares it before the "
-                  "merge (0x161ac, 0x32b88); that check is not reproduced, only that K/4D "
-                  "exists. It passed for all five versions in the measured run (FINDINGS)."],
-        "time": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
-    }
-    (out / "prepare.json").write_text(json.dumps(record, indent=1) + "\n")
+        if not _made_by_us(out):
+            raise SystemExit(f"error: {out} has no prepare.json written by {TOOL}; "
+                             "refusing to delete a folder this tool did not make")
+    staging = out.with_name("." + out.name + ".staging")
+    if staging.exists():
+        if not (staging / STAGING_MARK).is_file():
+            raise SystemExit(f"error: {staging} exists and was not made by {TOOL}; refusing")
+        shutil.rmtree(staging)                 # left behind by a killed run
+    staging.mkdir(parents=True)
+    try:
+        (staging / STAGING_MARK).write_text("")
+        subprocess.run(["cp", "-c", "-R", str(hdd0), str(staging / "dev_hdd0")], check=True)
+        applied = apply_eboot_effects(staging)
+        build = tree / "build.json"
+        info = json.loads(build.read_text()) if build.is_file() else {}
+        record = {
+            "tool": TOOL,
+            "source": {"tree": str(tree),
+                       "build_json_sha256": _sha256(build) if build.is_file() else None,
+                       **{k: info.get(k) for k in ("tool", "tool_version", "title_id",
+                                                   "final_app_ver")}},
+            "applied": applied,
+            "notes": ["The EBOOT also reads TPPS-MM.mm/PDIPFS/K/4D and compares it before the "
+                      "merge (0x161ac, 0x32b88); that check is not reproduced, only that K/4D "
+                      "exists. It passed for all five versions in the measured run (FINDINGS)."],
+            "time": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        }
+        (staging / "prepare.json").write_text(json.dumps(record, indent=1) + "\n")
+        (staging / STAGING_MARK).unlink()
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    old = None
+    if out.exists():                            # checked above: ours, and --force given
+        old = out.with_name("." + out.name + ".old")
+        if old.exists():
+            shutil.rmtree(old)
+        out.rename(old)
+    staging.rename(out)
+    if old is not None:
+        shutil.rmtree(old)
     return record
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("tree", type=Path, help="verified gt6unpack build tree")
-    ap.add_argument("--out", type=Path, help="play folder (default <tree>/play)")
     ap.add_argument("--force", action="store_true", help="delete an existing play folder first")
     args = ap.parse_args(argv)
-    rec = prepare(args.tree, args.out, args.force)
+    rec = prepare(args.tree, force=args.force)
     for a in rec["applied"]:
         print(f"applied {a['path']}: {a['change']}")
     return 0

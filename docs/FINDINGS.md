@@ -41,6 +41,14 @@ is byte-identical to the folder the real EBOOT left under RPCS3: `eboot_effects.
 the two snapshots shows nothing added, removed or changed (21,653 entries). The SHA-256 of the
 6 files are pinned in `tests/scripts/test_prepare_play.py`, which checks them when `GT6_TREE`
 is set. The port runs on the play folder; the verified tree is never run (D32).
+- `prepare_play.py` builds the folder in `<tree>/.play.staging` and writes `prepare.json`
+  last, then renames the folder into place. An interrupted run leaves no half-prepared
+  folder.
+- `--force` replaces only a folder holding this tool's `prepare.json`, and never the tree or a
+  folder that contains it.
+- The port refuses a `/dev_hdd0` folder that has no `prepare.json` beside it. For the default
+  that is `<tree>/play/prepare.json`; for a `PS3_HDD0_ROOT` override it is
+  `$PS3_HDD0_ROOT/../prepare.json`.
 
 Measured with RPCS3 0.0.43-20410 (official build, firmware 4.50) on an APFS clone (`cp -c -R`)
 of the verified `dev_hdd0/game/BCES01977`, installed as RPCS3's `dev_hdd0/game/BCES01977`,
@@ -156,7 +164,12 @@ arguments `_sys_process_exit2` receives):
   `/dev_hdd0/game/BCES01977/`.
 - Booted directly (run 3b), RPCS3 gives EMAIN argc = 1 (the path only). EMAIN behaved the
   same up to the `TPPS-01.07` decision above, so argc 1 or 2 made no visible difference there.
-  The port follows the contract (argc = 2).
+  The port follows the contract (argc = 2). `port/main.cpp` sets `PS3_BOOT_PATH` and
+  `PS3_ARGV` to the EMAIN path, unless the caller has set them. From those, ps3recomp's
+  `ppu_run` builds the entry's argc, argv and empty envp in lv2's layout. Without this, the
+  guest's `argv[0]` was ps3recomp's default, `/dev_bdvd/PS3_GAME/USRDIR/EBOOT.BIN`. The port
+  prints `[boot] guest argv: argc=2 ...; envp empty` at start, and the real port test checks
+  that line.
 
 ## Building the port (2026-10-27)
 

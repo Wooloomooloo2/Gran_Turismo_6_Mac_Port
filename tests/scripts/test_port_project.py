@@ -96,7 +96,7 @@ def test_apply_check_fails_on_a_patch_that_does_not_apply(tmp_path):
 @pytest.mark.slow
 @needs_cmake
 @pytest.mark.skipif(not os.environ.get("GT6_TREE"), reason="GT6_TREE not set (needs the translated v1.22 tree)")
-def test_real_port_builds():
+def test_real_port_builds(tmp_path):
     tree = Path(os.environ["GT6_TREE"])
     build = tree / "port-build"
     p = configure(build, "-DGT6_BUILD_PORT=ON", f"-DGT6_TREE={tree}", "-DCMAKE_BUILD_TYPE=Release")
@@ -116,6 +116,24 @@ def test_real_port_builds():
                        env=env)
     assert p.returncode != 0
     assert "scripts/prepare_play.py" in (p.stdout + p.stderr)
+    # A dev_hdd0 folder without the prepare.json beside it is refused too.
+    bare = tmp_path / "bare"
+    (bare / "dev_hdd0").mkdir(parents=True)
+    env = dict(os.environ, PS3_HDD0_ROOT=str(bare / "dev_hdd0"))
+    p = subprocess.run([str(exe), "unused.elf"], capture_output=True, text=True, timeout=30,
+                       env=env)
+    assert p.returncode != 0
+    assert "prepare.json" in (p.stdout + p.stderr)
+    # With the play folder prepared, the guest command line is the launch contract (D31).
+    if (tree / "play" / "prepare.json").is_file():
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("PS3_HDD0_ROOT", "PS3_BOOT_PATH", "PS3_ARGV")}
+        p = subprocess.run([str(exe), str(tmp_path / "no-such.elf")], capture_output=True,
+                           text=True, timeout=60, env=env)
+        out = p.stdout + p.stderr
+        assert p.returncode != 0   # the ELF does not exist; the line comes first
+        assert ("[boot] guest argv: argc=2 /dev_hdd0/game/BCES01977/USRDIR/EMAIN.SELF "
+                "/dev_hdd0/game/BCES01977/USRDIR/EMAIN.SELF; envp empty") in out, out[-2000:]
 
 
 def test_port_runs_on_the_play_folder():
@@ -124,3 +142,11 @@ def test_port_runs_on_the_play_folder():
     assert 'gt6_c_string(GT6_DEFAULT_HDD0_ROOT "${GT6_TREE}/play/dev_hdd0")' in cmake
     main = (REPO / "port" / "main.cpp").read_text()
     assert "run scripts/prepare_play.py first" in main
+    assert "prepare.json" in main and "S_ISDIR" in main
+
+
+def test_port_passes_the_launch_contract():
+    """argc 2, argv[0] = argv[1] = the EMAIN path, empty envp (FINDINGS, D31)."""
+    main = (REPO / "port" / "main.cpp").read_text()
+    assert '"/dev_hdd0/game/BCES01977/USRDIR/EMAIN.SELF"' in main
+    assert 'setenv("PS3_BOOT_PATH"' in main and 'setenv("PS3_ARGV"' in main

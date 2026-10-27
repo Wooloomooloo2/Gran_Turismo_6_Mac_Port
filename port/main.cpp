@@ -8,8 +8,9 @@
  * The GT6 runner: gt6 <path to EMAIN.SELF.elf>. Changes from the template, and nothing
  * else: the usage line and banner, the window title, and the VFS roots (the disc tree and
  * /dev_hdd0 default to the gt6unpack tree this build was configured for, gt6_paths.h, with
- * /dev_hdd0 on its play folder; PS3_VFS_ROOT and PS3_HDD0_ROOT override; a missing /dev_hdd0
- * folder stops the start). The template's Windows and Linux paths are kept
+ * /dev_hdd0 on its play folder; PS3_VFS_ROOT and PS3_HDD0_ROOT override; a /dev_hdd0 folder
+ * without prepare.json beside it stops the start), and the guest command line (the launch
+ * contract, configure_guest_argv). The template's Windows and Linux paths are kept
  * so the file stays diffable against the template; the port builds on macOS arm64 only.
  *
  * Template header follows.
@@ -302,14 +303,45 @@ static bool configure_vfs_roots(void)
     const char* hdd0 = getenv("PS3_HDD0_ROOT");
     if (!hdd0 || !*hdd0) { setenv("PS3_HDD0_ROOT", GT6_DEFAULT_HDD0_ROOT, 1); hdd0 = getenv("PS3_HDD0_ROOT"); }
     struct stat st;
-    if (stat(hdd0, &st) != 0 || !(st.st_mode & S_IFDIR)) {
+    if (stat(hdd0, &st) != 0 || !S_ISDIR(st.st_mode)) {
         fprintf(stderr, "ERROR: no /dev_hdd0 folder at %s: run scripts/prepare_play.py first "
                         "(it makes <tree>/play from the verified tree)\n", hdd0);
+        return false;
+    }
+    /* prepare_play.py writes prepare.json beside dev_hdd0, last, once the EBOOT's effects
+     * are applied. Without it the folder is not a prepared play folder, and EMAIN would
+     * silently skip the 1.07 data patch (FINDINGS). The same rule holds for an override:
+     * $PS3_HDD0_ROOT/../prepare.json must exist. */
+    char prep[1100];
+    snprintf(prep, sizeof prep, "%s/../prepare.json", hdd0);
+    if (stat(prep, &st) != 0 || !S_ISREG(st.st_mode)) {
+        fprintf(stderr, "ERROR: %s is not a prepared play folder (no prepare.json beside it): "
+                        "run scripts/prepare_play.py first\n", hdd0);
         return false;
     }
     snprintf(s_hdd0_mapping, sizeof s_hdd0_mapping, "%s/", hdd0);
     cellfs_add_path_mapping("/dev_hdd0/", s_hdd0_mapping);
     return true;
+}
+
+/* GT6: the guest command line. The 1.22 EBOOT.BIN spawns EMAIN.SELF with argc 2, argv[0]
+ * and argv[1] both its path, and no environment (sceNpDrmProcessExitSpawn2 under RPCS3,
+ * FINDINGS "how EMAIN is launched", D31). ps3recomp's ppu_run builds the entry's r3/r4/r5
+ * (argc, argv, envp; lv2's layout, as RPCS3's ppu_load_exec does) from $PS3_BOOT_PATH
+ * (argv[0]) and $PS3_ARGV (the rest, ';'-separated), with an empty envp. Set both to the
+ * contract unless the caller already set them. */
+static const char GT6_EMAIN_PATH[] = "/dev_hdd0/game/BCES01977/USRDIR/EMAIN.SELF";
+
+static void configure_guest_argv(void)
+{
+    setenv("PS3_BOOT_PATH", GT6_EMAIN_PATH, 0);
+    setenv("PS3_ARGV", GT6_EMAIN_PATH, 0);
+    const char* a0 = getenv("PS3_BOOT_PATH");
+    const char* rest = getenv("PS3_ARGV");
+    int argc_n = 1;
+    if (rest && *rest) { argc_n++; for (const char* c = rest; *c; c++) if (*c == ';') argc_n++; }
+    printf("[boot] guest argv: argc=%d %s%s%s; envp empty\n", argc_n, a0,
+           (rest && *rest) ? " " : "", (rest && *rest) ? rest : "");
 }
 
 /* ---------------------------------------------------------------------------
@@ -446,6 +478,7 @@ int main(int argc, char** argv)
 
     if (!configure_vfs_roots())
         return 1;
+    configure_guest_argv();
 
     if (!alloc_guest_vm()) {
         fprintf(stderr, "ERROR: could not allocate the guest address space\n");
