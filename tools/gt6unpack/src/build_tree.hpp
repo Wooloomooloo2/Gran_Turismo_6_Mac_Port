@@ -36,6 +36,10 @@ struct BuildOptions {
 // --force the old tree is renamed to <out>.old, the new one renamed in, then the old one
 // removed; a run killed in between is repaired at the next start. A relative <out> or one with
 // a trailing separator is accepted.
+// Refused before anything is written: an <out> that is or contains the current folder, the
+// disc or the updates folder; an <out> inside a git work tree; an existing <out> that is not
+// empty and has no gt6unpack build.json (never replaced, even with --force); a previous build
+// with a git work tree inside it; <out>.old or <out>.staging folders not left by gt6unpack.
 // Throws BuildError, UpdateError, PkgError or SelfError.
 void build_tree(const BuildOptions& opts);
 

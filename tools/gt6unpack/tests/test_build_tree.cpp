@@ -204,6 +204,7 @@ TEST_CASE("test_refuses_existing_out_without_force") {
 
 TEST_CASE("test_force_rebuilds_cleanly") {
     World w;
+    spit(w.out / "build.json", std::string("{\n  \"tool\": \"gt6unpack\",\n  \"tool_version\": \"0.0.1\"\n}\n"));
     spit(w.out / "stray.txt", std::string("old build"));
     BuildOptions o = w.opts();
     o.force = true;
@@ -358,6 +359,7 @@ TEST_CASE("an interrupted swap is recovered, not deleted") {
     const auto before = snapshot(w.out);
     // As if killed between moving the old tree aside and moving the new one in.
     fs::rename(w.out, w.old());
+    spit(w.staging() / ".gt6unpack-staging", std::string(""));
     spit(w.staging() / "partial.bin", std::string("half a build"));
     CHECK_THROWS_WITH_AS(build_tree(w.opts()), doctest::Contains("already exists"), BuildError);
     CHECK(snapshot(w.out) == before);  // the old tree is back in place
@@ -389,4 +391,117 @@ TEST_CASE("a relative --out or one with a trailing slash works") {
     build_tree(o);
     CHECK(app_ver(w.game() / "PARAM.SFO") == "01.04");
     CHECK_FALSE(fs::exists(w.staging()));
+}
+
+// ---- C1: --force only ever replaces a previous gt6unpack build ----
+
+namespace {
+BuildOptions forced(const World& w, const fs::path& out) {
+    BuildOptions o = w.opts();
+    o.out_dir = out;
+    o.force = true;
+    return o;
+}
+std::string error_of(const BuildOptions& o) {
+    try {
+        build_tree(o);
+    } catch (const std::exception& e) {
+        return e.what();
+    }
+    return "";
+}
+}  // namespace
+
+TEST_CASE("--force refuses to replace a folder that is not a gt6unpack build") {
+    World w;
+    spit(w.out / "precious.txt", std::string("keep me"));
+    const std::string err = error_of(forced(w, w.out));
+    CHECK(err.find("not a gt6unpack build") != std::string::npos);
+    CHECK(slurp(w.out / "precious.txt") == bytes("keep me"));
+    CHECK_FALSE(fs::exists(w.old()));
+    CHECK_FALSE(fs::exists(w.staging()));
+    // A build.json from something else does not count.
+    spit(w.out / "build.json", std::string("{\"tool\": \"other\"}"));
+    CHECK(error_of(forced(w, w.out)).find("not a gt6unpack build") != std::string::npos);
+    CHECK(slurp(w.out / "precious.txt") == bytes("keep me"));
+}
+
+TEST_CASE("without --force, a non-build folder is refused without suggesting --force") {
+    World w;
+    spit(w.out / "precious.txt", std::string("keep me"));
+    const std::string err = error_of(w.opts());
+    CHECK(err.find("not a gt6unpack build") != std::string::npos);
+    CHECK(err.find("--force") == std::string::npos);
+    // A previous build is refused with the hint.
+    fs::remove(w.out / "precious.txt");
+    build_tree(forced(w, w.out));
+    CHECK(error_of(w.opts()).find("use --force") != std::string::npos);
+}
+
+TEST_CASE("--force replaces an empty folder") {
+    World w;
+    fs::create_directories(w.out);
+    build_tree(forced(w, w.out));
+    CHECK(app_ver(w.game() / "PARAM.SFO") == "01.04");
+}
+
+TEST_CASE("--out may not be or contain the disc, the updates or the current folder") {
+    World w;
+    struct Cwd {
+        fs::path saved = fs::current_path();
+        ~Cwd() { fs::current_path(saved); }
+    } cwd;
+    spit(w.base / "build.json", std::string("{\"tool\": \"gt6unpack\"}"));  // even if it looks like a build
+    for (const fs::path& out : {w.disc, w.updates, w.base, w.root}) {
+        CAPTURE(out);
+        for (bool force : {false, true}) {
+            BuildOptions o = forced(w, out);
+            o.force = force;
+            const std::string err = error_of(o);
+            CHECK(err.find("--out") != std::string::npos);
+            CHECK(err.find("--force") == std::string::npos);
+        }
+    }
+    CHECK(fs::exists(w.disc / "PS3_GAME" / "PARAM.SFO"));
+    CHECK(fs::exists(w.updates / "z-first.pkg"));
+    CHECK_FALSE(fs::exists(fs::path(w.base.string() + ".old")));
+
+    fs::create_directories(w.base / "work");
+    fs::current_path(w.base / "work");
+    for (const char* rel : {".", "..", "./"}) {
+        CAPTURE(rel);
+        CHECK(error_of(forced(w, rel)).find("current folder") != std::string::npos);
+    }
+    CHECK(fs::exists(w.base / "work"));
+    CHECK(fs::exists(w.disc / "PS3_GAME" / "PARAM.SFO"));
+}
+
+TEST_CASE("--out may not be inside or contain a git work tree") {
+    World w;
+    const fs::path repo = w.root / "repo";
+    fs::create_directories(repo / ".git");
+    CHECK(error_of(forced(w, repo / "build" / "BCES01977")).find("git work tree") != std::string::npos);
+    CHECK(error_of(forced(w, repo)).find("git work tree") != std::string::npos);
+    CHECK_FALSE(fs::exists(repo / "build"));
+    // A git worktree or submodule has a .git file instead of a folder.
+    const fs::path wt = w.root / "worktree";
+    spit(wt / ".git", std::string("gitdir: /somewhere/else\n"));
+    CHECK(error_of(forced(w, wt / "out")).find("git work tree") != std::string::npos);
+    // A previous build with a work tree inside it is not replaced.
+    build_tree(w.opts());
+    fs::create_directories(w.out / "dev_hdd0" / "mine" / ".git");
+    CHECK(error_of(forced(w, w.out)).find("git work tree") != std::string::npos);
+    CHECK(fs::exists(w.out / "dev_hdd0" / "mine" / ".git"));
+}
+
+TEST_CASE("leftover .old and .staging folders that are not ours are not deleted") {
+    World w;
+    spit(w.old() / "precious.txt", std::string("keep me"));
+    CHECK(error_of(w.opts()).find(w.old().string()) != std::string::npos);
+    CHECK(slurp(w.old() / "precious.txt") == bytes("keep me"));
+    CHECK_FALSE(fs::exists(w.out));  // not restored over: it is not a build
+    fs::remove_all(w.old());
+    spit(w.staging() / "precious.txt", std::string("keep me"));
+    CHECK(error_of(w.opts()).find(w.staging().string()) != std::string::npos);
+    CHECK(slurp(w.staging() / "precious.txt") == bytes("keep me"));
 }

@@ -18,6 +18,7 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <optional>
 #include <sstream>
 
 namespace gt6 {
@@ -396,6 +397,82 @@ void build_into(const BuildOptions& o, const Edition& ed, const std::vector<fs::
         throw BuildError("final APP_VER " + final_ver + " does not match the target " + ed.target_app_ver);
 }
 
+// ---- Output folder safety: --force only ever replaces a previous gt6unpack build ----
+
+// Written into <out>.staging when it is created, removed just before it becomes <out>.
+constexpr const char* kStagingMarker = ".gt6unpack-staging";
+
+// Absolute, symlinks resolved as far as the path exists, no trailing separator.
+fs::path canon(const fs::path& p) {
+    fs::path c = fs::weakly_canonical(fs::absolute(p)).lexically_normal();
+    if (!c.has_filename() && c != c.root_path()) c = c.parent_path();
+    return c;
+}
+
+// True if inner is outer or lies under it (both from canon()).
+bool contains(const fs::path& outer, const fs::path& inner) {
+    auto i = inner.begin();
+    for (auto o = outer.begin(); o != outer.end(); ++o, ++i)
+        if (i == inner.end() || *o != *i) return false;
+    return true;
+}
+
+bool is_gt6unpack_build(const fs::path& dir) {
+    std::ifstream f(dir / "build.json", std::ios::binary);
+    if (!f) return false;
+    const std::string j(std::istreambuf_iterator<char>(f), {});
+    return j.find("\"tool\": \"gt6unpack\"") != std::string::npos;
+}
+
+enum class Found { missing, empty, build, staging, other };
+
+Found classify(const fs::path& p) {
+    std::error_code ec;
+    const auto st = fs::symlink_status(p, ec);
+    if (!fs::exists(st)) return Found::missing;
+    if (!fs::is_directory(st)) return Found::other;
+    if (fs::is_empty(p, ec) && !ec) return Found::empty;
+    if (is_gt6unpack_build(p)) return Found::build;
+    if (fs::exists(fs::symlink_status(p / kStagingMarker))) return Found::staging;
+    return Found::other;
+}
+
+// The nearest folder at or above p holding a .git folder or file (a work tree, worktree or submodule).
+std::optional<fs::path> git_work_tree_around(fs::path p) {
+    for (;;) {
+        if (fs::exists(fs::symlink_status(p / ".git"))) return p;
+        if (p == p.root_path() || !p.has_relative_path()) return std::nullopt;
+        p = p.parent_path();
+    }
+}
+
+std::optional<fs::path> git_work_tree_inside(const fs::path& dir) {
+    for (const auto& e : fs::recursive_directory_iterator(dir))
+        if (e.path().filename() == ".git") return e.path().parent_path();
+    return std::nullopt;
+}
+
+// Refuses an <out> that is, or would put at risk, anything but a previous gt6unpack build.
+void check_out_dir(const BuildOptions& o, const fs::path& out, const fs::path& staging, const fs::path& old) {
+    const fs::path c = canon(out);
+    const std::string shown = "--out " + out.string();
+    if (contains(c, canon(fs::current_path())))
+        throw BuildError(shown + " is or contains the current folder; choose a new folder for the build");
+    if (contains(c, canon(o.disc_dir)))
+        throw BuildError(shown + " is or contains the disc folder " + o.disc_dir.string() + "; choose a new folder for the build");
+    if (contains(c, canon(o.updates_dir)))
+        throw BuildError(shown + " is or contains the updates folder " + o.updates_dir.string() +
+                         "; choose a new folder for the build");
+    if (const auto repo = git_work_tree_around(c))
+        throw BuildError(shown + " is inside the git work tree " + repo->string() +
+                         "; build outside any repository so game files cannot be committed");
+    for (const fs::path& p : {staging, old}) {
+        const Found f = classify(p);
+        if (f == Found::other || (f == Found::staging && p == old))
+            throw BuildError(p.string() + " exists and is not left over from gt6unpack; move it away first");
+    }
+}
+
 }  // namespace
 
 int clone_with_clonefile(const fs::path& src, const fs::path& dst) {
@@ -412,14 +489,29 @@ void build_tree(const BuildOptions& o) {
         throw BuildError("bad output directory \"" + o.out_dir.string() + "\"");
     const fs::path staging = out.string() + ".staging";
     const fs::path old = out.string() + ".old";
+    check_out_dir(o, out, staging, old);
 
     // A run killed between moving <out> aside and moving the new tree in leaves <out>.old and no
     // <out>: put the old tree back before anything else.
-    if (!fs::exists(fs::symlink_status(out)) && fs::exists(fs::symlink_status(old))) {
+    if (classify(out) == Found::missing && classify(old) == Found::build) {
         fs::rename(old, out);
         o.log("restored " + out.string() + " from an interrupted earlier run");
     }
-    if (fs::exists(out) && !o.force) throw BuildError(out.string() + " already exists (use --force to rebuild)");
+    switch (classify(out)) {
+        case Found::missing:
+            break;
+        case Found::empty:
+        case Found::build:
+            if (!o.force) throw BuildError(out.string() + " already exists (use --force to rebuild)");
+            if (const auto repo = fs::is_directory(out) ? git_work_tree_inside(out) : std::nullopt)
+                throw BuildError("--out " + out.string() + " contains the git work tree " + repo->string() +
+                                 "; it is not replaced");
+            break;
+        default:
+            throw BuildError("--out " + out.string() +
+                             " exists and is not a gt6unpack build (no build.json from gt6unpack); it is never "
+                             "replaced, choose a new folder for the build");
+    }
 
     // Inputs: the disc must be this title; every update present and verified before writing.
     for (const char* name : kDiscEntries)
@@ -450,11 +542,13 @@ void build_tree(const BuildOptions& o) {
     if (fs::exists(fs::symlink_status(staging))) remove_tree(staging);
     if (fs::exists(fs::symlink_status(old))) remove_tree(old);
     fs::create_directories(staging);
+    write_file(staging / kStagingMarker, {});
     try {
         std::string final_ver;
         build_into(o, ed, ordered, staging, r, final_ver);
         r.timings.push_back({"total", seconds_since(t0)});
         write_build_json(staging / "build.json", o, ed, final_ver, r);
+        fs::remove(staging / kStagingMarker);
         // Swap by renames only, so <out> is always either the old or the new complete tree.
         const bool replacing = fs::exists(fs::symlink_status(out));
         if (replacing) fs::rename(out, old);

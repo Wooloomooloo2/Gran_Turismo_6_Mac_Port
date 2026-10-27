@@ -39,7 +39,7 @@ Shortcuts taken, with the proper fix logged. Priority order: 1) Stability, 2) Pe
 - Package reader: an all-NUL file name becomes empty and passes checks; the hostile-package test for `/abs` and `./x` asserts nothing useful.
 - Package reader: no test crosses the 4 MiB chunk or an unaligned offset; file count allocation is uncapped; filesystem errors are not wrapped as package errors; leading "/" is stripped inconsistently in `pkg_param_sfo`.
 - Build: the "not enough disk space" refusal is untested; the space estimate omits decrypted executables; "every segment HMAC" wording is too strong; duplicate JSON keys are accepted; `hex()` is copied in three places; one redundant `.gitignore` line; `build_tree.cpp` is 480 lines and should be split; the edition path is compiled into `main.cpp`.
-- `--out .` or `foo/..` resolves to an existing folder, which `--force` would rename to `.old`; a failed restore rename hides the original error.
+- Build: a failed restore rename hides the original error.
 - Verify does not compare title ID or app version; duplicate or `../` manifest paths are unchecked; static 8 MiB buffer; the reader accepts trailing garbage; no test for empty files or size-only mismatch.
 - `manifest.cpp` has a redundant `<cstdio>` include.
 - The map CLI test should skip when capstone is missing; test fixture values copy real GT6 metadata (use invented ones); `requirements-dev.txt` copies ps3recomp's dependencies (update on a pin bump).
