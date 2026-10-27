@@ -27,6 +27,49 @@ Full suite with the real disc and all updates (re-run after the final review fix
 - `gt6unpack verify ~/Gran\ Turismo\ 6/build/BCES01977-v1.22 --manifest manifests/BCES01977-v1.22.json`: `16568 files checked: 0 mismatched, 0 missing, 0 extra` (now also checks the tree's PARAM.SFO is BCES01977 01.22).
 - `scripts/check_no_game_files.py $(git ls-files)`: clean.
 
+## Building the port (2026-10-27)
+
+`port/` builds the native `gt6` executable from the translated tree (M4 Max, Apple clang 21,
+CMake 4.4.4, Ninja 1.13.2):
+
+| Step | Result |
+|---|---|
+| Configure (`-DGT6_BUILD_PORT=ON -DCMAKE_BUILD_TYPE=Release`, fresh folder) | 1.2 s, including the patch step and the SHA-256 of EMAIN |
+| Full build of `gt6` (295 steps: 65 lifted PPU chunks, 58 SPU images, the ps3recomp runtime, the HLE NID table) | **78 s wall**, 1,025 s CPU, peak 1.19 GB per compiler process, 0 errors |
+| `gt6` | 205 MB Mach-O arm64; with no arguments prints `usage: gt6 <path to EMAIN.SELF.elf>` and exits 2 |
+
+- Dev dependencies installed with `brew install sdl2 spirv-cross` (D29): `sdl2` now
+  installs **sdl2-compat 2.32.74**, the SDL2 API over **SDL3 3.4.18**; **spirv-cross
+  1.4.363.0**. Already present: glslang 16.6.0. ps3recomp's configure reports "guest programs
+  translated to MSL" (glslang plus spirv-cross found), so the Metal backend can run guest
+  shaders, not only fixed function.
+- `gt6` links Homebrew dylibs (SDL2, glslang, SPIRV-Tools) by absolute `/opt/homebrew`
+  path, so it runs only on a Mac with them installed (BACKLOG, Mac GUI).
+- The linker warns that Homebrew's static spirv-cross objects were built for macOS 27.0 while
+  the link targets 26.5 (CMake's default deployment target). Harmless on this Mac; a player
+  build must pin one deployment target for everything it bundles.
+- 63 compiler warnings, all in ps3recomp's runtime (unused variables, format widths,
+  deprecated `swapcontext`), none in the port's own files. No ps3recomp fix was needed to
+  build on macOS beyond patch 0001.
+- Optimisation levels as built (D30): lifted PPU chunks end their command line with `-O1`,
+  SPU images with `-O2`, after the Release `-O3`; the runtime is at `-O3`.
+- SPU images compiled: 1 of the 4 SPU programs (the only one the inventory marks
+  `registered`) and all 57 job modules (`lift_jobmods` registers all of them, including the
+  8 with unsupported words, whose bad words fall to the interpreter). The 3 unregistered
+  programs are not compiled; they run in the SPU interpreter.
+- `recomp/spu/sources.cmake`, written by `build_spu_workloads`, lists paths inside the
+  translate step's `recomp.staging` folder, which no longer exists after the swap. The port
+  does not use it (it reads `inventory.json` and `jobmods_manifest.json` instead).
+- Patch 0001 (`gcm:flip` milestone) touches the 13 unit tests that `#include
+  "../cellGcmSys.c"`: without an empty `ps3_ms` stub 8 of ps3recomp's `tools/test_gcm_*.py`
+  stop linking. With the patch all 12 `test_gcm_*.py` and `test_milestone.py` pass. The key is
+  recorded at each of the three places a guest flip request is counted for the present loop
+  (FIFO flip marker, `cellGcmSetFlipCommand`, `cellGcmSetPrepareFlip`); the milestone log
+  keeps the first occurrence in order and counts the rest.
+- Adding patch 0001 changed the patches hash, so the tree was translated again (57.4 s,
+  same 70,028 functions) before the build; configure refuses a tree translated under another
+  patch set.
+
 ## Translating EMAIN (2026-10-27)
 
 Measured with `ppu_lifter` on the v1.22 `USRDIR/EMAIN.SELF.elf` (M4 Max):

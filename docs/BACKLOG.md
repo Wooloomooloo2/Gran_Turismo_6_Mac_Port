@@ -12,7 +12,18 @@ Shortcuts taken, with the proper fix logged. Priority order: 1) Stability, 2) Pe
 
 ## 2) Performance
 
+- Lifted PPU code is compiled at `-O1` (D30). Measure `-O2`/`-O3` compile time and frame
+  time in milestone 5 (locked 60) and pick the level from that.
+
 ## 3) Mac GUI
+
+- The port builds with the developer's own tools (D29): Apple clang, CMake, Ninja, and
+  Homebrew's sdl2, glslang and spirv-cross. Players must not need any of them: bundle a
+  pinned toolchain and the libraries, or fetch them checksummed on first setup (D12).
+- Players need Python for translation today (`scripts/translate_game.py` and ps3recomp's
+  tools, plus capstone etc. from `scripts/requirements-dev.txt`), and the port build runs
+  ps3recomp's `gen_hle_nids.py` with whichever Python CMake finds. Ship a self-contained
+  translator, or bundle a pinned Python, before any player build.
 
 ## Unpacker
 

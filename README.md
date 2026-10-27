@@ -91,8 +91,10 @@ runs it on every push.
   unpacker's key table, SELF decryption and package reader are adapted from its
   `rpcs3/Crypto` code (`key_vault`, `unself`, `unpkg`).
 - [ps3recomp](https://github.com/sp00nznet/ps3recomp) (MIT) by Ned Heller / sp00nznet: its
-  analysis tools map the game's code (git submodule, dev-only), and it is the planned base for
-  the translator and runtime.
+  tools map and translate the game's code (git submodule, dev-only), its runtime runs the
+  translated program, and the port's build file and runner (`port/`) are adapted from its
+  project template (MIT). Its runtime includes `at3_standalone` (LGPL-2.1), PPSSPP's
+  extraction of FFmpeg's ATRAC3plus decoder.
 - [bloodborne_mac_port](https://github.com/Wooloomooloo2/bloodborne_mac_port): launcher,
   renderer machinery and project conventions.
 - [doctest](https://github.com/doctest/doctest) (MIT): C++ test framework.
