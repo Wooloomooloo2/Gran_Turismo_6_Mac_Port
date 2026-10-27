@@ -7,13 +7,14 @@ folder, and the game's code is fully mapped. Nothing failed outright.
 
 | Question | Answer |
 |---|---|
-| Is it really v1.22? | Yes. All 21 programs decrypted and the folder matches the recorded checksums. |
-| How big is the code? | One 23 MB program: about 72,000 functions, 15 MB of main-processor code. |
-| Helper-chip programs | 61 (the PS3 has small helper processors, "SPUs"): 4 stand-alone, 57 job modules, 1.76 MB in all. |
-| System calls to replace | 740 PS3 system functions from 46 libraries; about 290 are online-only and can be stubs. |
-| Biggest risk | The helper-chip code, which the game schedules with Sony's job system ("SPURS"). It is the largest piece of milestone 2 and our tools only half cover it. |
-| Other risk | The disc itself is not yet checked against an independent source (backlog). |
-| What milestone 2 needs | Your decision to start it. It will first settle how the launcher's data-patch step is handled, the helper-chip strategy, and how long translating 72,000 functions takes. |
+| Is it really v1.22? | Yes. Every game program was unlocked and the folder matches the recorded checksums. |
+| How big is the game's code? | One 23 MB program made of about 72,000 separate routines. All of it has to be translated for the Mac. |
+| Biggest risk | The game also runs many small programs on the PS3's helper chips. Recreating those on the Mac is the hardest part of what comes next. |
+| What milestone 2 needs | Your go-ahead. It starts by settling three things: a data-patching step the launcher runs, how to handle the helper-chip programs, and how long the translation takes. |
+
+One smaller risk: the disc has not yet been checked against an independent source (backlog).
+
+Measurements and facts, newest first within each section.
 
 ### Test run
 
@@ -25,12 +26,7 @@ Full suite with the real disc and all updates (no skips):
 
 ## Code map of v1.22 (2026-10-27)
 
-**In short.** The game program that runs on 1.22 is one 23 MB executable. It holds about
-15 MB of main-processor code in roughly 72,000 functions. It calls 740 PS3 system functions
-from 46 system libraries; that is the runtime's to-do list. About 290 of those calls are for
-online features, which are out of scope and can be stubs. It makes heavy use of SPURS, Sony's
-job system for the PS3's helper cores: tasks, job chains and a custom workload. It carries 61
-helper-core programs (1.76 MB in total) inside its own code. Risks:
+**Risks found** (technical detail; the plain-language version is the owner summary above):
 
 - **Helper-core code is the biggest job.** The 57 SPURS job modules (1.53 MB) are stored raw
   inside the executable, not as the separate programs ps3recomp's tools expect. Our map finds

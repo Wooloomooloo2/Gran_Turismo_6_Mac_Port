@@ -42,4 +42,4 @@ Shortcuts taken, with the proper fix logged. Priority order: 1) Stability, 2) Pe
 - `--out .` or `foo/..` resolves to an existing folder, which `--force` would rename to `.old`; a failed restore rename hides the original error.
 - Verify does not compare title ID or app version; duplicate or `../` manifest paths are unchecked; static 8 MiB buffer; the reader accepts trailing garbage; no test for empty files or size-only mismatch.
 - `manifest.cpp` has a redundant `<cstdio>` include.
-- The map CLI test should skip when capstone is missing; test fixture values copy real GT6 metadata (use invented ones); `requirements-dev.txt` copies ps3recomp's dependencies (update on a pin bump); the "In short" paragraph in FINDINGS uses SPURS/D22 jargon.
+- The map CLI test should skip when capstone is missing; test fixture values copy real GT6 metadata (use invented ones); `requirements-dev.txt` copies ps3recomp's dependencies (update on a pin bump).
