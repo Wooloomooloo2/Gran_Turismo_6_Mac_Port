@@ -33,16 +33,6 @@ double seconds_since(Clock::time_point t) {
     return std::chrono::duration<double>(Clock::now() - t).count();
 }
 
-std::string hex(std::span<const uint8_t> d) {
-    static const char* k = "0123456789abcdef";
-    std::string s;
-    for (uint8_t b : d) {
-        s += k[b >> 4];
-        s += k[b & 15];
-    }
-    return s;
-}
-
 std::string json_str(const std::string& s) {
     std::string o = "\"";
     for (unsigned char c : s) {
@@ -75,7 +65,7 @@ std::string sha1_file(const fs::path& p) {
         f.read(reinterpret_cast<char*>(buf.data()), std::streamsize(buf.size()));
         h.update(std::span<const uint8_t>(buf.data(), size_t(f.gcount())));
     }
-    return hex(h.final());
+    return crypto::to_hex(h.final());
 }
 
 std::string sfo_app_ver(const fs::path& sfo_path, std::string* title_id = nullptr) {
@@ -209,7 +199,7 @@ void decrypt_all(const fs::path& staging, std::vector<Decrypted>& done, std::vec
                      const std::string& klic_from) {
         const fs::path out = staging / "decrypted" / (rel + ".elf");
         write_file(out, elf);
-        done.push_back({rel, fs::relative(out, staging).generic_string(), hex(crypto::sha256(elf)), elf.size(), info,
+        done.push_back({rel, fs::relative(out, staging).generic_string(), crypto::to_hex(crypto::sha256(elf)), elf.size(), info,
                         klic_from});
         log("decrypted " + rel);
     };

@@ -121,3 +121,12 @@ Measurements and facts, newest first within each section.
   then bundled to PEM for `curl --cacert`. TLS checking was never turned off.
 - Not yet verified: per-file hashes of the disc (redump checksums do not apply to a decrypted
   image; the community IRD lists per-file hashes).
+
+## Risk: disc contents not checked against an independent source (2026-10-27)
+
+- The committed manifest `manifests/BCES01977-v1.22.json` proves a player's build matches
+  the one we made, but both start from the same disc image. If that image had a bad file
+  (for example in GT.VOL), the manifest would record the bad hash as correct.
+- The community IRD file lists per-file MD5s of the original disc and would catch this.
+  Using it needs an ISO directory reader (BACKLOG, Unpacker). Until then, GT.VOL is
+  unverified against an independent source.

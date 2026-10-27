@@ -4,7 +4,7 @@ target_compile_options(gt6crypto PRIVATE -Wall -Wextra)
 find_package(ZLIB REQUIRED)
 target_link_libraries(gt6crypto PUBLIC ZLIB::ZLIB)
 
-add_library(gt6build STATIC src/updates.cpp src/klic.cpp src/build_tree.cpp)
+add_library(gt6build STATIC src/updates.cpp src/klic.cpp src/build_tree.cpp src/manifest.cpp)
 target_include_directories(gt6build PUBLIC src)
 target_compile_options(gt6build PRIVATE -Wall -Wextra)
 target_link_libraries(gt6build PUBLIC gt6crypto)
@@ -22,7 +22,8 @@ add_executable(gt6unpack_tests
   tests/test_sfo.cpp
   tests/test_pkg.cpp
   tests/test_build_tree.cpp
-  tests/test_klic.cpp)
+  tests/test_klic.cpp
+  tests/test_manifest.cpp)
 target_include_directories(gt6unpack_tests PRIVATE ${PROJECT_SOURCE_DIR}/third_party/doctest tests)
 target_compile_options(gt6unpack_tests PRIVATE -Wall -Wextra)
 target_link_libraries(gt6unpack_tests PRIVATE gt6build)

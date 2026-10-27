@@ -149,16 +149,6 @@ bool is_sha1_hex(const std::string& s) {
            std::all_of(s.begin(), s.end(), [](char c) { return is_digit(c) || (c >= 'a' && c <= 'f'); });
 }
 
-std::string hex(std::span<const uint8_t> d) {
-    static const char* k = "0123456789abcdef";
-    std::string s;
-    for (uint8_t b : d) {
-        s += k[b >> 4];
-        s += k[b & 15];
-    }
-    return s;
-}
-
 std::string sfo_string(const Sfo& sfo, const std::string& key, const fs::path& pkg) {
     const auto it = sfo.find(key);
     if (it == sfo.end() || !std::holds_alternative<std::string>(it->second))
@@ -214,7 +204,7 @@ std::string sony_pkg_sha1(const fs::path& pkg) {
         h.update(std::span<const uint8_t>(buf.data(), n));
         left -= n;
     }
-    return hex(h.final());
+    return crypto::to_hex(h.final());
 }
 
 std::vector<fs::path> order_updates(const Edition& edition, const std::vector<fs::path>& pkgs) {

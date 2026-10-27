@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 // Thin wrappers over Apple CommonCrypto and zlib.
@@ -35,6 +36,24 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
+
+// Incremental SHA-256 for very large inputs.
+class Sha256Stream {
+public:
+    Sha256Stream();
+    ~Sha256Stream();
+    Sha256Stream(const Sha256Stream&) = delete;
+    Sha256Stream& operator=(const Sha256Stream&) = delete;
+    void update(Bytes data);
+    std::array<uint8_t, 32> final();
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+// Lower-case hex of a byte string.
+std::string to_hex(Bytes data);
 
 // Inflates a zlib stream; throws std::runtime_error on error or if the result
 // is not exactly expected_size bytes.

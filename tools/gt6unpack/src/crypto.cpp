@@ -86,15 +86,39 @@ std::array<uint8_t, 20> sha1(Bytes data) {
     return s.final();
 }
 
-std::array<uint8_t, 32> sha256(Bytes data) {
+struct Sha256Stream::Impl {
     CC_SHA256_CTX ctx;
-    CC_SHA256_Init(&ctx);
+};
+
+Sha256Stream::Sha256Stream() : impl_(std::make_unique<Impl>()) { CC_SHA256_Init(&impl_->ctx); }
+Sha256Stream::~Sha256Stream() = default;
+
+void Sha256Stream::update(Bytes data) {
     for (size_t off = 0; off < data.size(); off += kChunk)
-        CC_SHA256_Update(&ctx, data.data() + off,
+        CC_SHA256_Update(&impl_->ctx, data.data() + off,
                          static_cast<CC_LONG>(std::min(kChunk, data.size() - off)));
+}
+
+std::array<uint8_t, 32> Sha256Stream::final() {
     std::array<uint8_t, 32> out{};
-    CC_SHA256_Final(out.data(), &ctx);
+    CC_SHA256_Final(out.data(), &impl_->ctx);
     return out;
+}
+
+std::array<uint8_t, 32> sha256(Bytes data) {
+    Sha256Stream s;
+    s.update(data);
+    return s.final();
+}
+
+std::string to_hex(Bytes d) {
+    static const char* k = "0123456789abcdef";
+    std::string s;
+    for (uint8_t b : d) {
+        s += k[b >> 4];
+        s += k[b & 15];
+    }
+    return s;
 }
 
 std::array<uint8_t, 20> hmac_sha1(Bytes key, Bytes data) {
