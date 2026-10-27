@@ -166,7 +166,7 @@
 - `editions/BCES01977.json` (committed, hashes only): `{ "title_id": "BCES01977", "target_app_ver": "01.22", "updates": [ {"app_ver":"01.02","sha1":"26044500a07d32e569de34c8738eaa872782df42"}, … all 21 from BCES01977-ver.xml.list … ] }`
 - Produces:
   - `struct Edition { std::string title_id, target_app_ver; std::vector<std::pair<std::string,std::string>> updates; }; Edition load_edition(path);`
-  - `std::vector<std::filesystem::path> order_updates(const Edition&, const std::vector<std::filesystem::path>& pkgs);`: orders by each package's own `APP_VER`. Throws `UpdateError("missing update 01.07")` on a gap and `UpdateError("…sha1 mismatch…")` on a checksum mismatch, both checked before any extraction.
+  - `std::vector<std::filesystem::path> order_updates(const Edition&, const std::vector<std::filesystem::path>& pkgs);`: orders by each package's own `APP_VER`. Throws `UpdateError("missing update 01.07")` on a gap and `UpdateError("…sha1 mismatch…")` on a checksum mismatch, both checked before any extraction. The SHA-1 is computed over `size − 32` bytes (Sony's rule, see `test_sha1_rule`).
   - `void build_tree(const BuildOptions&);` with `struct BuildOptions { path disc_dir, updates_dir, out_dir, edition_file; bool force; };`
 - Output layout (D14):
   ```
@@ -181,6 +181,7 @@
 - [ ] **Step 1: Write failing tests** (all synthetic, in `Gran Turismo 6 (UK) test`, with a 3-update test edition 01.02/01.03/01.04):
   - `test_order_by_app_ver_not_filename`: files named so the alphabetical order is wrong still come out 01.02, 01.03, 01.04.
   - `test_missing_update_named`: without 01.03 it throws, and the message contains `01.03`. `<out>` does not exist afterwards.
+  - `test_sha1_rule`: Sony's `sha1` covers the package **minus its last 32 bytes**, and the package's last 32 bytes hold that same SHA-1 followed by 12 zero bytes (verified on 01.02). A synthetic package built that way passes.
   - `test_sha1_mismatch_before_extract`: one flipped byte throws, and no staging dir is left behind.
   - `test_later_update_overwrites`: the same file in 01.02 and 01.04 gives 01.04's content.
   - `test_refuses_existing_out_without_force`, and `test_force_rebuilds_cleanly` (a stray file in the old `<out>` is gone afterwards).
