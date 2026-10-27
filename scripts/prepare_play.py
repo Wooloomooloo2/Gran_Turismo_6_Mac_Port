@@ -194,6 +194,12 @@ def _made_by_us(folder):
         return False
 
 
+def _ours(folder):
+    """A staging or .old folder this tool left: it has the staging marker or prepare.json
+    (a run killed after the marker was dropped, or between the two renames)."""
+    return (Path(folder) / STAGING_MARK).is_file() or _made_by_us(folder)
+
+
 def prepare(tree, out=None, force=False):
     """Make the play folder (default <tree>/play; out= is for tests only, the CLI has none).
 
@@ -219,9 +225,13 @@ def prepare(tree, out=None, force=False):
             raise SystemExit(f"error: {out} has no prepare.json written by {TOOL}; "
                              "refusing to delete a folder this tool did not make")
     staging = out.with_name("." + out.name + ".staging")
+    old = out.with_name("." + out.name + ".old")
+    for p in (staging, old):
+        if p == tree or p in tree.parents:
+            raise SystemExit(f"error: {p} is the verified tree or contains it; refusing")
+        if p.exists() and not _ours(p):
+            raise SystemExit(f"error: {p} exists and was not made by {TOOL}; refusing")
     if staging.exists():
-        if not (staging / STAGING_MARK).is_file():
-            raise SystemExit(f"error: {staging} exists and was not made by {TOOL}; refusing")
         shutil.rmtree(staging)                 # left behind by a killed run
     staging.mkdir(parents=True)
     try:
@@ -247,14 +257,12 @@ def prepare(tree, out=None, force=False):
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
         raise
-    old = None
+    if old.exists():                            # checked above: ours, from a killed run
+        shutil.rmtree(old)
     if out.exists():                            # checked above: ours, and --force given
-        old = out.with_name("." + out.name + ".old")
-        if old.exists():
-            shutil.rmtree(old)
         out.rename(old)
     staging.rename(out)
-    if old is not None:
+    if old.exists():
         shutil.rmtree(old)
     return record
 

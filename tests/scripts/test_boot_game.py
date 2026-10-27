@@ -51,18 +51,22 @@ def test_parse_milestones_truncated():
     assert m["keys"] == ["a"] and not m["ended"]   # the last line may be half written
 
 
-@pytest.mark.parametrize("rc,to,hung,keys,want", [
-    (0, False, False, ["a", "gcm:flip"], "first_frame"),
-    (-11, False, False, ["a", "gcm:flip"], "crashed"),
-    (0, False, False, ["a"], "exited"),
-    (None, True, False, ["gcm:flip"], "first_frame"),
-    (None, True, False, ["a"], "timeout"),
-    (None, False, True, ["a"], "hung"),
-    (139, False, False, ["a"], "crashed"),
-    (1, False, False, ["a"], "exited"),
+@pytest.mark.parametrize("rc,to,hung,keys,frames,want", [
+    (0, False, False, ["a", "gcm:flip"], 1, "first_frame"),
+    (-11, False, False, ["a", "gcm:flip"], 1, "crashed"),
+    (0, False, False, ["a"], 0, "exited"),
+    (None, True, False, ["gcm:flip"], 1, "first_frame"),
+    (None, True, False, ["a"], 0, "timeout"),
+    (None, False, True, ["a"], 0, "hung"),
+    (139, False, False, ["a"], 0, "crashed"),
+    (1, False, False, ["a"], 0, "exited"),
+    # A flip with no frame dumped is not a first frame (run 20261027-195826).
+    (0, False, False, ["a", "gcm:flip"], 0, "flip_no_frame"),
+    (None, False, False, ["gcm:flip"], 0, "flip_no_frame"),
 ])
-def test_classify(rc, to, hung, keys, want):
-    assert boot_game.classify(rc, to, hung, keys) == want
+def test_classify(rc, to, hung, keys, frames, want):
+    assert want in boot_game.OUTCOMES
+    assert boot_game.classify(rc, to, hung, keys, frames) == want
 
 
 def pid_gone(pid):
@@ -106,6 +110,33 @@ def test_first_flip_stops_early_and_counts_frames(tree, tmp_path, monkeypatch):
     assert rep["seconds"] < 20
     assert rep["frames"] == 1
     assert pid_gone(rep["pid"])
+
+
+def test_flip_without_a_dump_is_not_a_first_frame(tree, tmp_path, monkeypatch):
+    monkeypatch.setattr(boot_game, "FLIP_GRACE", 1.0)
+    monkeypatch.delenv("FAKE_FRAME", raising=False)
+    rep = boot_game.boot(fake("flip", tmp_path), tree, seconds=60, idle=30)
+    assert rep["frames"] == 0
+    assert rep["outcome"] == "flip_no_frame"
+    assert boot_game.main([str(tree), "--gt6", str(fake("flip", tmp_path))]) == 1
+
+
+def test_boot_records_itself_and_warns_on_a_used_play_folder(tree, tmp_path, capsys):
+    rep = boot_game.boot(fake("crash", tmp_path), tree, seconds=30, idle=20)
+    run = Path(rep["run"]).name
+    rec = json.loads((tree / "play" / "prepare.json").read_text())
+    assert rec["booted"] == run
+    assert rep["play_reused"] is None
+    assert "prepare_play.py" not in capsys.readouterr().err
+    # A second boot on the same play folder still runs, but warns and says so in the report.
+    rec["booted"] = "20000101-000000"
+    (tree / "play" / "prepare.json").write_text(json.dumps(rec))
+    rep = boot_game.boot(fake("crash", tmp_path), tree, seconds=30, idle=20)
+    err = capsys.readouterr().err
+    assert "20000101-000000" in err and "prepare_play.py" in err and "--force" in err
+    assert rep["play_reused"] == "20000101-000000"
+    assert json.loads((tree / "play" / "prepare.json").read_text())["booted"] == Path(rep["run"]).name
+    assert "used by run 20000101-000000" in (Path(rep["run"]) / "summary.md").read_text()
 
 
 def test_default_environment(tree, tmp_path):

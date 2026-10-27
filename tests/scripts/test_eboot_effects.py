@@ -55,3 +55,21 @@ def test_cli_round_trip(tmp_path):
     out = subprocess.run([py, str(SCRIPT), "diff", str(a), str(b)], check=True,
                          capture_output=True, text=True).stdout
     assert json.loads(out) == {"added": [], "removed": [], "changed": ["a"]}
+
+
+def test_snapshot_refuses_output_inside_a_git_work_tree(tmp_path):
+    """A snapshot of a game folder lists game file names and hashes: never in a work tree."""
+    root = tmp_path / "game"
+    root.mkdir()
+    (root / "a").write_text("1")
+    target = REPO / "build" / "eboot-effects-test.json"
+    r = subprocess.run([sys.executable, str(SCRIPT), "snapshot", str(root), "-o", str(target)],
+                       capture_output=True, text=True)
+    assert r.returncode != 0 and "git work tree" in r.stderr
+    assert not target.exists()
+    other = tmp_path / "repo"
+    subprocess.run(["git", "init", "-q", str(other)], check=True)
+    r = subprocess.run([sys.executable, str(SCRIPT), "snapshot", str(root), "-o",
+                        str(other / "sub" / "s.json")], capture_output=True, text=True)
+    assert r.returncode != 0 and "git work tree" in r.stderr
+    assert not (other / "sub").exists()

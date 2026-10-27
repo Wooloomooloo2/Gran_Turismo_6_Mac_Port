@@ -10,7 +10,7 @@ Used to measure what the 1.22 EBOOT.BIN changes in the game folder before it
 spawns EMAIN.SELF (docs/FINDINGS.md, "What the 1.22 EBOOT leaves on disk").
 A snapshot maps each file's path, relative to <dir>, to its SHA-256, and each
 folder to "<dir>/" (value "dir"). Snapshots of a game folder describe game
-files, so write them outside the repository.
+files, so the snapshot refuses an output inside any git work tree (D26).
 """
 import argparse
 import hashlib
@@ -18,6 +18,9 @@ import json
 import os
 import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from translate_game import in_git_work_tree  # noqa: E402
 
 DIR = "dir"
 
@@ -66,6 +69,9 @@ def main(argv=None) -> int:
     d.add_argument("after", type=Path)
     args = ap.parse_args(argv)
     if args.cmd == "snapshot":
+        if in_git_work_tree(args.output):
+            ap.exit(2, f"error: {args.output} is inside a git work tree; a snapshot of a game "
+                       "folder lists game files and must be written outside it (D26)\n")
         args.output.write_text(json.dumps(snapshot(args.dir), indent=1) + "\n")
     else:
         result = diff(json.loads(args.before.read_text()), json.loads(args.after.read_text()))

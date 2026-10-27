@@ -221,3 +221,30 @@ def test_real_tree_matches_the_eboot(tmp_path):
         assert sha(usr / rel) == digest, rel
     assert len(rec["applied"]) == 6
     assert all(a["dropped"] == [] for a in rec["applied"][1:])
+
+
+def test_leftovers_of_a_killed_run_are_ours_only_with_prepare_json_or_marker(tmp_path):
+    """A run killed after the staging marker is dropped (prepare.json written, renames not
+    done) leaves a staging folder that is still ours; a .play.old is removed only if ours."""
+    tree = tmp_path / "tree"
+    make_tree(tree)
+    prepare_play.prepare(tree)
+    staging, old = tree / ".play.staging", tree / ".play.old"
+    staging.mkdir()
+    (staging / "prepare.json").write_text('{"tool": "scripts/prepare_play.py"}')
+    prepare_play.prepare(tree, force=True)
+    assert not staging.exists()
+    # A .play.old that is not ours is refused before anything is changed.
+    old.mkdir()
+    (old / "keep.txt").write_text("not ours")
+    first = (tree / "play" / "prepare.json").read_text()
+    with pytest.raises(SystemExit, match="not made by"):
+        prepare_play.prepare(tree, force=True)
+    assert (old / "keep.txt").read_text() == "not ours"
+    assert (tree / "play" / "prepare.json").read_text() == first
+    assert not staging.exists()
+    # One that is ours (left between the two renames) is replaced.
+    (old / "keep.txt").unlink()
+    (old / "prepare.json").write_text('{"tool": "scripts/prepare_play.py"}')
+    prepare_play.prepare(tree, force=True)
+    assert not old.exists() and not staging.exists()

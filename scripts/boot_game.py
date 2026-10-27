@@ -13,7 +13,8 @@ argv and the file roots itself, so only the log, headless and frame-dump variabl
 Each run writes <tree>/runs/<UTC yyyymmdd-HHMMSS>/ with stdout.log, stderr.log,
 milestones.log, frames/, report.json and summary.md. Nothing is written inside a git work
 tree. The run stops when:
-- the first guest flip (milestone key gcm:flip) appeared 5 s ago: outcome first_frame;
+- the first guest flip (milestone key gcm:flip) appeared 5 s ago: outcome first_frame if
+  at least one frame was dumped, otherwise flip_no_frame;
 - the process exits on its own (exited, or crashed if a signal ended it);
 - stdout, stderr and the milestone log all stopped growing for --idle seconds: hung
   (ps3recomp logs only the first occurrence of each key, so growth of any of the three counts);
@@ -22,6 +23,11 @@ The whole process group is killed on every way out, and the harness waits for it
 stay hidden (PS3RECOMP_METAL_HEADLESS=1) unless --window is given.
 The frame dump is one file the renderer overwrites every 120th frame, so frames/ holds the
 latest dump (frame.ppm).
+A process that exits by itself after a flip with no frame dumped is flip_no_frame too.
+The run is recorded in <tree>/play/prepare.json as "booted": <run>. A play folder an earlier
+run used is not clean (the game's first run changes it): the boot still runs, but warns,
+names the earlier run in report.json ("play_reused") and summary.md, and points at
+`prepare_play.py --force`.
 Exit status: 0 on first_frame, otherwise 1.
 """
 import argparse
@@ -41,7 +47,7 @@ from translate_game import in_git_work_tree  # noqa: E402
 
 ELF_REL = Path("decrypted") / map_game.TITLE_USRDIR / "EMAIN.SELF.elf"
 GT6_REL = Path("port-build") / "port" / "gt6"
-OUTCOMES = ("first_frame", "exited", "crashed", "hung", "timeout")
+OUTCOMES = ("first_frame", "flip_no_frame", "exited", "crashed", "hung", "timeout")
 FLIP_KEY = "gcm:flip"
 FLIP_GRACE = 5.0        # seconds to keep running after the first flip so frames get dumped
 POLL = 0.2
@@ -77,12 +83,13 @@ def parse_milestones(text):
     return {"keys": keys, "kv": kv, "counts": counts, "ended": ended}
 
 
-def classify(returncode, timed_out, hung, keys):
-    """One of OUTCOMES. returncode is None when the harness killed the process."""
+def classify(returncode, timed_out, hung, keys, frames):
+    """One of OUTCOMES. returncode is None when the harness killed the process. A first
+    frame needs both the flip key and at least one dumped frame."""
     if returncode is not None and (returncode < 0 or returncode > 128):
         return "crashed"
     if FLIP_KEY in keys:
-        return "first_frame"
+        return "first_frame" if frames >= 1 else "flip_no_frame"
     if hung:
         return "hung"
     if timed_out:
@@ -143,6 +150,7 @@ def _sample(pid, path):
 def _summary(rep, tree):
     said = {
         "first_frame": "The game reached its first frame.",
+        "flip_no_frame": "The game presented a frame (a guest flip), but no frame was dumped.",
         "exited": "The game ended by itself before drawing a frame.",
         "crashed": "The game crashed before drawing a frame.",
         "hung": "The game stopped making progress and was stopped.",
@@ -159,6 +167,9 @@ def _summary(rep, tree):
              f"- SPU images run in the interpreter (lift them: translate_game.py): "
              f"{len(rep['spu_interpreted'])}",
              f"- Run folder: {rep['run']}"]
+    if rep.get("play_reused"):
+        lines.append(f"- Warning: the play folder was already used by run {rep['play_reused']}; "
+                     f"run scripts/prepare_play.py --force for a clean one")
     if rep["backtraces"]:
         lines += ["", "Where it was stuck (first lines):", "", "```"]
         lines += rep["backtraces"].splitlines()[:40] + ["```"]
@@ -179,8 +190,13 @@ def boot(gt6, tree, seconds=300, idle=60, headless=True, env=None):
         raise SystemExit(f"error: ELF not found: {elf}")
     if not gt6.is_file():
         raise SystemExit(f"error: gt6 binary not found: {gt6}")
-    run = tree / "runs" / datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
-    run.mkdir(parents=True, exist_ok=False)
+    reused = _mark_booted(tree / "play" / "prepare.json", None)
+    run = _new_run(tree / "runs")
+    _mark_booted(tree / "play" / "prepare.json", run.name)
+    if reused:
+        print(f"warning: {tree}/play was already used by run {reused}; the game's first run "
+              f"changes it. For a clean boot run: scripts/prepare_play.py \"{tree}\" --force",
+              file=sys.stderr)
     (run / "frames").mkdir()
     child_env = build_env(tree, run, headless, env)
     start = time.monotonic()
@@ -219,8 +235,9 @@ def boot(gt6, tree, seconds=300, idle=60, headless=True, env=None):
     ms = parse_milestones(_read(run / "milestones.log"))
     keys = ms["keys"]
     err = _read(run / "stderr.log") + _read(run / "stdout.log")
+    frames = sum(1 for f in (run / "frames").iterdir() if f.is_file())
     rep = {
-        "outcome": classify(returncode, timed_out, hung, keys),
+        "outcome": classify(returncode, timed_out, hung, keys, frames),
         "seconds": elapsed,
         "returncode": returncode,
         "last_keys": keys[-20:],
@@ -228,7 +245,8 @@ def boot(gt6, tree, seconds=300, idle=60, headless=True, env=None):
         "unimplemented_syscalls": sorted({int(n) for n in SYSCALL_RE.findall(err)}),
         "spu_interpreted": {k[len(INTERP_KEY):]: ms["counts"].get(k, "1")
                             for k in keys if k.startswith(INTERP_KEY)},
-        "frames": sum(1 for f in (run / "frames").iterdir() if f.is_file()),
+        "frames": frames,
+        "play_reused": reused,
         "backtraces": backtraces,
         "pid": proc.pid,
         "run": str(run),
@@ -236,6 +254,36 @@ def boot(gt6, tree, seconds=300, idle=60, headless=True, env=None):
     (run / "report.json").write_text(json.dumps(rep, indent=2) + "\n")
     (run / "summary.md").write_text(_summary(rep, tree))
     return rep
+
+
+def _new_run(runs):
+    """A new <runs>/<UTC yyyymmdd-HHMMSS> folder (waits for the next second if taken)."""
+    runs.mkdir(parents=True, exist_ok=True)
+    while True:
+        run = runs / datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
+        try:
+            run.mkdir()
+            return run
+        except FileExistsError:
+            time.sleep(0.2)
+
+
+def _mark_booted(prepare_json, run_name):
+    """With run_name None, return the run an earlier boot recorded in prepare.json (or None);
+    otherwise record run_name there as "booted". An unreadable prepare.json is left alone."""
+    try:
+        rec = json.loads(Path(prepare_json).read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(rec, dict):
+        return None
+    if run_name is None:
+        return rec.get("booted")
+    rec["booted"] = run_name
+    tmp = Path(prepare_json).with_name(".prepare.json.tmp")
+    tmp.write_text(json.dumps(rec, indent=1) + "\n")
+    tmp.rename(prepare_json)
+    return run_name
 
 
 def _unresolved(err, keys):
