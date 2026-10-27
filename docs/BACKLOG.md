@@ -16,7 +16,7 @@ Shortcuts taken, with the proper fix logged. Priority order: 1) Stability, 2) Pe
 - Other regions (US BCUS-98394, Japan, Asia): per-edition hash manifests, update lists, address tables.
 - Paid DLC needing PSN licence files or console-bound decryption.
 - Player-side update download: fetch the updates directly, with TLS checked against Sony root certificates taken from the disc's update package, and without RPCS3 (spec section 6.1).
-- Read the ISO without `hdiutil` (macOS-only today).
+- Read the `.iso` directly. Today the player mounts it first (`hdiutil attach`, macOS only) and `gt6unpack` reads the mounted folder.
 - The IRD check (see the first Unpacker item).
 
 ## Milestone 2 open questions

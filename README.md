@@ -33,6 +33,42 @@ something.
 
 Online play is out of scope (Sony shut the servers down in 2018).
 
+## Unpack your copy (developer preview)
+
+This turns your own disc image and the official updates into a verified version 1.22 game
+folder. It is a developer tool for now; nothing is playable yet. It needs an Apple Silicon Mac
+with Xcode's command line tools and CMake, a decrypted disc image of BCES-01977 (`.iso`),
+and the update files from Sony's update server: 21 packages, 1.02 to 1.22, 11.2 GB, as named
+in the list Sony publishes for the title (`BCES01977-ver.xml`). Each package is checked against
+Sony's SHA-1 before anything is written. A downloader that fetches them for you is planned
+(see `docs/BACKLOG.md`).
+
+```sh
+# 1. Build the tool (from the repository folder).
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+
+# 2. Mount the disc image read-only. The tool reads a folder, not the .iso itself.
+mkdir -p /private/tmp/gt6iso
+hdiutil attach -readonly -nobrowse -mountpoint /private/tmp/gt6iso "/path/to/Gran Turismo 6.iso"
+
+# 3. Build the game folder. --out must be a new folder outside this repository
+#    (the tool refuses a folder inside a git work tree). About 25 GB; a few minutes.
+build/tools/gt6unpack/gt6unpack build --disc /private/tmp/gt6iso \
+    --updates "/path/to/updates" --out "/path/to/build/BCES01977-v1.22"
+
+# 4. Check it against the recorded v1.22 hashes. "0 mismatched, 0 missing" means it matches.
+build/tools/gt6unpack/gt6unpack verify "/path/to/build/BCES01977-v1.22" \
+    --manifest manifests/BCES01977-v1.22.json
+
+# 5. Unmount the disc image.
+hdiutil detach /private/tmp/gt6iso
+```
+
+`--force` rebuilds over a folder that an earlier `gt6unpack build` made; it never replaces
+any other folder. Keep the game folder outside this repository so its files can never be
+committed.
+
 ## Guard against game files
 
 `scripts/check_no_game_files.py` refuses a file when any of these is true:
