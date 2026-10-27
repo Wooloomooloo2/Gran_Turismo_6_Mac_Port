@@ -29,6 +29,11 @@ fingerprint is wrapped as an SPU ELF (wrap_spu_elf), lifted (spu_lifter
 --auto-functions) and registered by that fingerprint in spu/spu_missed_register.c, so
 the next build runs it as native code; counts in translate.json["spu"]["missed"].
 
+Before anything is lifted, patches/ps3recomp is applied to the ps3recomp in use (the
+folder above --ps3recomp's tools/) with scripts/apply_ps3recomp_patches.sh, then checked
+with its --verify; translate refuses unless every patch is in, and only then records the
+patches' hash in translate.json (D28).
+
 Output (replaced as a whole on every run, via <out>.staging and <out>.old):
 
     <out>/ppu/        ppu_recomp.h, ppu_recomp_NNN.cpp, ppu_recomp_table.cpp
@@ -43,11 +48,15 @@ Output (replaced as a whole on every run, via <out>.staging and <out>.old):
     <out>/translate.json   what was translated, with what, and how long it took
 
 The outputs are derived from the game, so <out> must not be inside a git work
-tree (D26). Tools run through map_game.run_tool (isolated Python, D22).
+tree (D26). An existing <out> is replaced only if it holds a translate.json this tool
+wrote, and never when <out>, <out>.staging or <out>.old is the tree or contains it; a
+leftover <out>.staging or <out>.old is removed only if it carries this tool's marker or
+translate.json. Tools run through map_game.run_tool (isolated Python, D22).
 """
 import argparse
 import hashlib
 import json
+import os
 import re
 import shutil
 import struct
@@ -61,6 +70,12 @@ import map_game  # noqa: E402
 
 REPO = map_game.REPO
 PATCHES = REPO / "patches" / "ps3recomp"
+APPLY = REPO / "scripts" / "apply_ps3recomp_patches.sh"
+TOOL = "scripts/translate_game.py"
+STAGING_MARK = ".translate_game-staging"
+# The fields of a translate.json written before "tool" was recorded (milestone 2).
+LEGACY_KEYS = {"elf", "elf_sha256", "ps3recomp_commit", "ps3recomp_patches", "code_end",
+               "chunks", "functions"}
 ELF_REL = Path("decrypted") / map_game.TITLE_USRDIR / "EMAIN.SELF.elf"
 SHF_EXECINSTR = 0x4
 
@@ -120,6 +135,61 @@ def patches_hash(folder=PATCHES):
     return h.hexdigest()
 
 
+def ensure_patches(sub, patches=None):
+    """Apply patches (default patches/ps3recomp) to the ps3recomp checkout at sub, then
+    verify that every one is applied; return their hash. Refuses (SystemExit) otherwise."""
+    patches = Path(patches or PATCHES)
+    env = dict(os.environ, GT6_PS3RECOMP_DIR=str(sub), GT6_PS3RECOMP_PATCHES=str(patches))
+    for mode in ([], ["--verify"]):
+        p = subprocess.run(["bash", str(APPLY), *mode], env=env, capture_output=True, text=True)
+        if p.returncode != 0:
+            raise SystemExit(
+                f"error: the ps3recomp patches in {patches} are not all applied to {sub}:\n"
+                f"{p.stdout}{p.stderr}"
+                f"To start over from the pinned commit: "
+                f"git -C \"{sub}\" checkout . && git -C \"{sub}\" clean -fd")
+    return patches_hash(patches)
+
+
+def _made_by_us(folder):
+    """True if folder holds a translate.json written by this tool (or by its milestone 2
+    version, which did not record "tool")."""
+    try:
+        rec = json.loads((Path(folder) / "translate.json").read_text())
+    except (OSError, ValueError):
+        return False
+    if not isinstance(rec, dict):
+        return False
+    return rec.get("tool") == TOOL or ("tool" not in rec and LEGACY_KEYS <= rec.keys())
+
+
+def _ours(folder):
+    """A staging or .old folder this tool left: it has the staging marker or translate.json."""
+    return (Path(folder) / STAGING_MARK).is_file() or _made_by_us(folder)
+
+
+def check_out(tree, out):
+    """Refuse an out this tool must not replace (see the module docstring)."""
+    staging, old = _staging(out), _old(out)
+    for p in (out, staging, old):
+        if p == tree or p in tree.parents:
+            raise SystemExit(f"error: {p} is the game tree or contains it; refusing")
+    if out.exists() and not _made_by_us(out):
+        raise SystemExit(f"error: {out} exists and has no translate.json written by {TOOL}; "
+                         f"refusing to replace a folder this tool did not make")
+    for p in (staging, old):
+        if p.exists() and not _ours(p):
+            raise SystemExit(f"error: {p} exists and was not made by {TOOL}; refusing")
+
+
+def _staging(out):
+    return out.with_name(out.name + ".staging")
+
+
+def _old(out):
+    return out.with_name(out.name + ".old")
+
+
 def in_git_work_tree(path):
     """True if path (which may not exist yet) is inside the repo or any git work tree."""
     path = path.resolve()
@@ -134,8 +204,9 @@ def in_git_work_tree(path):
 
 
 def _swap_in(staging, out):
-    """Replace out with staging, keeping out.old until the swap has succeeded."""
-    old = out.with_name(out.name + ".old")
+    """Replace out with staging, keeping out.old until the swap has succeeded. check_out
+    has already refused an out or out.old this tool did not make."""
+    old = _old(out)
     if old.exists():
         if not out.exists():
             old.rename(out)  # an earlier run died between the two renames
@@ -212,7 +283,7 @@ def _lifter_stats(log_text):
 
 def lift_missed(missed, staging, python, tools, logs):
     """Lift the images the game dumped to `missed` (D33) into staging/spu."""
-    out = {"found": 0, "lifted": 0, "partial": [], "rejected": [], "failed": []}
+    out = {"found": 0, "lifted": 0, "partial": [], "rejected": [], "failed": [], "duplicate": []}
     if missed is None or not missed.is_dir():
         return out
     spu = staging / "spu"
@@ -231,6 +302,11 @@ def lift_missed(missed, staging, python, tools, logs):
             continue
         base = MISSED_BASE[kind]
         name = f"missed_{fp:016x}"
+        if (spu / name).exists() or name in {e["name"] for e in manifest}:
+            # The same bytes dumped as both kinds: the registry keys on the fingerprint,
+            # so only one can be registered; the first (spujob_ sorts first) is kept.
+            out["duplicate"].append(f.name)
+            continue
         img_logs = logs / name
         img_logs.mkdir()
         elf = inputs / f"{name}.elf"
@@ -281,6 +357,12 @@ def lift_missed(missed, staging, python, tools, logs):
     return out
 
 
+def _has_longjmp_rewrite(ppu):
+    """True if a lifted PPU source calls ppu_sjlj_longjmp (the patch 0009 rewrite)."""
+    return any(b"ppu_sjlj_longjmp(" in f.read_bytes()
+               for f in sorted(ppu.glob("*.cpp")) + sorted(ppu.glob("*.c")))
+
+
 def lift_spu(elf, data, staging, python, tools, logs, missed_dir=None):
     """The SPU step: lift EMAIN's SPU programs and job modules, and the images dumped to
     missed_dir at run time, into staging/spu."""
@@ -312,24 +394,30 @@ def lift_spu(elf, data, staging, python, tools, logs, missed_dir=None):
             "seconds": round(time.monotonic() - t0, 2)}
 
 
-def translate(tree, out, python, tools, chunks=64, jobs=None):
+def translate(tree, out, python, tools, chunks=64, jobs=None, patches=None):
     tree = Path(tree).resolve()
     out = Path(out).resolve()
     tools = Path(tools)
     if in_git_work_tree(out):
         raise SystemExit(f"error: {out} is inside a git work tree; translated code is "
                          f"derived from the game and must live outside it")
+    check_out(tree, out)
     elf = tree / ELF_REL
     if not elf.is_file():
         raise SystemExit(f"error: ELF not found: {elf}")
     data = elf.read_bytes()
     end = code_end(data)
+    # The lifter must be the patched one (D28); the hash is recorded only once every patch
+    # is verified as applied.
+    applied_hash = ensure_patches(tools.parent, patches)
 
-    staging = out.with_name(out.name + ".staging")
+    staging = _staging(out)
     if staging.exists():
-        shutil.rmtree(staging)
+        shutil.rmtree(staging)                 # check_out: left by a killed run of ours
+    staging.mkdir(parents=True)
+    (staging / STAGING_MARK).write_text("")
     logs = staging / "logs"
-    logs.mkdir(parents=True)
+    logs.mkdir()
     try:
         seconds, status = {}, {}
         status["loader"] = map_game.run_tool(python, tools, "ppu_loader",
@@ -353,12 +441,17 @@ def translate(tree, out, python, tools, chunks=64, jobs=None):
         m = re.search(r"(\d+) functions lifted", (logs / "ppu_lifter.log").read_text())
         if not m:
             raise SystemExit("error: ppu_lifter did not report a function count")
+        if setjmps and longjmps and not _has_longjmp_rewrite(staging / "ppu"):
+            raise SystemExit("error: ppu_lifter was given --longjmp but no ppu_sjlj_longjmp "
+                             "call is in the lifted code; a guest longjmp would not unwind "
+                             f"(D34). See {logs / 'ppu_lifter.log'}")
         spu = lift_spu(elf, data, staging, python, tools, logs, tree / "spu-missed")
         record = {
+            "tool": TOOL,
             "elf": ELF_REL.as_posix(),
             "elf_sha256": map_game.sha256_file(elf),
             "ps3recomp_commit": map_game.ps3recomp_commit(tools.parent),
-            "ps3recomp_patches": patches_hash(),
+            "ps3recomp_patches": applied_hash,
             "code_end": hex(end),
             "chunks": chunks,
             "functions": int(m.group(1)),
@@ -367,6 +460,7 @@ def translate(tree, out, python, tools, chunks=64, jobs=None):
             "spu": spu,
         }
         (staging / "translate.json").write_text(json.dumps(record, indent=1))
+        (staging / STAGING_MARK).unlink()      # translate.json marks it as ours from here
         _swap_in(staging, out)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)

@@ -3,6 +3,7 @@ import importlib.util
 import json
 import os
 import struct
+import subprocess
 import sys
 from pathlib import Path
 
@@ -17,6 +18,17 @@ translate_game = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(translate_game)
 
 ELF_REL = "decrypted/dev_hdd0/game/BCES01977/USRDIR/EMAIN.SELF.elf"
+REAL_PATCHES = translate_game.PATCHES
+SUB = REPO / "third_party" / "ps3recomp"
+
+
+@pytest.fixture(autouse=True)
+def no_patches(tmp_path, monkeypatch):
+    """Fake-tool tests apply an empty patch set; the real ones pass patches=REAL_PATCHES."""
+    d = tmp_path / "no-patches"
+    d.mkdir()
+    monkeypatch.setattr(translate_game, "PATCHES", d)
+    return d
 
 
 def make_elf(sections):
@@ -124,8 +136,12 @@ if base == "0xa00":
 
 
 def fake_tools(root, tag, n, two=False, partial=False, unsup=False):
-    tools = root / "tools"
-    tools.mkdir(exist_ok=True)
+    """Fake ps3recomp tools in root/ps3recomp/tools; root/ps3recomp is a git work tree, as
+    the submodule is, so the patch step (apply_ps3recomp_patches.sh) can run on it."""
+    tools = root / "ps3recomp" / "tools"
+    tools.mkdir(parents=True, exist_ok=True)
+    if not (tools.parent / ".git").exists():
+        subprocess.run(["git", "init", "-q", str(tools.parent)], check=True)
     (tools / "ppu_loader.py").write_text(LOADER)
     extra = '(out / "ppu_recomp_001.cpp").write_text("x")' if two else ""
     (tools / "ppu_lifter.py").write_text(LIFTER.format(tag=tag, n=n, extra=extra))
@@ -173,15 +189,16 @@ def test_rerun_replaces_atomically(tree, tmp_path):
     translate_game.translate(tree, out, sys.executable, fake_tools(tmp_path, "two", 7))
     assert sorted(p.name for p in (out / "ppu").iterdir()) == ["ppu_recomp_000.cpp"]
     assert (out / "ppu" / "ppu_recomp_000.cpp").read_text() == "two"
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["out", "tools", "tree"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["no-patches", "out", "ps3recomp", "tree"]
 
 
 def test_record_fields(tree, tmp_path):
     out = tmp_path / "out"
     rec = translate_game.translate(tree, out, sys.executable, fake_tools(tmp_path, "a", 4242))
     assert json.loads((out / "translate.json").read_text()) == rec
-    assert set(rec) == {"elf", "elf_sha256", "ps3recomp_commit", "ps3recomp_patches",
+    assert set(rec) == {"tool", "elf", "elf_sha256", "ps3recomp_commit", "ps3recomp_patches",
                         "code_end", "chunks", "functions", "sjlj", "seconds", "spu"}
+    assert rec["tool"] == "scripts/translate_game.py"
     assert rec["sjlj"] == {"setjmp": [], "longjmp": []}
     assert rec["elf"] == ELF_REL
     assert rec["code_end"] == "0x10320"
@@ -208,7 +225,8 @@ def test_spu_record_with_fake_tools(tree, tmp_path):
     rec = translate_game.translate(tree, out, sys.executable, fake_tools(tmp_path, "a", 1))
     spu = rec["spu"]
     assert set(spu) == {"images", "jobmods", "partial", "missed", "seconds"}
-    assert spu["missed"] == {"found": 0, "lifted": 0, "partial": [], "rejected": [], "failed": []}
+    assert spu["missed"] == {"found": 0, "lifted": 0, "partial": [], "rejected": [], "failed": [],
+                             "duplicate": []}
     assert spu["images"] == 2
     manifest = json.loads((out / "spu" / "jobmods_manifest.json").read_text())
     assert spu["jobmods"] == len(manifest) == 2
@@ -242,7 +260,7 @@ def test_spu_tool_failure_keeps_previous_output(tree, tmp_path):
         translate_game.translate(tree, out, sys.executable, tools)
     assert "lift_jobmods failed" in str(e.value)
     assert (out / "ppu" / "ppu_recomp_000.cpp").read_text() == "one"
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["out", "tools", "tree"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["no-patches", "out", "ps3recomp", "tree"]
 
 
 def make_elf_with_code(words, addr=0x10200):
@@ -277,7 +295,15 @@ def test_sjlj_passed_to_the_lifter(tmp_path):
     lifter = original.replace(
         old, 'assert a[a.index("--setjmp") + 1] == "0x10300" and a[a.index("--longjmp") + 1] == "0x10318", a')
     assert lifter != original
+    # Without the longjmp rewrite in ppu/ the translate fails (item 13): a lifter that took
+    # --longjmp but rewrote nothing would silently stop unwinding.
     (tools / "ppu_lifter.py").write_text(lifter)
+    with pytest.raises(SystemExit, match="ppu_sjlj_longjmp"):
+        translate_game.translate(t, tmp_path / "out", sys.executable, tools)
+    assert not (tmp_path / "out").exists()
+    (tools / "ppu_lifter.py").write_text(lifter.replace(
+        '(out / "ppu_recomp_000.cpp").write_text("{tag}")'.format(tag="a"),
+        '(out / "ppu_recomp_000.cpp").write_text("ppu_sjlj_longjmp(ctx, 0);")'))
     rec = translate_game.translate(t, tmp_path / "out", sys.executable, tools)
     assert rec["sjlj"] == {"setjmp": ["0x10300"], "longjmp": ["0x10318"]}
 
@@ -331,7 +357,7 @@ def test_real_spu(tmp_path):
     out = tmp_path / "recomp"
     rec = translate_game.translate(
         Path(os.environ["GT6_TREE"]), out, sys.executable,
-        translate_game.map_game.DEFAULT_PS3RECOMP / "tools")
+        translate_game.map_game.DEFAULT_PS3RECOMP / "tools", patches=REAL_PATCHES)
     spu = rec["spu"]
     print(f"\nSPU: {spu}")
     assert spu["images"] == 4
@@ -346,8 +372,180 @@ def test_real_emain(tmp_path):
     out = tmp_path / "recomp"
     rec = translate_game.translate(
         Path(os.environ["GT6_TREE"]), out, sys.executable,
-        translate_game.map_game.DEFAULT_PS3RECOMP / "tools")
+        translate_game.map_game.DEFAULT_PS3RECOMP / "tools", patches=REAL_PATCHES)
     assert rec["functions"] > 60000
     assert rec["code_end"] == "0x101bea0"
     total = sum(p.stat().st_size for p in (out / "ppu").rglob("*") if p.is_file())
     assert total < 600 * 1024 * 1024
+
+
+def test_spu_missed_same_bytes_as_job_and_policy_module_is_lifted_once(tree, tmp_path):
+    """The same bytes dumped as spujob_ and spupm_ share a fingerprint; the registry keys on
+    it, so only the first is lifted and the other is listed as a duplicate (item 11)."""
+    missed = tree / "spu-missed"
+    missed.mkdir()
+    img = b"\x40\x80\x00\x05" * 8
+    fp = translate_game.fnv1a64(img)
+    (missed / f"spujob_{fp:016X}_{len(img)}.bin").write_bytes(img)
+    (missed / f"spupm_{fp:016X}_{len(img)}.bin").write_bytes(img)
+    rec = translate_game.translate(tree, tmp_path / "out", sys.executable, fake_tools(tmp_path, "a", 1))
+    m = rec["spu"]["missed"]
+    assert m["found"] == 2 and m["lifted"] == 1 and m["failed"] == []
+    assert m["duplicate"] == [f"spupm_{fp:016X}_{len(img)}.bin"]
+    man = json.loads((tmp_path / "out" / "spu" / "spu_missed_manifest.json").read_text())
+    assert [e["kind"] for e in man] == ["spujob"]
+
+
+# ---- ps3recomp patches (item 1): applied and verified before the lifter runs -------------
+
+UNPATCHED = 'import sys; sys.exit("unpatched lifter: no --setjmp")\n'
+
+
+def git(*args, cwd):
+    return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True,
+                          text=True).stdout
+
+
+def make_patch(repo, rel, new_text, patches, name="0001-fix.patch"):
+    """A patch (git diff) taking repo/rel to new_text; repo/rel is left unchanged."""
+    f = repo / rel
+    old = f.read_text()
+    git("add", rel, cwd=repo)
+    f.write_text(new_text)
+    diff = git("diff", "--", rel, cwd=repo)
+    f.write_text(old)
+    patches.mkdir(exist_ok=True)
+    (patches / name).write_text("Upstream: not yet submitted\n\n" + diff)
+    return patches / name
+
+
+def unpatched_tools(tmp_path):
+    """Fake tools whose lifter only works once the patch in tmp_path/patches is applied."""
+    tools = fake_tools(tmp_path, "a", 3)
+    lifter = (tools / "ppu_lifter.py").read_text()
+    (tools / "ppu_lifter.py").write_text(UNPATCHED + lifter)
+    patches = tmp_path / "patches"
+    make_patch(tools.parent, "tools/ppu_lifter.py", lifter, patches)
+    return tools, patches, lifter
+
+
+def test_translate_applies_the_patches_first(tree, tmp_path):
+    tools, patches, lifter = unpatched_tools(tmp_path)
+    out = tmp_path / "out"
+    rec = translate_game.translate(tree, out, sys.executable, tools, patches=patches)
+    assert (tools / "ppu_lifter.py").read_text() == lifter     # patched in place
+    assert rec["functions"] == 3
+    assert rec["ps3recomp_patches"] == translate_game.patches_hash(patches)
+    # Already applied: a second run skips the patch and records the same hash.
+    rec = translate_game.translate(tree, out, sys.executable, tools, patches=patches)
+    assert rec["ps3recomp_patches"] == translate_game.patches_hash(patches)
+
+
+def test_translate_refuses_when_a_patch_does_not_apply(tree, tmp_path):
+    tools, patches, _ = unpatched_tools(tmp_path)
+    (patches / "0002-bad.patch").write_text(
+        "Upstream: not yet submitted\n"
+        "diff --git a/no/such/file.c b/no/such/file.c\n"
+        "--- a/no/such/file.c\n+++ b/no/such/file.c\n@@ -1 +1 @@\n-x\n+y\n")
+    out = tmp_path / "out"
+    with pytest.raises(SystemExit) as e:
+        translate_game.translate(tree, out, sys.executable, tools, patches=patches)
+    assert "0002-bad.patch" in str(e.value) and "clean -fd" in str(e.value)
+    # Nothing ran and nothing was written.
+    assert not out.exists() and not (tmp_path / "out.staging").exists()
+
+
+def test_ensure_patches_on_an_unpatched_export_of_the_pin(tmp_path):
+    """A fresh export of the pinned ps3recomp (no patches): translate's patch step applies
+    every patch in patches/ps3recomp, then verifies all of them, then gives the hash."""
+    if not (SUB / ".git").exists():
+        pytest.skip("no ps3recomp checkout")
+    pin = git("ls-tree", "HEAD", "third_party/ps3recomp", cwd=REPO).split()[2]
+    export = tmp_path / "ps3recomp"
+    export.mkdir()
+    archive = subprocess.run(["git", "archive", pin], cwd=SUB, check=True,
+                             capture_output=True).stdout
+    subprocess.run(["tar", "-x", "-C", str(export)], input=archive, check=True)
+    subprocess.run(["git", "init", "-q", str(export)], check=True)
+    assert "--setjmp" not in (export / "tools" / "ppu_lifter.py").read_text()
+    h = translate_game.ensure_patches(export, REAL_PATCHES)
+    assert h == translate_game.patches_hash(REAL_PATCHES)
+    assert "--setjmp" in (export / "tools" / "ppu_lifter.py").read_text()
+    assert (export / "runtime" / "ppu" / "ppu_sjlj.h").is_file()
+    assert translate_game.ensure_patches(export, REAL_PATCHES) == h
+
+
+# ---- the output folder (item 2): only ever replace what this tool made ------------------
+
+def test_refuses_an_existing_out_this_tool_did_not_make(tree, tmp_path):
+    tools = fake_tools(tmp_path, "a", 1)
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "keep.txt").write_text("not ours")
+    with pytest.raises(SystemExit, match="translate.json"):
+        translate_game.translate(tree, out, sys.executable, tools)
+    assert (out / "keep.txt").read_text() == "not ours"
+    (out / "translate.json").write_text('{"tool": "something else"}')
+    with pytest.raises(SystemExit, match="translate.json"):
+        translate_game.translate(tree, out, sys.executable, tools)
+    assert (out / "keep.txt").read_text() == "not ours"
+    assert not (tmp_path / "out.staging").exists()
+
+
+def test_replaces_an_out_from_before_the_tool_field(tree, tmp_path):
+    """A translate.json written before "tool" was recorded still counts as ours."""
+    tools = fake_tools(tmp_path, "a", 1)
+    out = tmp_path / "out"
+    translate_game.translate(tree, out, sys.executable, tools)
+    rec = json.loads((out / "translate.json").read_text())
+    del rec["tool"]
+    (out / "translate.json").write_text(json.dumps(rec))
+    translate_game.translate(tree, out, sys.executable, tools)
+    assert json.loads((out / "translate.json").read_text())["tool"] == "scripts/translate_game.py"
+
+
+def test_never_replaces_the_tree_or_its_ancestors(tree, tmp_path):
+    tools = fake_tools(tmp_path, "a", 1)
+    for target in (tree, tmp_path):
+        (target / "translate.json").write_text(json.dumps({"tool": "scripts/translate_game.py"}))
+        with pytest.raises(SystemExit, match="game tree"):
+            translate_game.translate(tree, target, sys.executable, tools)
+        assert (tree / ELF_REL).is_file()
+        (target / "translate.json").unlink()
+    # Nor when out's staging or .old name is the tree.
+    for suffix in (".staging", ".old"):
+        other = tmp_path / ("g" + suffix)
+        other.mkdir()
+        (tree / "decrypted").rename(other / "decrypted")
+        (other / ".translate_game-staging").write_text("")
+        with pytest.raises(SystemExit, match="game tree"):
+            translate_game.translate(other, tmp_path / "g", sys.executable, tools)
+        assert (other / ELF_REL).is_file()
+        (other / "decrypted").rename(tree / "decrypted")
+
+
+def test_staging_and_old_are_removed_only_when_ours(tree, tmp_path):
+    tools = fake_tools(tmp_path, "a", 1)
+    out = tmp_path / "out"
+    for leftover in ("out.staging", "out.old"):
+        d = tmp_path / leftover
+        d.mkdir()
+        (d / "keep.txt").write_text("not ours")
+        with pytest.raises(SystemExit, match="not made by"):
+            translate_game.translate(tree, out, sys.executable, tools)
+        assert (d / "keep.txt").read_text() == "not ours"
+        assert not out.exists()
+        (d / "keep.txt").unlink()
+        d.rmdir()
+    # Left by a killed run: a staging folder with the marker, or (killed after the marker
+    # was dropped) with this tool's translate.json, and an old folder with translate.json.
+    translate_game.translate(tree, out, sys.executable, tools)
+    for leftover, mark in (("out.staging", ".translate_game-staging"),
+                           ("out.staging", "translate.json"), ("out.old", "translate.json")):
+        d = tmp_path / leftover
+        d.mkdir()
+        (d / mark).write_text(json.dumps({"tool": "scripts/translate_game.py"}))
+        translate_game.translate(tree, out, sys.executable, tools)
+        assert not d.exists()
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["no-patches", "out", "ps3recomp", "tree"]
+    assert not (out / ".translate_game-staging").exists()
