@@ -7,11 +7,19 @@ Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0004)
 What: the context-style sys_lwcond in runtime/ppu/ppu_sysprx.cpp gets a real
 waiter queue. sys_lwcond_wait queues itself, releases the lwmutex, blocks
 until a signal or its timeout (microseconds, 0 forever) and takes the
-lwmutex back. sys_lwcond_signal wakes the oldest waiter, _signal_all every
-waiter, _signal_to the named thread. Answers follow RPCS3's sys_lwcond_.cpp
-and lv2/sys_lwcond.cpp: waiting without the lwmutex is CELL_EPERM, expiry is
+lwmutex back. sys_lwcond_signal wakes the next waiter by the paired
+lwmutex's protocol (SYS_SYNC_PRIORITY, the default: the highest priority,
+the oldest among equals; SYS_SYNC_FIFO: the oldest; SYS_SYNC_RETRY counts as
+priority), _signal_all every waiter, _signal_to the named thread. Answers
+follow RPCS3's sys_lwcond_.cpp, lv2/sys_lwcond.cpp and lv2/sys_sync.h
+(schedule): waiting without the lwmutex is CELL_EPERM, expiry is
 CELL_ETIMEDOUT with the lwmutex held, a signal with no waiter is lost
-(CELL_OK), signal_to a thread that is not waiting is CELL_EPERM.
+(CELL_OK), signal_to a thread that is not waiting is CELL_EPERM and to one
+that does not exist CELL_ESRCH, destroying an lwcond a thread sleeps on is
+CELL_EBUSY. sys_ppu_thread.c gains ppu_thread_query (exists? priority?).
+The queue's mutex and condition variable are leaked heap objects, so a
+guest thread still waiting while exit() runs static destructors never
+waits on a destroyed object.
 
 Why: the wait was a 1 ms poll and every signal a no-op, so every wait was a
 spurious wakeup. Code whose wait has no predicate loop then runs on state
@@ -24,8 +32,9 @@ One global queue lock and condition variable serve every lwcond: waking is
 notify_all, and each waiter checks its own flag. Simple and enough for
 boot; a per-lwcond channel would cut wakeups for titles with many waiters.
 
-Test: tools/test_lwcond_wakeup.py (new); tools/test_lwcond_layout.py now
-builds the waiter queue too.
+Test: tools/test_lwcond_wakeup.py (new: wakeups, timeouts, wake order per
+protocol, EBUSY, ESRCH); tools/test_lwcond_layout.py now builds the waiter
+queue too.
 
 --- a/runtime/ppu/ppu_sysprx.cpp
 +++ b/runtime/ppu/ppu_sysprx.cpp
@@ -39,7 +48,7 @@ builds the waiter queue too.
  /* win32_compat.h is <windows.h> on Windows (CRITICAL_SECTION for the real
   * lwmutex exclusion) and the POSIX shims elsewhere -- Sleep, DWORD, QPC. */
  #include "../platform/win32_compat.h"
-@@ -391,14 +394,69 @@
+@@ -391,14 +394,96 @@
  }
  
  /* sys_lwcond (sysPrxForUser) — guest-side condition variable, paired with an
@@ -66,39 +75,66 @@ builds the waiter queue too.
 + * lv2/sys_lwcond.cpp (GPL-2.0): waiting without holding the lwmutex is
 + * CELL_EPERM; the timeout is in microseconds, 0 forever, and expiry answers
 + * CELL_ETIMEDOUT with the lwmutex held again; a signal with no waiter is lost
-+ * and answers CELL_OK; signal_to a thread that is not waiting is CELL_EPERM.
++ * and answers CELL_OK; signal_to a thread that is not waiting is CELL_EPERM,
++ * to one that does not exist CELL_ESRCH; destroying an lwcond with a thread
++ * asleep on it is CELL_EBUSY. A signal wakes by the lwmutex protocol: the
++ * highest-priority waiter (SYS_SYNC_PRIORITY, the default), or the oldest
++ * (SYS_SYNC_FIFO).
 + * A waiter queues itself before it lets go of the lwmutex, so a signal sent
 + * the moment the lwmutex is free cannot be missed. */
 +/* lwcond-waiters: begin */
-+struct LwcWaiter { uint32_t lwcond; uint32_t tid; bool woken; LwcWaiter* next; };
-+static std::mutex g_lwc_mu;
-+static std::condition_variable g_lwc_cv;
-+static LwcWaiter* g_lwc_head = nullptr;          /* FIFO, oldest first */
-+static void lwc_enqueue(LwcWaiter* w)
++/* Whether thread `tid` exists, and its priority (runtime/syscalls/sys_ppu_thread.c). */
++extern "C" int ppu_thread_query(uint64_t tid, int32_t* prio);
++struct LwcWaiter {
++    uint32_t lwcond; uint32_t tid; int32_t prio; uint32_t protocol; bool woken; LwcWaiter* next;
++};
++/* Leaked on purpose: guest threads may still sit in a wait while exit() runs
++ * the static destructors, and a destroyed mutex under a waiter is undefined. */
++static std::mutex& g_lwc_mu = *new std::mutex;
++static std::condition_variable& g_lwc_cv = *new std::condition_variable;
++static LwcWaiter* g_lwc_head = nullptr;          /* queue order, oldest first */
++/* Queue the calling thread on `lwcond`. The wake order is the protocol of the
++ * paired lwmutex, as lv2 takes it at sys_lwcond_create: SYS_SYNC_FIFO (1) wakes
++ * the oldest waiter, every other protocol the highest priority (lowest number,
++ * the oldest among equals); SYS_SYNC_RETRY is SYS_SYNC_PRIORITY for an lwcond. */
++static void lwc_enqueue(LwcWaiter* w, uint32_t lwcond, uint32_t tid, uint32_t lwmutex_attr)
 +{
++    int32_t prio = 1000;
++    ppu_thread_query(tid, &prio);
++    w->lwcond = lwcond; w->tid = tid; w->prio = prio;
++    w->protocol = lwmutex_attr & 0xF; w->woken = false; w->next = nullptr;
 +    std::lock_guard<std::mutex> hold(g_lwc_mu);
 +    LwcWaiter** pp = &g_lwc_head;
 +    while (*pp) pp = &(*pp)->next;
-+    w->next = nullptr;
 +    *pp = w;
 +}
-+/* Wake the oldest waiter on `lwcond` (tid 0xFFFFFFFF), the waiting thread
-+ * `tid`, or with `all` every one. Returns how many were woken. */
++/* Wake the next waiter on `lwcond` by its protocol (tid 0xFFFFFFFF), the
++ * waiting thread `tid`, or with `all` every one. Returns how many were woken. */
 +static int lwc_wake(uint32_t lwcond, uint32_t tid, bool all)
 +{
 +    int n = 0;
 +    {
 +        std::lock_guard<std::mutex> hold(g_lwc_mu);
++        LwcWaiter* pick = nullptr;
 +        for (LwcWaiter* w = g_lwc_head; w; w = w->next) {
 +            if (w->lwcond != lwcond || w->woken) continue;
-+            if (!all && tid != 0xFFFFFFFFu && w->tid != tid) continue;
-+            w->woken = true;
-+            n++;
-+            if (!all) break;
++            if (all) { w->woken = true; n++; continue; }
++            if (tid != 0xFFFFFFFFu) { if (w->tid == tid) { pick = w; break; } continue; }
++            if (!pick) { pick = w; if (w->protocol == 1) break; continue; }
++            if (w->prio < pick->prio) pick = w;     /* strictly higher: the older keeps a tie */
 +        }
++        if (pick) { pick->woken = true; n = 1; }
 +    }
 +    if (n) g_lwc_cv.notify_all();
 +    return n;
++}
++/* Whether any thread is still asleep on `lwcond`. */
++static bool lwc_has_waiters(uint32_t lwcond)
++{
++    std::lock_guard<std::mutex> hold(g_lwc_mu);
++    for (LwcWaiter* w = g_lwc_head; w; w = w->next)
++        if (w->lwcond == lwcond && !w->woken) return true;
++    return false;
 +}
 +/* Block until woken or `timeout_us` passes (0 = forever), then leave the
 + * queue. Returns whether a signal woke it. */
@@ -117,10 +153,11 @@ builds the waiter queue too.
  static void sys_lwcond_create(ppu_context* ctx)
  {
      static uint32_t s_lwcond_id = 0x4C000000u;
-@@ -409,29 +467,48 @@
+@@ -408,30 +493,59 @@
+     vm_write32(lwcond + 0x04, ++s_lwcond_id);
      ctx->gpr[3] = 0;
  }
- static void sys_lwcond_destroy(ppu_context* ctx)    { ctx->gpr[3] = 0; }
+-static void sys_lwcond_destroy(ppu_context* ctx)    { ctx->gpr[3] = 0; }
 -static void sys_lwcond_signal(ppu_context* ctx)     { ctx->gpr[3] = 0; }
 -static void sys_lwcond_signal_all(ppu_context* ctx) { ctx->gpr[3] = 0; }
 -static void sys_lwcond_signal_to(ppu_context* ctx)  { ctx->gpr[3] = 0; }
@@ -128,6 +165,11 @@ builds the waiter queue too.
 - * signaler. Release the paired lwmutex, wait briefly, reacquire (poll-style: the
 - * guest's while(!predicate) loop re-checks; signalers stay no-ops). Handles the
 - * common single (non-recursive) hold. */
++/* lv2 refuses to destroy an lwcond a thread still sleeps on (CELL_EBUSY). */
++static void sys_lwcond_destroy(ppu_context* ctx)
++{
++    ctx->gpr[3] = lwc_has_waiters((uint32_t)ctx->gpr[3]) ? (uint64_t)(int64_t)(int32_t)0x8001000Au : 0;  /* CELL_EBUSY */
++}
 +static void sys_lwcond_signal(ppu_context* ctx)
 +{
 +    lwc_wake((uint32_t)ctx->gpr[3], 0xFFFFFFFFu, false);
@@ -142,7 +184,13 @@ builds the waiter queue too.
 +{
 +    const uint32_t tid = (uint32_t)ctx->gpr[4];
 +    const int n = lwc_wake((uint32_t)ctx->gpr[3], tid, false);
-+    ctx->gpr[3] = (n || tid == 0xFFFFFFFFu) ? 0 : (uint64_t)(int64_t)(int32_t)0x80010009u;  /* CELL_EPERM */
++    int32_t prio;
++    if (n || tid == 0xFFFFFFFFu)
++        ctx->gpr[3] = 0;
++    else if (!ppu_thread_query(tid, &prio))
++        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005u;   /* CELL_ESRCH: no such thread */
++    else
++        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010009u;   /* CELL_EPERM: not waiting */
 +}
  static void sys_lwcond_wait(ppu_context* ctx)
  {
@@ -158,8 +206,8 @@ builds the waiter queue too.
 +            ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010009u;   /* CELL_EPERM */
 +            return;
 +        }
-+        LwcWaiter w = { lwcond, self, false, nullptr };
-+        lwc_enqueue(&w);
++        LwcWaiter w;
++        lwc_enqueue(&w, lwcond, self, vm_read32(lwmutex + LWM_ATTR));
          vm_write32(lwmutex + LWM_RECUR, 0);
          vm_write32(lwmutex + LWM_OWNER, 0);
          ppu_thread_note_block(ctx->thread_id);
@@ -175,6 +223,39 @@ builds the waiter queue too.
      }
      ctx->gpr[3] = 0;
  }
+--- a/runtime/syscalls/sys_ppu_thread.c
++++ b/runtime/syscalls/sys_ppu_thread.c
+@@ -1190,6 +1190,20 @@
+     return CELL_OK;
+ }
+ 
++/* Whether thread `tid` exists (1) or not (0), and its priority in *prio. For
++ * the runtime's own sync objects (the lwcond wake order and ESRCH answer in
++ * runtime/ppu/ppu_sysprx.cpp). The main thread's "never set" 0 reads as the
++ * default, as creator_priority() takes it. */
++int ppu_thread_query(uint64_t tid, int32_t* prio)
++{
++    table_lock();
++    const ppu_thread_info* t = find_thread(tid);
++    if (t && prio)
++        *prio = (t == &g_ppu_threads[0] && t->priority == 0) ? PPU_DEFAULT_PRIORITY : t->priority;
++    table_unlock();
++    return t != NULL;
++}
++
+ /* ---------------------------------------------------------------------------
+  * sys_ppu_thread_get_priority
+  *
+--- a/runtime/syscalls/sys_ppu_thread.h
++++ b/runtime/syscalls/sys_ppu_thread.h
+@@ -106,6 +106,7 @@
+ int64_t sys_ppu_thread_detach(ppu_context* ctx);
+ int64_t sys_ppu_thread_yield(ppu_context* ctx);
+ int64_t sys_ppu_thread_get_priority(ppu_context* ctx);
++int     ppu_thread_query(uint64_t tid, int32_t* prio);  /* 1 if `tid` exists; its priority */
+ int64_t sys_ppu_thread_set_priority(ppu_context* ctx);
+ int64_t sys_ppu_thread_rename(ppu_context* ctx);
+ int64_t sys_ppu_thread_get_join_state(ppu_context* ctx);
 --- a/tools/test_lwcond_layout.py
 +++ b/tools/test_lwcond_layout.py
 @@ -30,10 +30,20 @@
@@ -198,15 +279,17 @@ builds the waiter queue too.
  static uint8_t mem[0x10000];
  static void vm_write32(uint32_t a, uint32_t v) { for (int i = 0; i < 4; i++) mem[a + i] = (uint8_t)(v >> (24 - 8 * i)); }
  static void vm_write64(uint32_t a, uint64_t v) { vm_write32(a, (uint32_t)(v >> 32)); vm_write32(a + 4, (uint32_t)v); }
-@@ -44,6 +54,7 @@
+@@ -44,6 +54,9 @@
   * hand back no slot, so the wait returns at once. */
  #define LWM_OWNER 0x00
  #define LWM_RECUR 0x04
++#define LWM_ATTR  0x08
 +#define LWM_SELF(ctx) ((ctx)->thread_id ? (ctx)->thread_id : 0x7FFFFFFEu)
++extern "C" int ppu_thread_query(uint64_t, int32_t*) { return 1; }
  static uint32_t s_asked = 0xFFFFFFFFu;
  struct LwmSlot;
  static struct LwmSlot* lwm_slot(uint32_t lwmutex) { s_asked = lwmutex; return nullptr; }
-@@ -53,6 +64,7 @@
+@@ -53,6 +66,7 @@
  static void ppu_thread_note_block(uint64_t) {}
  %s
  %s
@@ -214,7 +297,7 @@ builds the waiter queue too.
  int main() {
      const uint32_t LWC = 0x1000, MTX = 0x2468;
      memset(mem, 0xAA, sizeof mem);
-@@ -85,7 +97,8 @@
+@@ -85,7 +99,8 @@
          print('SKIP: no C++ compiler')
          return
      src = (ROOT / 'runtime/ppu/ppu_sysprx.cpp').read_text()
@@ -226,7 +309,7 @@ builds the waiter queue too.
          exe = Path(tmp) / 't'
 --- /dev/null
 +++ b/tools/test_lwcond_wakeup.py
-@@ -0,0 +1,170 @@
+@@ -0,0 +1,212 @@
 +#!/usr/bin/env python3
 +"""sys_lwcond_wait blocks until a signal, as lv2's does (runtime/ppu/ppu_sysprx.cpp).
 +
@@ -246,7 +329,12 @@ builds the waiter queue too.
 +  - waiting without holding the lwmutex is CELL_EPERM;
 +  - signal_to a thread that is not waiting is CELL_EPERM, and to a waiting one
 +    wakes exactly it;
-+  - signal_all wakes every waiter.
++  - signal_all wakes every waiter;
++  - a signal wakes the highest-priority waiter under SYS_SYNC_PRIORITY (the
++    oldest among equals) and the oldest under SYS_SYNC_FIFO, the paired
++    lwmutex's protocol;
++  - destroying an lwcond a thread sleeps on is CELL_EBUSY, CELL_OK after;
++  - signal_to a thread that does not exist is CELL_ESRCH.
 +"""
 +import os
 +import re
@@ -290,7 +378,11 @@ builds the waiter queue too.
 +static uint32_t vm_read32(uint32_t a) { std::lock_guard<std::mutex> g(mem_mu); return (uint32_t)mem[a] << 24 | mem[a + 1] << 16 | mem[a + 2] << 8 | mem[a + 3]; }
 +struct ppu_context { uint64_t gpr[32]; uint32_t thread_id; };
 +#define LWM_OWNER 0x00
++#define LWM_ATTR  0x08
 +#define LWM_RECUR 0x0C
++/* Threads 1-99 exist; priority 1000 unless set in prios[]. */
++static int32_t prios[100];
++extern "C" int ppu_thread_query(uint64_t tid, int32_t* prio) { if (tid == 0 || tid >= 100) return 0; if (prio) *prio = prios[tid] ? prios[tid] : 1000; return 1; }
 +#define LWM_SELF(ctx) ((ctx)->thread_id ? (ctx)->thread_id : 0x7FFFFFFEu)
 +/* A host binary lock standing in for the runtime's lwmutex slot. */
 +struct LwmSlot { std::mutex m; std::condition_variable cv; bool held = false; };
@@ -304,6 +396,7 @@ builds the waiter queue too.
 +%s
 +%s
 +%s
++%s
 +static const uint32_t LWC = 0x1000, MTX = 0x2000;
 +static void lock(uint32_t tid) { lwm_acquire(&g_slot, 0); vm_write32(MTX + LWM_OWNER, tid); vm_write32(MTX + LWM_RECUR, 1); }
 +static void unlock() { vm_write32(MTX + LWM_OWNER, 0); vm_write32(MTX + LWM_RECUR, 0); lwm_release(&g_slot); }
@@ -311,6 +404,7 @@ builds the waiter queue too.
 +static uint32_t sig(uint32_t tid) { lock(tid); ppu_context c = {}; c.thread_id = tid; c.gpr[3] = LWC; sys_lwcond_signal(&c); unlock(); return (uint32_t)c.gpr[3]; }
 +static uint32_t sig_all(uint32_t tid) { lock(tid); ppu_context c = {}; c.thread_id = tid; c.gpr[3] = LWC; sys_lwcond_signal_all(&c); unlock(); return (uint32_t)c.gpr[3]; }
 +static uint32_t sig_to(uint32_t tid, uint32_t to) { lock(tid); ppu_context c = {}; c.thread_id = tid; c.gpr[3] = LWC; c.gpr[4] = to; sys_lwcond_signal_to(&c); unlock(); return (uint32_t)c.gpr[3]; }
++static uint32_t destroy() { ppu_context c = {}; c.gpr[3] = LWC; sys_lwcond_destroy(&c); return (uint32_t)c.gpr[3]; }
 +static int fails = 0;
 +#define CHECK(c, ...) do { const bool ok_ = (c); printf(ok_ ? "[PASS] " : "[FAIL] "); printf(__VA_ARGS__); printf("\n"); if (!ok_) fails++; } while (0)
 +static void ms(int n) { std::this_thread::sleep_for(std::chrono::milliseconds(n)); }
@@ -365,6 +459,36 @@ builds the waiter queue too.
 +    sig_all(1);
 +    for (auto& t : ts) t.join();
 +    CHECK(woke == 3, "signal_all wakes all three (%%d)", (int)woke);
++
++    /* 7. wake order: the lwmutex protocol */
++    std::mutex om; std::vector<uint32_t> order;
++    auto waiter = [&](uint32_t tid) { lock(tid); wait(tid, 0); { std::lock_guard<std::mutex> g(om); order.push_back(tid); } unlock(); };
++    auto run_order = [&](uint32_t attr, std::vector<uint32_t> tids) {
++        vm_write32(MTX + LWM_ATTR, attr);
++        order.clear();
++        std::vector<std::thread> w;
++        for (uint32_t t : tids) { w.emplace_back(waiter, t); ms(50); }   /* queued in this order */
++        for (size_t i = 0; i < tids.size(); i++) { sig(1); ms(50); }
++        for (auto& t : w) t.join();
++        return order;
++    };
++    prios[30] = 2000; prios[31] = 500; prios[32] = 500; prios[33] = 100;
++    auto o = run_order(0x22, {30, 31, 32});   /* SYS_SYNC_PRIORITY, recursive */
++    CHECK(o == std::vector<uint32_t>({31, 32, 30}), "SYS_SYNC_PRIORITY wakes the highest priority first, the oldest among equals (%%u %%u %%u)", o[0], o[1], o[2]);
++    o = run_order(0x01, {30, 33, 31});        /* SYS_SYNC_FIFO */
++    CHECK(o == std::vector<uint32_t>({30, 33, 31}), "SYS_SYNC_FIFO wakes the oldest first (%%u %%u %%u)", o[0], o[1], o[2]);
++    o = run_order(0x04, {30, 33});            /* SYS_SYNC_RETRY: priority for an lwcond */
++    CHECK(o == std::vector<uint32_t>({33, 30}), "SYS_SYNC_RETRY wakes by priority (%%u %%u)", o[0], o[1]);
++
++    /* 8. destroy with a waiter */
++    std::thread td([&] { lock(50); wait(50, 0); unlock(); });
++    ms(100);
++    CHECK(destroy() == 0x8001000Au, "destroying an lwcond a thread sleeps on is CELL_EBUSY");
++    sig(1); td.join();
++    CHECK(destroy() == 0, "and CELL_OK once nobody waits");
++
++    /* 9. signal_to a thread that does not exist */
++    CHECK(sig_to(1, 200) == 0x80010005u, "signal_to a thread that does not exist is CELL_ESRCH");
 +    printf("%%s (%%d failed)\n", fails ? "FAIL" : "PASS", fails);
 +    return fails ? 1 : 0;
 +}
@@ -378,6 +502,7 @@ builds the waiter queue too.
 +        return
 +    src = (ROOT / 'runtime/ppu/ppu_sysprx.cpp').read_text()
 +    code = HARNESS % (extract_waiters(src), extract(src, 'sys_lwcond_create'),
++                      extract(src, 'sys_lwcond_destroy'),
 +                      extract(src, 'sys_lwcond_signal') + '\n' + extract(src, 'sys_lwcond_signal_all'),
 +                      extract(src, 'sys_lwcond_signal_to'), extract(src, 'sys_lwcond_wait'))
 +    with tempfile.TemporaryDirectory() as tmp:

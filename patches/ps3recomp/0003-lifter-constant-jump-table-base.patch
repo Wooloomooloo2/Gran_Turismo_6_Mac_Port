@@ -15,7 +15,9 @@ were accepted, so every such dispatcher was dropped and each case lifted to
 an unresolved indirect call (func_00A3FEE0, func_00A6D80C and others at boot).
 Also makes the debug trace print a missing TOC candidate as 0.
 
-Test: tools/test_ppu_jumptables.py test_constant_table_base.
+Test: tools/test_ppu_jumptables.py test_constant_table_base, and
+test_constant_table_base_needs_lis (an `addi r9,r9,lo` whose nearest earlier
+definition of r9 is not `lis` is still rejected).
 
 --- a/tools/ppu_lifter.py
 +++ b/tools/ppu_lifter.py
@@ -99,15 +101,16 @@ Test: tools/test_ppu_jumptables.py test_constant_table_base.
                  targets = []
 --- a/tools/test_ppu_jumptables.py
 +++ b/tools/test_ppu_jumptables.py
-@@ -372,6 +372,7 @@
+@@ -373,6 +373,8 @@
      test_multi_toc_prefers_targets_near_the_dispatcher()
      test_bound_compare_beyond_window()
      test_spilled_base_reused_as_target()
 +    test_constant_table_base()
++    test_constant_table_base_needs_lis()
      if FAILS:
          print(f"FAILED: {', '.join(FAILS)}")
          return 1
-@@ -460,5 +461,27 @@
+@@ -475,5 +477,45 @@
      check("reload of a slot nothing stored is not a base", discover(words, mem), None)
  
  
@@ -131,6 +134,24 @@ Test: tools/test_ppu_jumptables.py test_constant_table_base.
 +    mem = {table: 0x0C, table + 4: 0x10, table + 8: 0xFFFFFFFF}
 +    got = discover(words, mem)
 +    check("constant (lis/addi) table base", got, [table + 0x0C, table + 0x10])
++
++
++def w_mr(ra, rs):          return (31 << 26) | (rs << 21) | (ra << 16) | (rs << 11) | (444 << 1)
++
++
++def test_constant_table_base_needs_lis():
++    """`addi r9,r9,lo` counts as a constant base only when the nearest earlier
++    definition of r9 is `lis`. Here a `mr r9,r3` comes between: r9 is a
++    run-time value, so there is no table:
++
++        lis r9,1 ; mr r9,r3 ; addi r9,r9,0x1C ; lwzx r0,r11,r9 ; extsw r0,r0
++        add r0,r0,r9 ; mtctr r0 ; bctr
++    """
++    table = TEXT_LO + 0x20
++    words = [w_lis(9, 1), w_mr(9, 3), w_addi(9, 9, 0x20), w_lwzx(0, 11, 9), w_extsw(0, 0),
++             w_add(0, 0, 9), w_mtctr(0), w_bctr()]
++    mem = {table: 0x0C, table + 4: 0x10, table + 8: 0xFFFFFFFF}
++    check("addi onto a register last set by mr is not a constant base", discover(words, mem), None)
 +
 +
  if __name__ == "__main__":

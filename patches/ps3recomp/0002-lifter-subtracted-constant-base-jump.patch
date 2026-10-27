@@ -16,7 +16,9 @@ indirect call: short memsets and the 8..128-byte tails stored nothing, and the
 first C++ static constructors left their objects unzeroed (first symptom at
 boot: "unresolved indirect call -> 0x00A8DFF0" from func_00FD7724).
 
-Test: tools/test_ppu_jumptables.py test_const_base_subtracted.
+Test: tools/test_ppu_jumptables.py test_const_base_subtracted, and
+test_const_base_subtracted_wrong_way (`subf r8,r8,r5`, the constant as
+subtrahend, is still rejected).
 
 --- a/tools/ppu_lifter.py
 +++ b/tools/ppu_lifter.py
@@ -66,20 +68,19 @@ Test: tools/test_ppu_jumptables.py test_const_base_subtracted.
          v = read_u32(a)
 --- a/tools/test_ppu_jumptables.py
 +++ b/tools/test_ppu_jumptables.py
-@@ -368,6 +368,7 @@
+@@ -368,6 +368,8 @@
      test_base_before_fallthrough_split()
      test_const_base_no_table()
      test_const_base_needs_constant()
 +    test_const_base_subtracted()
++    test_const_base_subtracted_wrong_way()
      test_multi_toc_prefers_targets_near_the_dispatcher()
      test_bound_compare_beyond_window()
      test_spilled_base_reused_as_target()
-@@ -401,8 +402,39 @@
-     mem = {base: w_blr(), TOC + 8: base}
-     got = discover([w_lwz(8, 2, 8), w_add(8, 8, 7), w_mtctr(8), w_bctr()], mem)
+@@ -403,6 +405,51 @@
      check("non-constant base is not a constant-base jump", got, None)
-+
-+
+ 
+ 
 +def w_lis(rt, si):         return w_addis(rt, 0, si)
 +def w_addi(rt, ra, si):    return (14 << 26) | (rt << 21) | (ra << 16) | (si & 0xFFFF)
 +def w_subf(rt, ra, rb):    return (31 << 26) | (rt << 21) | (ra << 16) | (rb << 11) | (40 << 1)
@@ -106,8 +107,22 @@ Test: tools/test_ppu_jumptables.py test_const_base_subtracted.
 +    got = discover(words, mem)
 +    check("subtracted constant-base computed jump", got,
 +          [TEXT_LO + 0x14, TEXT_LO + 0x18, TEXT_LO + 0x1C, base])
- 
- 
++
++
++def test_const_base_subtracted_wrong_way():
++    """`subf r8,r8,r5` is r5 - r8: the constant is the subtrahend, so r8 ends
++    up holding length minus base, not an address next to the dispatcher. Not
++    the idiom: no landing sites."""
++    base = TEXT_LO + 0x20
++    words = [w_lis(8, 1), w_addi(8, 8, 0x20), w_subf(8, 8, 5), w_mtctr(8), w_bctr()]
++    mem = {TEXT_LO + 4 * i: w for i, w in enumerate(words)}
++    for k, d in enumerate((2, 1, 0)):
++        mem[TEXT_LO + 0x14 + 4 * k] = w_stb(4, 6, d)
++    mem[base] = w_blr()
++    check("subf with the constant as subtrahend is not a constant-base jump",
++          discover(words, mem), None)
++
++
 +def w_stb(rs, ra, d):      return (38 << 26) | (rs << 21) | (ra << 16) | (d & 0xFFFF)
 +
 +

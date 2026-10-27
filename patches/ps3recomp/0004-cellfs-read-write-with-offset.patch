@@ -7,14 +7,17 @@ Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0003)
 What: registers cellFsReadWithOffset (0x0D5B4A14) and cellFsWriteWithOffset
 (0x8CB722D5) as pread/pwrite on the fd's FILE*: seek, transfer and seek
 back under the stream lock (as cellFsAioRead does), so the fd's position is
-unchanged. Error answers follow RPCS3's cellFs.cpp: CELL_EFAULT for a null
-write buffer, CELL_EBADF for an unknown fd, count written as 0.
+unchanged. Error answers follow RPCS3's cellFs.cpp and lv2/sys_fs.cpp
+(fcntl 0x8000000a/b), each writing the count as 0: CELL_EFAULT for a null
+buffer; CELL_EBADF for an unknown fd, a read on an O_WRONLY fd, and a write
+on an O_RDONLY or O_APPEND fd. cellFsOpen keeps each fd's open flags for
+these checks.
 
 Why: Gran Turismo 6 reads GT.VOL and its PDIPFS index this way from its first
 second. Unregistered, the import faked CELL_OK with nothing read, the title
 parsed zeroed headers, and boot died in a stack overrun soon after.
 
-Test: tools/test_ppu_fs_aio.py (runtime/ppu/tests/test_fs_aio.cpp, cases 3-4).
+Test: tools/test_ppu_fs_aio.py (runtime/ppu/tests/test_fs_aio.cpp, cases 3-5).
 
 --- a/runtime/ppu/ppu_fs.cpp
 +++ b/runtime/ppu/ppu_fs.cpp
@@ -27,7 +30,31 @@ Test: tools/test_ppu_fs_aio.py (runtime/ppu/tests/test_fs_aio.cpp, cases 3-4).
  #define CELL_FS_S_IFDIR      0x4000u
  #define CELL_FS_S_IFREG      0x8000u
  #define CELL_FS_O_RDONLY     0
-@@ -978,6 +980,53 @@
+@@ -222,6 +224,7 @@
+  * validated and FIOS rebuilt it for good -- ICO stayed on a black screen.
+  * fs_set_dir() repositions in place (SEEK_CUR 0) when the direction changes. */
+ static uint8_t g_fd_dir[FS_MAX];
++static uint32_t g_fd_flags[FS_MAX];      /* cellFsOpen flags per fd (0 = read-only) */
+ static void fs_set_dir(int fd, FILE* f, uint8_t dir)
+ {
+     if (g_fd_dir[fd] && g_fd_dir[fd] != dir) FS_SEEK64(f, 0, SEEK_CUR);
+@@ -240,6 +243,7 @@
+     for (int i = 3; i < FS_MAX; i++)
+         if (!g_files[i] && !g_dirs[i]) {
+             g_fd_dir[i] = 0;
++            g_fd_flags[i] = 0;
+             __atomic_store_n(&g_files[i], f, __ATOMIC_RELEASE);
+             return i;
+         }
+@@ -318,6 +322,7 @@
+     }
+     int fd = fd_alloc_file(f);
+     if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
++    g_fd_flags[fd] = flags;
+     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
+     g_fd_usm[fd] = (strstr(gpath, ".usm") != nullptr) ? 1 : 0;
+     /* FS_CALLER=1: name the guest function that opened each file. A title whose
+@@ -978,6 +983,57 @@
                                   (uint64_t)(int64_t)id, (uint64_t)n, 0, 0, 0, 0);
  }
  
@@ -35,8 +62,10 @@ Test: tools/test_ppu_fs_aio.py (runtime/ppu/tests/test_fs_aio.cpp, cases 3-4).
 + * cellFsWriteWithOffset(fd, offset, buf, size, nwrite): pread/pwrite. They
 + * name their own offset and leave the fd's position alone, so they take the
 + * stream lock across seek, transfer and seek back, as cellFsAioRead does.
-+ * Error answers follow RPCS3's cellFs.cpp (GPL-2.0): a bad buffer for a write
-+ * is CELL_EFAULT, an unknown fd CELL_EBADF, and the count is written as 0.
++ * Error answers follow RPCS3's cellFs.cpp and lv2/sys_fs.cpp (GPL-2.0), and
++ * every error writes the count as 0: a NULL buffer is CELL_EFAULT; an unknown
++ * fd, a read on an O_WRONLY fd, and a write on an O_RDONLY or O_APPEND fd are
++ * CELL_EBADF.
 + * Gran Turismo 6 reads GT.VOL and its PDIPFS files this way; unregistered,
 + * the import faked CELL_OK with nothing read. */
 +static void fs_rw_with_offset(ppu_context* ctx, bool write)
@@ -46,13 +75,15 @@ Test: tools/test_ppu_fs_aio.py (runtime/ppu/tests/test_fs_aio.cpp, cases 3-4).
 +    const uint32_t buf    = (uint32_t)ctx->gpr[5];
 +    uint64_t       size   = ctx->gpr[6];
 +    const uint32_t n_ptr  = (uint32_t)ctx->gpr[7];
-+    if (write && !buf) {
++    if (!buf) {
 +        if (n_ptr) vm_write64(n_ptr, 0);
 +        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EFAULT;
 +        return;
 +    }
 +    FILE* f = fd_file(fd);
-+    if (!f) {
++    const uint32_t acc = f ? (g_fd_flags[fd] & 0x3) : 0;
++    if (!f || (!write && acc == CELL_FS_O_WRONLY)
++           || (write && (acc == CELL_FS_O_RDONLY || (g_fd_flags[fd] & CELL_FS_O_APPEND)))) {
 +        if (n_ptr) vm_write64(n_ptr, 0);
 +        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EBADF;
 +        return;
@@ -81,7 +112,7 @@ Test: tools/test_ppu_fs_aio.py (runtime/ppu/tests/test_fs_aio.cpp, cases 3-4).
  extern "C" void ppu_fs_register(void)
  {
      ps3_hle_register_ctx(ps3_compute_nid("cellFsOpen"),     "cellFsOpen",     cellFsOpen);
-@@ -988,6 +1037,8 @@
+@@ -988,6 +1044,8 @@
      ps3_hle_register_ctx(ps3_compute_nid("cellFsClose"),    "cellFsClose",    cellFsClose);
      ps3_hle_register_ctx(ps3_compute_nid("cellFsRead"),     "cellFsRead",     cellFsRead);
      ps3_hle_register_ctx(ps3_compute_nid("cellFsWrite"),    "cellFsWrite",    cellFsWrite);
@@ -92,17 +123,18 @@ Test: tools/test_ppu_fs_aio.py (runtime/ppu/tests/test_fs_aio.cpp, cases 3-4).
      ps3_hle_register_ctx(ps3_compute_nid("cellFsGetBlockSize"),  "cellFsGetBlockSize",  cellFsGetBlockSize);
 --- a/runtime/ppu/tests/test_fs_aio.cpp
 +++ b/runtime/ppu/tests/test_fs_aio.cpp
-@@ -6,7 +6,8 @@
+@@ -6,7 +6,9 @@
   * threads, audio streamers) issue them on one fd at once. The fixture writes
   * a file whose every 4-byte word holds its own offset, then checks both:
   * a cellFsRead after an AIO read continues from the fd's position, and
 - * reads racing from four threads each get the words they asked for.
 + * reads racing from four threads each get the words they asked for. The
-+ * same holds for cellFsReadWithOffset / cellFsWriteWithOffset (pread/pwrite).
++ * same holds for cellFsReadWithOffset / cellFsWriteWithOffset (pread/pwrite),
++ * with lv2's EFAULT / EBADF answers for a NULL buffer and the fd's access mode.
   *
   *   tools/test_ppu_fs_aio.py
   *   test_fs_aio [DIR]     (DIR: where the file goes; default the temp dir)
-@@ -115,8 +116,54 @@
+@@ -115,8 +117,81 @@
      CHECK(total == 0, "%d racing AIO reads over %d threads, %d returned the wrong bytes",
            THREADS * ROUNDS, THREADS, total);
  
@@ -152,8 +184,35 @@ Test: tools/test_ppu_fs_aio.py (runtime/ppu/tests/test_fs_aio.cpp, cases 3-4).
 +    cellFsWriteWithOffset(&ctx);
 +    CHECK((uint32_t)ctx.gpr[3] == 0x8001000Du && rd64(0x220) == 0,
 +          "cellFsWriteWithOffset from a null buffer is CELL_EFAULT");
++    memset(&ctx, 0, sizeof ctx);
++    ctx.gpr[3] = wfd; ctx.gpr[4] = 0; ctx.gpr[5] = 0; ctx.gpr[6] = 4; ctx.gpr[7] = 0x220;
++    wr64(0x220, 99);
++    cellFsReadWithOffset(&ctx);
++    CHECK((uint32_t)ctx.gpr[3] == 0x8001000Du && rd64(0x220) == 0,
++          "cellFsReadWithOffset into a null buffer is CELL_EFAULT with nread 0");
 +    memset(&ctx, 0, sizeof ctx); ctx.gpr[3] = wfd;
 +    cellFsClose(&ctx);
++
++    /* 5. the fd's access mode: lv2 answers CELL_EBADF for a read on O_WRONLY
++     *    and a write on O_RDONLY or O_APPEND, writing the count as 0. */
++    struct { uint32_t flags; bool write; const char* what; } modes[] = {
++        { 1 /* O_WRONLY */,          false, "a read on an O_WRONLY fd" },
++        { 0 /* O_RDONLY */,          true,  "a write on an O_RDONLY fd" },
++        { 2 | 0x400 /* RDWR|APPEND */, true, "a write on an O_APPEND fd" },
++    };
++    for (auto& m : modes) {
++        memset(&ctx, 0, sizeof ctx); ctx.gpr[3] = 0x100; ctx.gpr[4] = m.flags; ctx.gpr[5] = 0x200;
++        cellFsOpen(&ctx);
++        const uint32_t mfd = rd32(0x200);
++        memset(&ctx, 0, sizeof ctx);
++        ctx.gpr[3] = mfd; ctx.gpr[4] = 0; ctx.gpr[5] = 0x3400; ctx.gpr[6] = 4; ctx.gpr[7] = 0x238;
++        wr64(0x238, 99);
++        if (m.write) cellFsWriteWithOffset(&ctx); else cellFsReadWithOffset(&ctx);
++        CHECK((uint32_t)ctx.gpr[3] == 0x8001002Au && rd64(0x238) == 0,
++              "%s is CELL_EBADF with the count 0 (rc 0x%X)", m.what, (uint32_t)ctx.gpr[3]);
++        memset(&ctx, 0, sizeof ctx); ctx.gpr[3] = mfd;
++        cellFsClose(&ctx);
++    }
      remove(host);
      printf("%s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
      return fails ? 1 : 0;
