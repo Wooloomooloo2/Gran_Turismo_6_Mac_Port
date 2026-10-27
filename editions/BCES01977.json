@@ -1,0 +1,27 @@
+{
+  "title_id": "BCES01977",
+  "target_app_ver": "01.22",
+  "updates": [
+    {"app_ver": "01.02", "sha1": "26044500a07d32e569de34c8738eaa872782df42"},
+    {"app_ver": "01.03", "sha1": "9693347b7f533d19287187f39707f186ac38bb5b"},
+    {"app_ver": "01.04", "sha1": "adbb05035787ebfd7abd38b2561604dbf09b4b8f"},
+    {"app_ver": "01.05", "sha1": "3e41becf4bc68a5ef0f6d9a43bcb4039b9897486"},
+    {"app_ver": "01.06", "sha1": "1f996f3c383f5d111eef34112fec1b619dfee6b5"},
+    {"app_ver": "01.07", "sha1": "2268a4b8c5bf40d871d10b43215e44f951cae926"},
+    {"app_ver": "01.08", "sha1": "f104823d9a50cb12f6bb1c9869e7bc2ab443583f"},
+    {"app_ver": "01.09", "sha1": "3bf6fba484bff2dbd62cf61b2cc5c29661ef7de9"},
+    {"app_ver": "01.10", "sha1": "07f7dc985bc421dcb5d225af6b82672aadaeabd1"},
+    {"app_ver": "01.11", "sha1": "adee8b4f4c354109725b1395a091e3484d9de50d"},
+    {"app_ver": "01.12", "sha1": "d4d103d25976f8dbe8e1628a94e43edf1c4a7b70"},
+    {"app_ver": "01.13", "sha1": "e6c2e43a05d47d8fdf50f87f2e65dd85b4d0f46f"},
+    {"app_ver": "01.14", "sha1": "6997d3861f50fb7289b77695c2f7231ce4f20326"},
+    {"app_ver": "01.15", "sha1": "2a75b5ff2608f3b6bf710f37f38eadb23d4672d5"},
+    {"app_ver": "01.16", "sha1": "3fe51f9a35d9122787602005390fbe6d561c5890"},
+    {"app_ver": "01.17", "sha1": "6fc23f84941d376674693654bda574094905f066"},
+    {"app_ver": "01.18", "sha1": "26cf0b31f32beb2f7525fa4db7389617a0da2dd8"},
+    {"app_ver": "01.19", "sha1": "94c8e9dba9f8b8252900171b665fa99619e40a9c"},
+    {"app_ver": "01.20", "sha1": "c706ae8edca331e5b286c43823568f7a19d8f995"},
+    {"app_ver": "01.21", "sha1": "252f715f139e323d950858c61f491de8ca7ec1e9"},
+    {"app_ver": "01.22", "sha1": "7d459a9bcbbc2217117a466a7b7b0225be17e15a"}
+  ]
+}

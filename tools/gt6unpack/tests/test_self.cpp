@@ -77,6 +77,10 @@ constexpr size_t kShOff = 0x500;
 
 enum class Kind { App, NpdrmFree, NpdrmLocal };
 
+// A game-supplied klicensee (what sceNpDrmIsAvailable receives); arbitrary test value.
+const Klicensee kGameKlic = {0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe,
+                             0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef};
+
 Buf make_elf() {
     Buf e(kElfSize, 0);
     const uint8_t ident[] = {0x7f, 'E', 'L', 'F', 2, 2, 1, 0x66};
@@ -117,7 +121,7 @@ Buf make_elf() {
     return e;
 }
 
-Fixture make_fixture(Kind kind) {
+Fixture make_fixture(Kind kind, const Klicensee* klic = nullptr) {
     Fixture f;
     f.elf = make_elf();
     const bool npdrm = kind != Kind::App;
@@ -253,7 +257,7 @@ Fixture make_fixture(Kind kind) {
     put(info, 0x20, miv);
     info = cbc_encrypt(key->erk, key->riv, info);
     if (npdrm) {
-        const Buf npdrm_key = ecb_decrypt(npdrm_klic_key(), npdrm_klic_free());
+        const Buf npdrm_key = klic ? ecb_decrypt(npdrm_klic_key(), *klic) : ecb_decrypt(npdrm_klic_key(), npdrm_klic_free());
         info = cbc_encrypt(npdrm_key, Buf(16, 0), info);
     }
     put(s, meta_info_off, info);
@@ -324,6 +328,15 @@ TEST_CASE("decrypt_self handles free-licence NPDRM") {
     CHECK(i.npdrm_license == 3);
     CHECK(i.content_id == "EP9000-BCES01977_00-GRANTURISMO6000");
     CHECK(decrypt_self(f.self) == f.elf);
+}
+
+TEST_CASE("decrypt_self opens free-licence NPDRM with a game-supplied klicensee") {
+    // As RPCS3 decrypt_self(file, klic_key): the given klicensee replaces NP_KLIC_FREE.
+    const Fixture f = make_fixture(Kind::NpdrmFree, &kGameKlic);
+    CHECK_THROWS_WITH_AS(decrypt_self(f.self), doctest::Contains("wrong key"), SelfError);
+    CHECK(decrypt_self(f.self, &kGameKlic) == f.elf);
+    const Fixture plain = make_fixture(Kind::NpdrmFree);
+    CHECK_THROWS_AS(decrypt_self(plain.self, &kGameKlic), SelfError);
 }
 
 TEST_CASE("decrypt_self refuses paid NPDRM licences") {

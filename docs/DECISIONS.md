@@ -39,3 +39,5 @@ Numbered, dated, with reasoning. Do not re-litigate D1-D12 without the owner.
 **D16 (2026-10-27).** SELF decryption checks the section hash of every program segment and skips the hash of the section header table and SCE version sections. Reason: on the real disc executables the segment hashes match exactly, but the other two never match under any coverage tried (evidence in FINDINGS). Checking them would reject valid files. The decrypted ELFs are byte-identical to RPCS3's.
 
 **D17 (2026-10-27).** The SELF decrypter supports retail ELF64 application and free-licence NPDRM SELFs only. Debug/fake SELFs, ELF32 SELFs and paid NPDRM licences raise clear errors. Reason: GT6's executables and its update packages need nothing more; less code to get wrong.
+
+**D18 (2026-10-27).** The built disc layer (`dev_bdvd`) holds `PS3_DISC.SFB` and `PS3_GAME` only. The disc's `PS3_UPDATE` (system firmware) is left out, and the copied tree is made owner-writable. Reason: the game never reads the firmware, firmware must stay out of the project's outputs, and a read-only tree from a mounted image could not be rebuilt or removed.

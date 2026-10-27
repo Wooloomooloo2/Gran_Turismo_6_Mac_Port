@@ -195,19 +195,21 @@ struct Metadata {
     std::vector<uint8_t> keys;  // key_count * 16 bytes
 };
 
-// SELFDecrypter::DecryptNPDRM: strips the NPDRM layer from the metadata info.
-std::vector<uint8_t> decrypt_npdrm(const Headers& h, Bytes info) {
+// SELFDecrypter::DecryptNPDRM: strips the NPDRM layer from the metadata info. A free licence
+// uses the caller's klicensee when given (RPCS3 key_v.SetKlicenseeKey), else NP_KLIC_FREE.
+std::vector<uint8_t> decrypt_npdrm(const Headers& h, Bytes info, const Klicensee* klic) {
     if (h.npdrm_license == 1 || h.npdrm_license == 2)
         throw SelfError("needs a licence file (paid content, out of scope)");
     if (h.npdrm_license != 3) throw SelfError("invalid NPDRM licence type " + std::to_string(h.npdrm_license));
     const std::array<uint8_t, 16> zero_iv{};
     // ECB-decrypt the free klicensee with NP_KLIC_KEY (one CBC block with a zero IV is ECB).
-    const auto npdrm_key = crypto::aes_cbc_decrypt(npdrm_klic_key(), zero_iv, npdrm_klic_free());
+    const Bytes klicensee = klic ? Bytes(*klic) : Bytes(npdrm_klic_free());
+    const auto npdrm_key = crypto::aes_cbc_decrypt(npdrm_klic_key(), zero_iv, klicensee);
     return crypto::aes_cbc_decrypt(npdrm_key, zero_iv, info);
 }
 
 // SELFDecrypter::LoadMetadata (retail path).
-Metadata load_metadata(const Reader& r, const Headers& h) {
+Metadata load_metadata(const Reader& r, const Headers& h, const Klicensee* klic) {
     const uint64_t info_off = add(h.meta_offset, kSceHeaderSize);
     const uint64_t headers_off = add(info_off, kMetaInfoSize);
     if (h.header_size > r.size() || add(headers_off, kMetaHeaderSize) > h.header_size)
@@ -215,7 +217,7 @@ Metadata load_metadata(const Reader& r, const Headers& h) {
 
     const Bytes raw_info = r.slice(info_off, kMetaInfoSize, "metadata info");
     std::vector<uint8_t> info(raw_info.begin(), raw_info.end());
-    if (h.npdrm) info = decrypt_npdrm(h, info);
+    if (h.npdrm) info = decrypt_npdrm(h, info, klic);
     info = crypto::aes_cbc_decrypt(h.key->erk, h.key->riv, info);
     // Layout: key[16], key_pad[16], iv[16], iv_pad[16]. Non-zero padding means a wrong key.
     const auto zero = [](auto first, auto last) { return std::all_of(first, last, [](uint8_t b) { return b == 0; }); };
@@ -291,10 +293,10 @@ SelfInfo inspect_self(std::span<const uint8_t> self) {
     return {h.key_revision, h.header_type, h.program_type, h.npdrm, h.npdrm_license, h.content_id};
 }
 
-std::vector<uint8_t> decrypt_self(std::span<const uint8_t> self) {
+std::vector<uint8_t> decrypt_self(std::span<const uint8_t> self, const Klicensee* klic) {
     const Reader r(self);
     const Headers h = load_headers(r);
-    const Metadata md = load_metadata(r, h);
+    const Metadata md = load_metadata(r, h, klic);
 
     // SELFDecrypter::MakeElf / WriteElf.
     std::vector<uint8_t> elf;
