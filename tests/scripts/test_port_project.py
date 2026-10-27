@@ -1,14 +1,21 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """The port project (port/): configure-time guards, patch application, and the real build."""
+import hashlib
+import importlib.util
 import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO / "scripts"))
+_spec = importlib.util.spec_from_file_location("translate_game", REPO / "scripts" / "translate_game.py")
+translate_game = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(translate_game)
 APPLY = REPO / "scripts" / "apply_ps3recomp_patches.sh"
 CMAKE = shutil.which("cmake")
 NINJA = shutil.which("ninja")
@@ -67,6 +74,100 @@ def test_root_build_without_port_unchanged(tmp_path):
     assert "tools/gt6unpack/gt6unpack" in names
     assert not any(n == "port/gt6" or n.startswith("port/") for n in names)
     assert not any("ps3recomp" in n for n in names)
+
+
+def sub_commit():
+    return subprocess.run(["git", "-C", str(REPO / "third_party/ps3recomp"), "rev-parse", "HEAD"],
+                          capture_output=True, text=True, check=True).stdout.strip()
+
+
+def fake_tree(tree, elf_bytes=b"elf", **spu_files):
+    """A translated tree as far as configure reads it before the ps3recomp runtime: a
+    translate.json with this checkout's commit and translate_game.patches_hash(), the ELF it
+    names, ppu/ppu_recomp.h and one lifted source, and the given recomp/spu files."""
+    elf = tree / "decrypted" / "x.elf"
+    elf.parent.mkdir(parents=True)
+    elf.write_bytes(elf_bytes)
+    (tree / "recomp" / "ppu").mkdir(parents=True)
+    (tree / "recomp" / "ppu" / "ppu_recomp.h").write_text("")
+    (tree / "recomp" / "ppu" / "ppu_recomp_000.cpp").write_text("")
+    (tree / "recomp" / "spu").mkdir()
+    for name, text in spu_files.items():
+        (tree / "recomp" / "spu" / name).write_text(text)
+    (tree / "recomp" / "translate.json").write_text(json.dumps({
+        "elf": "decrypted/x.elf", "elf_sha256": hashlib.sha256(elf_bytes).hexdigest(),
+        "ps3recomp_commit": sub_commit(),
+        "ps3recomp_patches": translate_game.patches_hash()}))
+    return tree
+
+
+@needs_cmake
+def test_configure_accepts_the_patches_hash_translate_records(tmp_path):
+    """CMake's hash of patches/ps3recomp equals translate_game.patches_hash() (item 10)."""
+    tree = fake_tree(tmp_path / "tree")
+    (tree / "decrypted" / "x.elf").unlink()          # stop at the next check
+    p = configure(tmp_path / "b", "-DGT6_BUILD_PORT=ON", f"-DGT6_TREE={tree}")
+    assert p.returncode != 0
+    assert "translated with a different ps3recomp" not in p.stderr, p.stderr
+    assert "The translated ELF is missing" in p.stderr, p.stderr
+
+
+@needs_cmake
+def test_configure_refuses_firmware_policy_bytes(tmp_path):
+    """taskset_policy_bytes.c holds libsre firmware bytes: never compiled or linked (D27)."""
+    tree = fake_tree(tmp_path / "tree", **{"taskset_policy_bytes.c": "/* firmware */"})
+    p = configure(tmp_path / "b", "-DGT6_BUILD_PORT=ON", f"-DGT6_TREE={tree}")
+    assert p.returncode != 0
+    assert "taskset_policy_bytes.c" in p.stderr and "firmware" in p.stderr, p.stderr
+
+
+@needs_cmake
+def test_configure_refuses_any_git_work_tree(tmp_path):
+    """GT6_TREE and the build folder must be outside every git work tree, through symlinks."""
+    other = tmp_path / "repo"
+    subprocess.run(["git", "init", "-q", str(other)], check=True)
+    tree = fake_tree(other / "tree")
+    p = configure(tmp_path / "b", "-DGT6_BUILD_PORT=ON", f"-DGT6_TREE={tree}")
+    assert p.returncode != 0
+    assert "git work tree" in p.stderr, p.stderr
+    # A symlink outside the work tree pointing into it is refused as well.
+    (tmp_path / "link").symlink_to(tree)
+    p = configure(tmp_path / "b2", "-DGT6_BUILD_PORT=ON", f"-DGT6_TREE={tmp_path / 'link'}")
+    assert p.returncode != 0
+    assert "git work tree" in p.stderr, p.stderr
+    # And so is a build folder inside one, by its real path.
+    good = fake_tree(tmp_path / "tree")
+    (other / "b").mkdir()
+    (tmp_path / "blink").symlink_to(other / "b")
+    p = configure(tmp_path / "blink", "-DGT6_BUILD_PORT=ON", f"-DGT6_TREE={good}")
+    assert p.returncode != 0
+    assert "git work tree" in p.stderr, p.stderr
+
+
+def test_undo_hint_removes_the_files_the_patches_add():
+    """A plain checkout leaves the patches' new files, and a later apply then fails (item 3)."""
+    undo = "git -C third_party/ps3recomp checkout . && git -C third_party/ps3recomp clean -fd"
+    assert undo in APPLY.read_text()
+    assert "clean -fd" in (REPO / "port" / "CMakeLists.txt").read_text()
+
+
+def test_apply_verify_needs_every_patch_applied(tmp_path):
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    subprocess.run(["git", "init", "-q", str(sub)], check=True)
+    (sub / "f.txt").write_text("a\n")
+    patches = tmp_path / "patches"
+    patches.mkdir()
+    (patches / "0001-f.patch").write_text(
+        "Upstream: not yet submitted\n"
+        "diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-a\n+b\n")
+    env = dict(os.environ, GT6_PS3RECOMP_PATCHES=str(patches), GT6_PS3RECOMP_DIR=str(sub))
+    p = subprocess.run(["bash", str(APPLY), "--verify"], capture_output=True, text=True, env=env)
+    assert p.returncode != 0 and "0001-f.patch" in p.stderr
+    assert (sub / "f.txt").read_text() == "a\n"         # --verify changes nothing
+    assert subprocess.run(["bash", str(APPLY)], env=env, capture_output=True).returncode == 0
+    p = subprocess.run(["bash", str(APPLY), "--verify"], capture_output=True, text=True, env=env)
+    assert p.returncode == 0, p.stderr
 
 
 def test_patches_apply_check():

@@ -39,16 +39,46 @@ get_filename_component(GT6_REPO "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
 file(REAL_PATH "${GT6_REPO}" GT6_REPO_REAL)
 get_filename_component(GT6_TREE "${GT6_TREE}" ABSOLUTE)
 file(REAL_PATH "${GT6_TREE}" GT6_TREE_REAL)
-foreach(repo IN ITEMS "${GT6_REPO}" "${GT6_REPO_REAL}")
-    foreach(path IN ITEMS "${GT6_TREE}" "${GT6_TREE_REAL}" "${CMAKE_BINARY_DIR}")
-        cmake_path(IS_PREFIX repo "${path}" NORMALIZE inside)
-        if(inside)
-            message(FATAL_ERROR
-                "GT6_TREE must be outside the repository, and so must the build folder: "
-                "translated code and everything built from it is derived from the game (D26).\n"
-                "  GT6_TREE: ${GT6_TREE}\n  build:    ${CMAKE_BINARY_DIR}\n  repo:     ${repo}")
+file(REAL_PATH "${CMAKE_BINARY_DIR}" GT6_BUILD_REAL)
+# True if path, or its nearest existing ancestor, is inside any git work tree (as the
+# scripts' in_git_work_tree).
+function(gt6_in_git_work_tree out path)
+    set(probe "${path}")
+    while(NOT EXISTS "${probe}")
+        get_filename_component(parent "${probe}" DIRECTORY)
+        if(parent STREQUAL probe)
+            break()
+        endif()
+        set(probe "${parent}")
+    endwhile()
+    execute_process(COMMAND git -C "${probe}" rev-parse --is-inside-work-tree
+                    OUTPUT_VARIABLE git_out OUTPUT_STRIP_TRAILING_WHITESPACE
+                    ERROR_QUIET RESULT_VARIABLE rc)
+    if(rc EQUAL 0 AND git_out STREQUAL "true")
+        set(${out} TRUE PARENT_SCOPE)
+    else()
+        set(${out} FALSE PARENT_SCOPE)
+    endif()
+endfunction()
+foreach(path IN ITEMS "${GT6_TREE}" "${GT6_TREE_REAL}" "${CMAKE_BINARY_DIR}" "${GT6_BUILD_REAL}")
+    set(inside FALSE)
+    foreach(repo IN ITEMS "${GT6_REPO}" "${GT6_REPO_REAL}")
+        cmake_path(IS_PREFIX repo "${path}" NORMALIZE in_repo)
+        if(in_repo)
+            set(inside TRUE)
         endif()
     endforeach()
+    if(NOT inside)
+        gt6_in_git_work_tree(inside "${path}")
+    endif()
+    if(inside)
+        message(FATAL_ERROR
+            "GT6_TREE must be outside the repository and any other git work tree, and so must "
+            "the build folder: translated code and everything built from it is derived from "
+            "the game (D26).\n"
+            "  GT6_TREE: ${GT6_TREE} (${GT6_TREE_REAL})\n"
+            "  build:    ${CMAKE_BINARY_DIR} (${GT6_BUILD_REAL})\n  repo:     ${GT6_REPO}")
+    endif()
 endforeach()
 
 set(GT6_TRANSLATE_JSON "${GT6_TREE}/recomp/translate.json")
@@ -78,6 +108,20 @@ if(NOT GT6_LIFT_COMMIT STREQUAL GT6_PS3RECOMP_COMMIT)
         "GT6_TREE was translated with a different ps3recomp: commit '${GT6_LIFT_COMMIT}', "
         "this checkout is ${GT6_PS3RECOMP_COMMIT}.\n${GT6_RETRANSLATE}")
 endif()
+
+# ---------------------------------------------------------------------------
+# ps3recomp patches (D28): applied to the submodule's working tree, never committed there.
+# Applied before the hash check below, so the build compiles the patch set the hash names.
+# ---------------------------------------------------------------------------
+execute_process(COMMAND bash "${GT6_REPO}/scripts/apply_ps3recomp_patches.sh"
+                OUTPUT_VARIABLE out ERROR_VARIABLE err RESULT_VARIABLE rc)
+if(NOT rc EQUAL 0)
+    message(FATAL_ERROR "Could not apply the ps3recomp patches:\n${out}${err}"
+        "To start over from the pinned commit (this also removes the files the patches add):\n"
+        "  git -C third_party/ps3recomp checkout . && git -C third_party/ps3recomp clean -fd")
+endif()
+string(STRIP "${out}" out)
+message(STATUS "ps3recomp patches: ${out}")
 
 # The same hash as translate_game.patches_hash: SHA-256 over patches/ps3recomp/*.patch,
 # concatenated in filename order (file(GLOB) sorts lexicographically).
@@ -113,17 +157,6 @@ if(NOT GT6_ELF_SHA STREQUAL GT6_LIFT_ELF_SHA)
 endif()
 
 # ---------------------------------------------------------------------------
-# ps3recomp patches (D28): applied to the submodule's working tree, never committed there
-# ---------------------------------------------------------------------------
-execute_process(COMMAND bash "${GT6_REPO}/scripts/apply_ps3recomp_patches.sh"
-                OUTPUT_VARIABLE out ERROR_VARIABLE err RESULT_VARIABLE rc)
-if(NOT rc EQUAL 0)
-    message(FATAL_ERROR "Could not apply the ps3recomp patches:\n${out}${err}")
-endif()
-string(STRIP "${out}" out)
-message(STATUS "ps3recomp patches: ${out}")
-
-# ---------------------------------------------------------------------------
 # The two directories the template builds from
 # ---------------------------------------------------------------------------
 set(RECOMP_DIR "${GT6_TREE}/recomp/ppu")
@@ -140,6 +173,13 @@ if(NOT RECOMP_SOURCES)
 endif()
 list(LENGTH RECOMP_SOURCES RECOMP_SOURCE_COUNT)
 message(STATUS "Lifted sources:  ${RECOMP_SOURCE_COUNT} file(s)")
+# ps3recomp's SPURS taskset generator can write the libsre policy module's bytes here. They
+# are Sony firmware: never compiled or linked (D27).
+if(EXISTS "${SPU_DIR}/taskset_policy_bytes.c")
+    message(FATAL_ERROR
+        "${SPU_DIR}/taskset_policy_bytes.c holds Sony firmware bytes (libsre's taskset policy "
+        "module); the port never links firmware (D27). Delete it.\n${GT6_RETRANSLATE}")
+endif()
 
 # ---------------------------------------------------------------------------
 # ps3recomp runtime library
@@ -223,7 +263,7 @@ endif()
 message(STATUS "Lifted SPU:      ${spu_programs} of ${n_programs} program(s), ${spu_jobmods} job module(s), ${spu_missed} image(s) from spu-missed")
 # The musttail indirect-branch fast path; it must be built here, by clang (template note).
 list(APPEND SPU_SOURCES "${PS3RECOMP_DIR}/runtime/spu/spu_dispatch_mt.c")
-foreach(gen IN ITEMS spu_workloads.c jobmods_register.c taskset_policy_bytes.c spu_missed_register.c)
+foreach(gen IN ITEMS spu_workloads.c jobmods_register.c spu_missed_register.c)
     if(EXISTS "${SPU_DIR}/${gen}")
         list(APPEND SPU_SOURCES "${SPU_DIR}/${gen}")
     else()
