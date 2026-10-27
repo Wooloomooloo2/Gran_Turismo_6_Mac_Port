@@ -2,6 +2,130 @@
 
 Measurements and facts, newest first within each section.
 
+## Code map of v1.22 (2026-10-27)
+
+**In short.** The game program that runs on 1.22 is one 23 MB executable. It holds about
+15 MB of main-processor code in roughly 72,000 functions. It calls 740 PS3 system functions
+from 46 system libraries; that is the runtime's to-do list. About 290 of those calls are for
+online features, which are out of scope and can be stubs. It makes heavy use of SPURS, Sony's
+job system for the PS3's helper cores: tasks, job chains and a custom workload. It carries 61
+helper-core programs (1.76 MB in total) inside its own code. Risks:
+
+- **Helper-core code is the biggest job.** The 57 SPURS job modules (1.53 MB) are stored raw
+  inside the executable, not as the separate programs ps3recomp's tools expect. Our map finds
+  and extracts them; ps3recomp's own extractor finds none. Milestone 2 must lift them and build
+  SPURS support for job chains and tasks, not just the simpler case.
+- **ps3recomp's name list has gaps.** ps3recomp cannot name 227 of the 835 imported functions
+  (EMAIN 217, EBOOT 10). RPCS3 names 222 of them, so the gap is in ps3recomp's list, not
+  unknown territory. Five (in game storage) are unnamed by both.
+- **The launcher does work before the game starts.** The 1.22 `EBOOT.BIN` runs a data-patch
+  step, and can swap in a repaired executable, before it launches the game (below). The port
+  must reproduce what that step leaves on disk, or run it.
+- Nothing failed outright. One ps3recomp tool does not start under the isolated Python the
+  project requires; a small runner works around it without changing ps3recomp (D22).
+
+**What the 1.22 EBOOT launches.** From a static trace of the decrypted 1.22 `EBOOT.BIN` (in
+the code segment, va = file offset + 0x10000). It always launches `<own folder>/EMAIN.SELF`,
+that is `/dev_hdd0/game/BCES01977/USRDIR/EMAIN.SELF`. The repair swap below is the one
+exception.
+
+- Boot function 0x123e0: takes `argv[0]`, cuts it to its folder, and checks that `EBOOT.BIN`
+  and `EMAIN.SELF` both exist there. Both paths are built in a static buffer at va 0x52a10.
+  If either is missing it shows the "game content damaged" dialog (`cellGameContentErrorDialog`).
+- It then opens `TPPS-01.07/update.txt` in that folder and, if the file exists, overwrites it
+  with `99.98 99.99` (string at va 0x3d100). As installed, `TPPS-01.07/update.txt` reads
+  `01.06 01.07`, and every later `TPPS-01.xx/update.txt` already reads `99.98 99.99`.
+- 0x1143c is a data-patch step (not yet analysed). It scans the `TPPS-%02d.%02d` folders,
+  `PDIPFS` and `UPDATENODEINFO`, writes `UPDATENODEINFO.upd` and renames files. It receives the
+  launch path only as a source to copy from, so it cannot change it.
+- 0x108f0 is the repair swap. It reads the size of the current `EMAIN.SELF` (`cellFsFstat`)
+  and looks it up in a table keyed by title ID (va 0x51b84, 0x20-byte rows of size + title).
+  For BCES01977 the "broken" size is 9,058,928 bytes, which is the 1.14 `EMAIN.SELF`. Only on a
+  match does it check `FIXEDELF114/EMAIN.SELF` against a second table (9,059,040 bytes, which
+  is its size). It then renames that file over `USRDIR/EMAIN.SELF` (`cellFsRename` in 0x2224c).
+  The 1.22 `EMAIN.SELF` is 9,001,952 bytes, so the swap does not happen on 1.22.
+  **`FIXEDELF114` is a repaired 1.14 executable, kept for consoles stuck on the broken one.**
+- Spawn: 0x12614 calls 0x2123c with the klicensee string from 0x13914 (the `KeyLicensee`
+  default traced earlier) and the 0x52a10 buffer. 0x2123c parses the key and calls
+  `sceNpDrmProcessExitSpawn2` at 0x21324. 0x125e4 is a non-DRM branch that calls
+  `sys_game_process_exitspawn2` with the same buffer, taken when a state record returned by
+  0x20858 has its first word 1 and the low bit of its second word clear. No code passes a `TPPS-*` or `FIXEDELF114` path to
+  either spawn call.
+- **The `TPPS-01.xx` folders** each hold an `EMAIN.SELF`, a `PDIPFS` folder and an `update.txt`
+  ("from to" versions). They look like per-update staging for Polyphony's `PDIPFS` data-patch
+  system. `TPPS-01.07/PDIPFS` is 971 MB and `TPPS-01.22/PDIPFS` is 17 MB. The 1.22 EBOOT never
+  spawns their executables.
+- **No two of the 21 decrypted executables are identical** (SHA-256, `map/identity.json`).
+  `USRDIR/EMAIN.SELF` is not `TPPS-01.22/EMAIN.SELF`: the ELFs are 23,168,200 and 23,787,792
+  bytes. Three pairs have equal ELF sizes but differ in millions of bytes:
+  `FIXEDELF114`/`TPPS-01.14`, `TPPS-01.10`/`01.11` and `TPPS-01.12`/`01.13`. All carry the
+  build tag `gt.gt6.ps3.product-strong.release.build`.
+
+**Numbers** (`scripts/map_game.py`, ps3recomp 4e8f3ca8; full summary in
+`~/Gran Turismo 6/build/BCES01977-v1.22/map/summary.json`):
+
+| | 1.22 `EBOOT.BIN` | 1.22 `USRDIR/EMAIN.SELF` |
+|---|---|---|
+| ELF bytes | 278,344 | 23,168,200 |
+| Code segment (also holds read-only data and the SPU programs) | 200,608 | 21,749,736 |
+| Data segment, in file / in memory | 10,660 / 227,328 | 1,385,632 / 2,775,632 |
+| Functions found (`find_functions`) | 1,117 | 72,144, covering 15,318,088 bytes |
+| Address-taken functions (`ppu_loader`, from the descriptor table) | 282 | 33,428 (45,005 descriptors) |
+| System functions imported / libraries | 95 / 11 | 740 / 46 |
+| Imports ps3recomp cannot name | 10 | 217 (29 %) |
+| SPU ELF programs | 0 | 4, 224,036 bytes |
+| SPURS job modules | 0 | 57, 1,532,240 bytes |
+
+- `find_functions` attributes almost no code to the SPU programs: 2 functions start in the
+  3.4 MB stretch (va 0x112d880 to 0x1468190) that holds them. So the 15.3 MB is PPU code.
+- **Imports of `EMAIN.SELF` by library** (the EBOOT's 11 libraries are all among these):
+  sceNp 64, cellSysutil 55, cellSpurs 49, sceNp2 48, cellGcmSys 39, sysPrxForUser 38,
+  sys_net 34, sceNpCommerce2 32, cellSail 31, cellHttp 28, cellSysutilAvc2 27, sys_fs 26,
+  sys_io 23, cellSailRec 19, sceNpTus 19, cellPamf 18, cellNetCtl 15, cellUsbd 14,
+  sceNpTrophy 13, cellAudio 12, cellDmux 12, cellRtc 10, cellUsbPspcm 9, cellAdec 8, cellGame 8,
+  cellMusicUtility 8, libvdec 8, cellFiber 6, cellOskExtUtility 6, cellSysmodule 6, sceNpSns 6,
+  cellGameStorage 5, cellHttpUtil 5, cellRec 5, cellKey2char 4, cellSaveData 4, cellSsl 4,
+  cellVideoExportUtility 4, sceNpUtil 4, cellPhotoUtility 3, cellSync 3, cellSysutilNpEula 3,
+  cellUserInfo 2, cellSysutilAvconfExt 1, sceNpBasicLimited 1, sys_crashdump 1.
+- By purpose: online (sceNp except trophies, sys_net, HTTP/SSL, network control, voice chat,
+  EULA) 290 in 14 libraries; video playback and recording (cellSail, cellSailRec, cellPamf,
+  cellDmux, libvdec, cellAdec, cellRec, video export) 105; USB (cellUsbd, cellUsbPspcm) 23,
+  probably including the racing wheels (milestone 7); SPURS and sync 52; the remaining core
+  (graphics, files, pad, audio, system, save data, trophies, time, fibres) 270.
+- **SPURS: yes, heavily.** The 49 cellSpurs imports cover initialisation with attributes,
+  tasksets and tasks (`cellSpursCreateTaskset2`, `cellSpursCreateTask2`), job chains
+  (`cellSpursCreateJobChainWithAttribute`, `cellSpursRunJobChain`, `cellSpursJobGuard*`),
+  custom workloads (`cellSpursAddWorkloadWithAttribute`), SPURS queues, LV2 event queues and
+  tracing. The one unnamed cellSpurs import is 0x2DDBCC0A (`_cellSpursWorkloadFlagReceiver2`
+  in RPCS3).
+- **SPU ELF programs** (file offsets in `EMAIN.SELF.elf`): 0x1286F00 17,400 B (built with SPU
+  GCC 4.1.1, SDK 4.20), 0x13F9580 21,332 B (`ipc_spucore.elf`), 0x13FE900 91,956 B,
+  0x1415080 93,348 B.
+- **Job modules**: 57, all different, 3,216 to 155,184 bytes each, between file offsets
+  0x111d880 and 0x1456600 of the code segment. Header: four `ila`, entry 0x30, image size, then
+  `0xC0DEC0DE`. They are extracted to `map/<elf>/jobmods_embedded/` with ps3recomp's naming,
+  ready for `lift_jobmods.py`. ps3recomp's `extract_jobmods.py` exits 0 and writes nothing
+  (`MISSING .../USRDIR/patch.sdat`, `MISSING .../USRDIR/data.sdat`): GT6 has no SDATA archives.
+  Programs the game loads from `GT.VOL` at run time would not show up in any of these counts.
+- **Unresolved NIDs**: 217 in EMAIN, by library: cellSailRec 19, cellSail 18, sceNp 14,
+  cellHttp 13, cellSysutil 13, cellSysutilAvc2 13, sceNp2 12, cellPamf 9, cellUsbPspcm 9,
+  cellUsbd 9, sys_net 9, cellNetCtl 6, cellOskExtUtility 6, cellFiber 5, cellGameStorage 5,
+  sceNpSns 5, sysPrxForUser 5, sys_io 5, then 18 libraries with 4 or fewer. 10 in EBOOT:
+  cellFiber 5 (the `cellFiberPpuContext*` family), sys_fs 4 (`cellFsReadWithOffset`,
+  `cellFsWriteWithOffset`, `cellFsAllocateFileAreaWithoutZeroFill`, `cellFsFGetBlockSize`),
+  sys_crashdump 1. Every one appears by name in the RPCS3 0.0.43-20410 boot log
+  (`ppu_loader: **** <lib> import: [<name>] (<nid>)`) except five cellGameStorage NIDs
+  (0x23EC78CE, 0x50771F25, 0x8DBD9594, 0xA9201831, 0xD7724C0A), which RPCS3 also leaves
+  unnamed. Core ones ps3recomp lacks include `sys_mempool_*`, `cellPadLdd*` (custom controller
+  drivers) and `cellWebBrowser*`.
+- **Tool failure.** `.venv/bin/python -I third_party/ps3recomp/tools/extract_spu_images.py
+  EMAIN.SELF.elf -o spu_images` fails with `ModuleNotFoundError: No module named 'spu_elf'`
+  (`extract_spu_images.py` line 31). `-I` leaves the script's folder off the import path, and
+  unlike the other tools this one does not add it itself. Worked around (D22). The other four
+  tools run as documented in ps3recomp's `docs/TOOLS.md`.
+- **Run time** on the M4 Max: 13.6 s for the whole map, including SHA-256 of all 21 ELFs.
+  `find_functions` on EMAIN takes 12.4 s; every other tool takes under 0.6 s.
+
 ## Building the v1.22 tree (2026-10-27)
 
 - **Outcome: done.** `gt6unpack build` produces a verified v1.22 tree at

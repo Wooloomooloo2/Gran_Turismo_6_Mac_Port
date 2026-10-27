@@ -1,0 +1,3 @@
+{"ppu_loader": {"exit": 0, "ok": true, "seconds": 0.1},
+ "find_functions": {"exit": 0, "ok": true, "seconds": 0.2},
+ "extract_spu_images": {"exit": 1, "ok": true, "seconds": 0.1}}

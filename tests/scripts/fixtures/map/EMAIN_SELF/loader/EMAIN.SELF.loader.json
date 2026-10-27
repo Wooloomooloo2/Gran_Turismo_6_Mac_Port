@@ -1,0 +1,2 @@
+{"entry_opd": "0x154ea10", "entry_code": "0x10230", "entry_toc": "0x15ae868", "module_toc": "0x15ae868",
+ "opd_base": "0x154ea00", "opd_size": "0x20", "opd_count": 4, "function_count": 4, "e_type": 2, "load_segments": 2}

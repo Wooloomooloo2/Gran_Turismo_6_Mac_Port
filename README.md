@@ -40,8 +40,9 @@ on every push.
 
 - [RPCS3](https://github.com/RPCS3/rpcs3) (GPL-2.0): reference for PS3 behaviour, and the
   source of the decryption approach adapted for the unpacker.
-- [ps3recomp](https://github.com/sp00nznet/ps3recomp) (MIT) by Ned Heller / sp00nznet: the
-  planned base for the translator and runtime.
+- [ps3recomp](https://github.com/sp00nznet/ps3recomp) (MIT) by Ned Heller / sp00nznet: its
+  analysis tools map the game's code (git submodule, dev-only), and it is the planned base for
+  the translator and runtime.
 - [bloodborne_mac_port](https://github.com/Wooloomooloo2/bloodborne_mac_port): launcher,
   renderer machinery and project conventions.
 - [doctest](https://github.com/doctest/doctest) (MIT): C++ test framework.
