@@ -1,5 +1,6 @@
-// Copyright (C) the RPCS3 project (https://github.com/RPCS3/rpcs3), licensed GPL-2.0.
-// Adapted from RPCS3 (GPL-2.0), rpcs3/Crypto/unpkg.cpp, commit c365ea76a552961ff078ea1a46da9d4b07729674
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) the RPCS3 project (https://github.com/RPCS3/rpcs3), licensed GPL-2.0-only.
+// Adapted from RPCS3 (GPL-2.0-only), rpcs3/Crypto/unpkg.cpp, commit c365ea76a552961ff078ea1a46da9d4b07729674
 // Header/entry layout, validation rules and the CTR-style keystream (AES-128-ECB of
 // klicensee + block index, keyed with the retail PKG key) follow package_reader there.
 // Retail finalized PS3 packages only; debug, PSP and Vita paths are out of scope.

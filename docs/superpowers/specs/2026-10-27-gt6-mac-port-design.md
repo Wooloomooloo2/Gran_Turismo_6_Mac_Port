@@ -67,6 +67,8 @@ Translation is the only native route.
   ps3recomp is MIT, which is compatible: its notices stay. **GPL-3.0-only code cannot be taken
   in** without relicensing the whole project to GPL-3.0. That is the owner's call, and the
   builder should raise it if it ever comes up.
+  Amended by D24: RPCS3 is GPL-2.0-only, so code adapted from it (and any tool or program that
+  links it, `gt6unpack` today) is GPL-2.0-only; the rest stays GPL-2.0-or-later.
 - **Credit:** every borrowed file or idea is credited in README (Credits section),
   `THIRD-PARTY-NOTICES.md`, and file headers where code is copied.
 - **Docs:** every design decision goes in `docs/DECISIONS.md` (numbered, dated, with the

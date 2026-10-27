@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // gt6unpack command line.
 #include "build_tree.hpp"
 #include "manifest.hpp"

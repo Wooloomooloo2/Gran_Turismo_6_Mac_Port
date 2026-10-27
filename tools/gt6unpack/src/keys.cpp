@@ -1,5 +1,6 @@
-// Copyright (C) the RPCS3 project (https://github.com/RPCS3/rpcs3), licensed GPL-2.0.
-// Adapted from RPCS3 (GPL-2.0), rpcs3/Crypto/key_vault.cpp, commit c365ea76a552961ff078ea1a46da9d4b07729674
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) the RPCS3 project (https://github.com/RPCS3/rpcs3), licensed GPL-2.0-only.
+// Adapted from RPCS3 (GPL-2.0-only), rpcs3/Crypto/key_vault.cpp and rpcs3/Crypto/key_vault.h, commit c365ea76a552961ff078ea1a46da9d4b07729674
 // Public PS3 key material, kept in source per owner decision D15.
 #include "keys.hpp"
 

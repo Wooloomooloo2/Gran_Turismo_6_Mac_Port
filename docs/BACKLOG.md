@@ -32,7 +32,7 @@ Shortcuts taken, with the proper fix logged. Priority order: 1) Stability, 2) Pe
 - `install_hooks.sh` overwrites an existing hook and uses `.git/hooks` rather than asking git where hooks live.
 - Add tests for the guard's staged mode, a file of exactly 50 MB, and little-endian ELF.
 - Decompression with an expected size of zero passes a null buffer; the encryption call's "done" count is unchecked; no empty-input tests for hmac/sha256.
-- The key-table test "every entry found by its own revision" is close to circular; pin the NPDRM key and IV and the entry counts; add key_vault.h to the "Adapted from" line.
+- The key-table test "every entry found by its own revision" is close to circular; pin the NPDRM key and IV and the entry counts.
 - SELF reader: sizes taken from untrusted file fields are not capped, so a bad file can raise a non-SELF error.
 - SELF reader is stricter than RPCS3 on some flags and short decompressed output; it may reject odd but valid files. Watch for this.
 - SELF reader: a header comment is stale after D16; some error paths (offset past end of file, out-of-range indexes, empty supplemental data) are untested.

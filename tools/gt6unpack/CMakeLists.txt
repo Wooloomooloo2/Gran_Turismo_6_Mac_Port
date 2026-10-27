@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-only
 add_library(gt6crypto STATIC src/crypto.cpp src/keys.cpp src/self.cpp src/sfo.cpp src/pkg.cpp)
 target_include_directories(gt6crypto PUBLIC src)
 target_compile_options(gt6crypto PRIVATE -Wall -Wextra)

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Finding a game's NPDRM klicensee in its own decrypted executable. No third-party code.
 #include "klic.hpp"
 

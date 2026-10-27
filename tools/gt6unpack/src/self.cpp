@@ -1,5 +1,6 @@
-// Copyright (C) the RPCS3 project (https://github.com/RPCS3/rpcs3), licensed GPL-2.0.
-// Adapted from RPCS3 (GPL-2.0), rpcs3/Crypto/unself.cpp, commit c365ea76a552961ff078ea1a46da9d4b07729674
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) the RPCS3 project (https://github.com/RPCS3/rpcs3), licensed GPL-2.0-only.
+// Adapted from RPCS3 (GPL-2.0-only), rpcs3/Crypto/unself.cpp, commit c365ea76a552961ff078ea1a46da9d4b07729674
 // Port of SELFDecrypter (LoadHeaders, LoadMetadata, DecryptNPDRM, DecryptData, MakeElf) working
 // on spans with exceptions. Differences from RPCS3: ELF64 retail SELFs only (no ELF32, no
 // debug/fake SELFs); every bound is checked; program segment hashes are verified; each metadata

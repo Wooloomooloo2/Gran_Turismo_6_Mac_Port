@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Small JSON helpers shared by the build log and the manifest writers.
 #pragma once
 #include <string>

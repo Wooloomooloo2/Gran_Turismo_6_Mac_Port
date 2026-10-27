@@ -41,8 +41,9 @@ on every push.
 
 ## Credits
 
-- [RPCS3](https://github.com/RPCS3/rpcs3) (GPL-2.0): reference for PS3 behaviour, and the
-  source of the decryption approach adapted for the unpacker.
+- [RPCS3](https://github.com/RPCS3/rpcs3) (GPL-2.0-only): reference for PS3 behaviour. The
+  unpacker's key table, SELF decryption and package reader are adapted from its
+  `rpcs3/Crypto` code (`key_vault`, `unself`, `unpkg`).
 - [ps3recomp](https://github.com/sp00nznet/ps3recomp) (MIT) by Ned Heller / sp00nznet: its
   analysis tools map the game's code (git submodule, dev-only), and it is the planned base for
   the translator and runtime.
@@ -54,4 +55,7 @@ See `THIRD-PARTY-NOTICES.md` for licence details.
 
 ## Licence
 
-GPL-2.0-or-later. See `LICENSE`.
+The project is GPL-2.0-or-later, except the unpacker `gt6unpack` (`tools/gt6unpack/`), which
+is GPL-2.0-only because it includes code adapted from RPCS3, which is GPL-2.0-only. Each
+source file states its licence in an `SPDX-License-Identifier` line. See `LICENSE` (GPL-2.0
+text) and `THIRD-PARTY-NOTICES.md`.

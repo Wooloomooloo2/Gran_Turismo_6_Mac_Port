@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Hashes-only manifest of a built tree, and verification of a tree against one.
 // The manifest holds paths, sizes and SHA-256 values, never file contents, so it can be committed.
 #pragma once

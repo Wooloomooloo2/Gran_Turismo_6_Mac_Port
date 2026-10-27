@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Assembles a game tree (design D14). No third-party code.
 #include "build_tree.hpp"
 

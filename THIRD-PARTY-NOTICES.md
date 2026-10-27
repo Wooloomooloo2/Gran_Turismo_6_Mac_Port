@@ -2,10 +2,13 @@
 
 | Project | Licence | Use here |
 |---|---|---|
-| [RPCS3](https://github.com/RPCS3/rpcs3) | GPL-2.0 | Reference for PS3 behaviour; PS3 crypto code adapted for the `gt6unpack` unpacker (added in milestone 1). File headers credit copied code. `tools/gt6unpack/src/keys.cpp` and `keys.hpp` are adapted from `rpcs3/Crypto/key_vault.cpp`; `tools/gt6unpack/src/self.cpp` and `self.hpp` are adapted from `rpcs3/Crypto/unself.cpp` and `unself.h`; `tools/gt6unpack/src/pkg.cpp` and `pkg.hpp` are adapted from `rpcs3/Crypto/unpkg.cpp` and `unpkg.h` (all commit c365ea76a552961ff078ea1a46da9d4b07729674). |
+| [RPCS3](https://github.com/RPCS3/rpcs3) | GPL-2.0-only ("Most files are licensed under the terms of GNU GPL-2.0-only", RPCS3 README) | Reference for PS3 behaviour; PS3 crypto code adapted for the `gt6unpack` unpacker (added in milestone 1). File headers credit copied code. The adapted files are GPL-2.0-only, so `gt6unpack` as a whole (everything under `tools/gt6unpack/`) is distributed under GPL-2.0-only (decision D24). `tools/gt6unpack/src/keys.cpp` and `keys.hpp` are adapted from `rpcs3/Crypto/key_vault.cpp` and `key_vault.h`; `tools/gt6unpack/src/self.cpp` and `self.hpp` are adapted from `rpcs3/Crypto/unself.cpp` and `unself.h`; `tools/gt6unpack/src/pkg.cpp` and `pkg.hpp` are adapted from `rpcs3/Crypto/unpkg.cpp` and `unpkg.h` (all commit c365ea76a552961ff078ea1a46da9d4b07729674). |
 | [ps3recomp](https://github.com/sp00nznet/ps3recomp) by Ned Heller / sp00nznet | MIT | Git submodule at `third_party/ps3recomp`, pinned to commit 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514, unmodified. Its analysis tools are run by the dev-only `scripts/map_game.py` (nothing from it ships yet). Planned upstream base for translator and runtime. Its MIT notice stays with any code taken; full text below and in `third_party/ps3recomp/LICENSE`. |
 | [bloodborne_mac_port](https://github.com/Wooloomooloo2/bloodborne_mac_port) | GPL-2.0-or-later | Launcher, renderer machinery and conventions (added as needed). |
 | [doctest](https://github.com/doctest/doctest) | MIT | C++ unit tests: v2.4.11, single header at `third_party/doctest/doctest.h`, licence at `third_party/doctest/LICENSE.txt`. |
+
+Every source file carries an `SPDX-License-Identifier` line: `GPL-2.0-only` under
+`tools/gt6unpack/`, `GPL-2.0-or-later` for the rest of the project.
 
 Every borrowed file or idea is also credited in the README and in file headers where code is
 copied. The MIT licence texts are reproduced here when the code is added.

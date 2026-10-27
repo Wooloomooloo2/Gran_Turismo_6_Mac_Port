@@ -21,7 +21,8 @@ The owner makes every product and architecture decision.
 ## What this repo is
 
 A native Apple Silicon port of Gran Turismo 6 (PS3) by static recompilation, not emulation.
-GitHub: https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac (public). Licence GPL-2.0-or-later.
+GitHub: https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac (public). Licence GPL-2.0-or-later,
+except `tools/gt6unpack/` (GPL-2.0-only: it holds RPCS3-derived code, D24).
 
 ## Decisions already made (don't re-litigate)
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Test-only synthetic SELF writer (retail-style, public revision 0x001C keys). Output goes to
 // memory or tmp dirs only; never commit it.
 #pragma once

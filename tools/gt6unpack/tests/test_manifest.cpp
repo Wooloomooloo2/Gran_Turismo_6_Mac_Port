@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #include "crypto.hpp"
 #include "doctest.h"
 #include "manifest.hpp"

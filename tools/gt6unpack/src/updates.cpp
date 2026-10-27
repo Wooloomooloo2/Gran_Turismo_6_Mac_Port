@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Edition files and update ordering/verification. No third-party code.
 #include "updates.hpp"
 

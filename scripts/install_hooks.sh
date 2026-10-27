@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Installs a pre-commit hook that blocks PS3 game files from being committed.
 set -e
 root=$(git rev-parse --show-toplevel)

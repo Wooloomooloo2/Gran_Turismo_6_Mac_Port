@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // PARAM.SFO parser. Format per the public PS3 developer wiki; no third-party code.
 #pragma once
 #include <cstdint>

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Assembles a game tree: disc copy (dev_bdvd), updates installed in APP_VER order
 // (dev_hdd0/game/<title>), decrypted executables, and build.json. Layout per design D14.
 #pragma once

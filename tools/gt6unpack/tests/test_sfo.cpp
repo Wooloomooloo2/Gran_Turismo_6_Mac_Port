@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #include "doctest.h"
 #include "pkg_builder.hpp"
 #include "sfo.hpp"

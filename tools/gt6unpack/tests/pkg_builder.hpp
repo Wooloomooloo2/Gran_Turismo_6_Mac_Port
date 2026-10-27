@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Test-only synthetic PS3 package writer. Writes only where the caller points it (tmp dirs);
 // never commit its output.
 #pragma once

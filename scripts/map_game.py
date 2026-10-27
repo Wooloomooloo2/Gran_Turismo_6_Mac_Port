@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Map GT6's code with ps3recomp's analysis tools (dev-only, never shipped).
 
 Usage:
