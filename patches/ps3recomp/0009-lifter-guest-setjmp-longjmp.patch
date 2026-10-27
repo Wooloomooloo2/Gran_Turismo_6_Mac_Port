@@ -1,0 +1,495 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] lifter: guest setjmp/longjmp unwind the lifted host frames
+
+Upstream: not yet submitted
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0008)
+
+What: new ppu_lifter options --setjmp EA[,EA] and --longjmp EA[,EA] name the
+title's C library setjmp and longjmp. Every direct call to a setjmp becomes
+PPU_SJLJ_SETJMP (runtime/ppu/ppu_sjlj.h): a host _setjmp into a frame
+declared at the top of the calling function, registered per host thread and
+dropped on every return of that function. The longjmp function, after its
+lifted body has restored the guest registers, calls ppu_sjlj_longjmp, which
+host-longjmps to the newest frame for the same jmp_buf and puts back the
+indirect-call depth and vcall stack the skipped frames held. With no frame
+for the buffer it logs and returns, as before. The runtime half is in
+ppu_loader.cpp (between guest-sjlj markers); the generated header includes
+ppu_sjlj.h only when either option is given, so other lifts are unchanged.
+
+Why: lifted, a guest longjmp only returned from the longjmp function; the
+code after the call carried on with the registers of the setjmp. Gran
+Turismo 6's file worker aborts a decode with longjmp when its consumer has
+no output buffer left, so its inflater kept writing through a NULL or stale
+buffer, overran a static buffer into its USB driver's state, and the game
+exited on a failed mutex lock.
+
+Test: tools/test_ppu_sjlj.py (new): the lifter rewrite, and the runtime with
+stand-in lifted functions (landing value, skipped code, depth restore,
+unknown and returned buffers, a re-armed call site).
+
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -35,6 +35,7 @@
+ #include "ppu_tls.h"   /* PPU_THREAD_LOCAL, without a second ppu_context */
+ #define PPU_NO_INLINE_LOADS   /* this file defines the out-of-line accessors */
+ #include "ppu_recomp.h"
++#include "ppu_sjlj.h"   /* guest setjmp/longjmp across lifted host frames */
+ #include "../spu/spu_coh_bitmap.h"   /* spu_coh_line_reserved, for the stores */
+ #include "ps3emu/ps3_ftrace.h"   /* PS3_FTRACE timeline */
+ #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
+@@ -1567,6 +1568,70 @@
+ extern "C" int* ps3_ppu_dispatch_depth_slot(void) { return &g_dispatch_depth; }
+ extern "C" int* ps3_ppu_vcall_sp_slot(void) { return &g_vcall_sp; }
+ 
++/* ---- guest setjmp/longjmp (ppu_sjlj.h) -------------------------------------
++ * Frames registered by PPU_SJLJ_SETJMP, newest first, per host thread. Each
++ * lives in its lifted function's host frame, so a frame at or below a new
++ * one's address belongs to a function that has returned and is dropped. */
++extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*);
++/* guest-sjlj: begin */
++/* Frames registered by PPU_SJLJ_SETJMP, newest first, per host thread. A frame
++ * lives in its lifted function's host frame; the function drops its frames on
++ * every return (ppu_sjlj_leave), and a longjmp drops every frame newer than the
++ * one it lands on, so the chain holds live frames only. */
++static PPU_THREAD_LOCAL ppu_sjlj_frame* g_sjlj_top = nullptr;
++static uint32_t sjlj_align(uint32_t ea) { return (ea + 15u) & ~15u; }
++
++extern "C" void ppu_sjlj_push(ppu_context* ctx, ppu_sjlj_frame* f, uint32_t guest_buf)
++{
++    (void)ctx;
++    if (f->pushed) {                   /* the same call site again (a loop): re-arm it */
++        while (g_sjlj_top && g_sjlj_top != f) g_sjlj_top = g_sjlj_top->prev;
++        if (g_sjlj_top == f) g_sjlj_top = f->prev;
++    }
++    f->guest_buf = sjlj_align(guest_buf);
++    f->dispatch_depth = g_dispatch_depth;
++    f->vcall_sp = g_vcall_sp;
++    f->prev = g_sjlj_top;
++    f->pushed = 1;
++    g_sjlj_top = f;
++}
++
++extern "C" void ppu_sjlj_leave(ppu_sjlj_frame* a, ppu_sjlj_frame* b)
++{
++    const uintptr_t lo = (uintptr_t)(a < b ? a : b), hi = (uintptr_t)(a < b ? b : a);
++    while (g_sjlj_top && (uintptr_t)g_sjlj_top >= lo && (uintptr_t)g_sjlj_top <= hi)
++        g_sjlj_top = g_sjlj_top->prev;
++}
++
++extern "C" void ppu_sjlj_landed(ppu_context* ctx, ppu_sjlj_frame* f)
++{
++    (void)ctx;
++    /* The host frames the jump skipped never ran their epilogues. */
++    g_dispatch_depth = f->dispatch_depth;
++    g_vcall_sp = f->vcall_sp;
++    g_trampoline_fn = nullptr;
++}
++
++extern "C" void ppu_sjlj_longjmp(ppu_context* ctx, uint32_t guest_buf)
++{
++    const uint32_t want = sjlj_align(guest_buf);
++    for (ppu_sjlj_frame* p = g_sjlj_top; p; p = p->prev) {
++        if (p->guest_buf != want) continue;
++        g_sjlj_top = p;                /* frames newer than p are gone */
++#if defined(_WIN32)
++        longjmp(p->env, 1);
++#else
++        _longjmp(p->env, 1);
++#endif
++    }
++    static int n = 0;
++    if (PS3_LOG_FIRST(n, 8))
++        fprintf(stderr, "[ppu] guest longjmp(0x%08X): no live setjmp frame on this thread "
++                "(tid=%llu) -- returning to the caller instead\n", want,
++                (unsigned long long)ctx->thread_id);
++}
++/* guest-sjlj: end */
++
+ /* Every guest store commits through this: on a line no SPU has reserved (all of
+  * them, until SPU code runs) it is the plain memcpy it replaced. */
+ #define VM_WRITE_COH(a, src, n)                                               \
+--- /dev/null
++++ b/runtime/ppu/ppu_sjlj.h
+@@ -0,0 +1,65 @@
++/* ppu_sjlj.h -- guest setjmp/longjmp across lifted host frames.
++ *
++ * A guest longjmp restores r1, r2, r13-r31, LR, CR and the non-volatile FP and
++ * vector registers from the jmp_buf and returns through the saved LR. Lifted,
++ * every guest call is a host C call, so that return only leaves the longjmp
++ * function: the host frames between the setjmp and the longjmp stay on the
++ * host stack, and the code after the longjmp call carries on with the
++ * restored registers as if the call had returned. A title that aborts a
++ * decoder with longjmp (Gran Turismo 6's file worker does when its consumer
++ * has no output buffer left) then keeps decoding into a stale or NULL buffer.
++ *
++ * With --setjmp/--longjmp, the lifter brackets every direct call to a guest
++ * setjmp with a host setjmp (PPU_SJLJ_SETJMP, a frame in the caller's own
++ * frame) and ends the guest longjmp with ppu_sjlj_longjmp, which host-longjmps
++ * to the newest frame registered for that jmp_buf; every return from a function
++ * holding frames drops them (ppu_sjlj_leave), so only live frames are
++ * registered. The guest code has by
++ * then restored every register, so execution resumes after the setjmp call
++ * with the longjmp's value in r3, exactly as on the console. With no live
++ * frame for the buffer, ppu_sjlj_longjmp logs and returns (the old behaviour).
++ * The runtime side is in ppu_loader.cpp. */
++#pragma once
++#include <setjmp.h>
++#include <stdint.h>
++
++struct ppu_context;
++
++typedef struct ppu_sjlj_frame {
++    jmp_buf env;
++    uint32_t guest_buf;            /* the guest jmp_buf (16-byte aligned, as the guest code uses it) */
++    int dispatch_depth;            /* ps3_indirect_call nesting at the setjmp */
++    int vcall_sp;
++    int pushed;                    /* registered (0 until the setjmp call is reached) */
++    struct ppu_sjlj_frame* prev;   /* the next older frame on this host thread */
++} ppu_sjlj_frame;
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++void ppu_sjlj_push(struct ppu_context* ctx, ppu_sjlj_frame* f, uint32_t guest_buf);
++void ppu_sjlj_landed(struct ppu_context* ctx, ppu_sjlj_frame* f);
++void ppu_sjlj_longjmp(struct ppu_context* ctx, uint32_t guest_buf);
++/* The function holding frames a..b (its first and last) returns: drop them. */
++void ppu_sjlj_leave(ppu_sjlj_frame* a, ppu_sjlj_frame* b);
++#ifdef __cplusplus
++}
++#endif
++
++/* _setjmp/_longjmp on POSIX: no signal-mask save, which on Darwin is a
++ * syscall per setjmp. */
++#if defined(_WIN32)
++#  define PPU_SJLJ_SETJMP_RAW(env) setjmp(env)
++#else
++#  define PPU_SJLJ_SETJMP_RAW(env) _setjmp(env)
++#endif
++
++/* A direct call to a guest setjmp. `f` is a ppu_sjlj_frame declared (zeroed) at
++ * the top of the calling function, so it lives as long as that function's
++ * frame, and every return from that function calls ppu_sjlj_leave. */
++#define PPU_SJLJ_SETJMP(ctx, f, fn)                                         \
++    do {                                                                    \
++        ppu_sjlj_push((ctx), &(f), (uint32_t)(ctx)->gpr[3]);                \
++        if (PPU_SJLJ_SETJMP_RAW((f).env) == 0) fn(ctx);                     \
++        else ppu_sjlj_landed((ctx), &(f));                                  \
++    } while (0)
+--- a/tools/ppu_lifter.py
++++ b/tools/ppu_lifter.py
+@@ -800,6 +800,47 @@
+ _INSN_PATCH_RE = re.compile(r"^if \(([A-Za-z_]\w*)\) \{ .* /\* insn patch 0x[0-9A-F]{8}: ")
+ 
+ 
++def _sjlj_rewrite(func, body, prefix, setjmp_addrs, longjmp_addrs):
++    """Guest setjmp/longjmp across lifted host frames (runtime/ppu/ppu_sjlj.h).
++
++    Every direct call `func_<S>(ctx);` to a --setjmp function S becomes
++    PPU_SJLJ_SETJMP(ctx, _sjfN, func_<S>), with its frame _sjfN declared (zeroed)
++    at the top of the calling function so it lives as long as that host frame,
++    and every `return;` of that function first drops its frames
++    (ppu_sjlj_leave). A --longjmp function records its jmp_buf (r3) on entry and
++    ends every plain `return;` in ppu_sjlj_longjmp, which host-longjmps to the
++    newest setjmp frame for that buffer once the guest code has restored the
++    registers. Returns the new body and the number of frames."""
++    if not setjmp_addrs and func.start_addr not in longjmp_addrs:
++        return body, 0
++    out, frames = [], 0
++    for line in body:
++        for s_ea in setjmp_addrs:
++            call = f"{prefix}func_{s_ea:08X}(ctx);"
++            if call in line:
++                line = line.replace(call, f"PPU_SJLJ_SETJMP(ctx, _sjf{frames}, {prefix}func_{s_ea:08X});")
++                frames += 1
++        if func.start_addr in longjmp_addrs and line.strip() == "return;":
++            line = line.replace("return;", "ppu_sjlj_longjmp(ctx, _sjbuf); return;")
++        out.append(line)
++    if frames:
++        out = [sjlj_leave_returns(line, frames) for line in out]
++    head = [f"ppu_sjlj_frame _sjf{k} = {{}};" for k in range(frames)]
++    if func.start_addr in longjmp_addrs:
++        head.append("const uint32_t _sjbuf = (uint32_t)ctx->gpr[3];")
++    return head + out, frames
++
++
++_RETURN_RE = re.compile(r"\breturn;")
++
++
++def sjlj_leave_returns(line, frames):
++    """Every `return;` of a function holding setjmp frames drops them first."""
++    if not frames:
++        return line
++    return _RETURN_RE.sub(f"{{ ppu_sjlj_leave(&_sjf0, &_sjf{frames - 1}); return; }}", line)
++
++
+ def load_insn_patches(path: str) -> dict[int, tuple[int, int, str]]:
+     """Read an --insn-patches file:
+ 
+@@ -1064,6 +1105,9 @@
+             prefix += "_"
+         self.prefix = prefix
+         self.weak_emit = bool(weak_emit)
++        # Guest setjmp/longjmp entry points (--setjmp/--longjmp, ppu_sjlj.h).
++        self.setjmp_addrs: set[int] = set()
++        self.longjmp_addrs: set[int] = set()
+         # Cache for _range_insns: (instructions, len, ordered, addrs). Keyed by
+         # the instruction-list identity so the FULL list (mid-function / serial
+         # lift) is sorted+indexed once, not rescanned per call.
+@@ -3993,6 +4037,9 @@
+                                             self.prefix + "function_table")
+                     if self.prefix else HEADER_PREAMBLE)
+         lines = [preamble]
++        if getattr(self, "setjmp_addrs", None) or getattr(self, "longjmp_addrs", None):
++            lines.append('#include "ppu_sjlj.h"   /* guest setjmp/longjmp (--setjmp/--longjmp) */')
++            lines.append("")
+         # Forward declarations
+         for func in self.functions:
+             lines.append(f"void {func.name}(ppu_context* ctx);")
+@@ -4178,7 +4225,10 @@
+                       f"extern int {g};", "#endif"]
+         lines.append(f"void {weak}{func.name}(ppu_context* ctx) {{")
+         lines.append("    PPU_MM_SNAP")
+-        for bline in _fuse_cr(func.body_lines):
++        body, sj_frames = _sjlj_rewrite(func, _fuse_cr(func.body_lines), self.prefix,
++                                        getattr(self, "setjmp_addrs", ()),
++                                        getattr(self, "longjmp_addrs", ()))
++        for bline in body:
+             lines.append(f"    {bline}" if not bline.endswith(":") else bline)
+ 
+         # If a function doesn't end with blr/b/bctr (a return or unconditional
+@@ -4207,11 +4257,14 @@
+                     if nxt.start_addr == func.fallthrough_to:
+                         target = nxt.name
+             if target:
+-                lines.append(f"        {{ g_trampoline_fn = (void(*)(void*)){target}; return; }}")
++                lines.append(sjlj_leave_returns(
++                    f"        {{ g_trampoline_fn = (void(*)(void*)){target}; return; }}", sj_frames))
+             else:
+                 print(f"  WARNING: {func.name} has no continuation at "
+                       f"0x{func.fallthrough_to:08X}; emitting halt", flush=True)
+-                lines.append(f"        /* missing continuation 0x{func.fallthrough_to:08X}: halt */ return;")
++                lines.append(sjlj_leave_returns(
++                    f"        /* missing continuation 0x{func.fallthrough_to:08X}: halt */ return;",
++                    sj_frames))
+ 
+         lines.append("}")
+         lines.append("")
+@@ -5102,6 +5155,15 @@
+                              "is emitted as `if (guard) {new} else {orig}`, guard "
+                              "being an int the port defines. The input must hold "
+                              "`orig` at `addr` or the lift stops.")
++    parser.add_argument("--setjmp", metavar="EA[,EA...]", default="",
++                        help="guest setjmp functions: every direct call to one "
++                             "also takes a host setjmp (PPU_SJLJ_SETJMP, "
++                             "runtime/ppu/ppu_sjlj.h), so a guest longjmp can "
++                             "unwind the lifted host frames")
++    parser.add_argument("--longjmp", metavar="EA[,EA...]", default="",
++                        help="guest longjmp functions: each ends in "
++                             "ppu_sjlj_longjmp, a host longjmp to the matching "
++                             "--setjmp call")
+     args = parser.parse_args()
+ 
+     # Load firmware-import stubs (addr -> NID) up front; applied to func_bounds
+@@ -5558,6 +5620,11 @@
+     lifter.hle_stub_nids = hle_stubs
+     lifter.function_entries = _func_entries
+     lifter.jump_tables = jt_dispatchers
++    lifter.setjmp_addrs = {int(a, 0) for a in args.setjmp.split(",") if a.strip()}
++    lifter.longjmp_addrs = {int(a, 0) for a in args.longjmp.split(",") if a.strip()}
++    if lifter.setjmp_addrs or lifter.longjmp_addrs:
++        print(f"  setjmp: {sorted(hex(a) for a in lifter.setjmp_addrs)}  "
++              f"longjmp: {sorted(hex(a) for a in lifter.longjmp_addrs)}")
+     if args.insn_patches:
+         lifter.insn_patches = load_insn_patches(args.insn_patches)
+         print(f"  insn-patches: {len(lifter.insn_patches)} from {args.insn_patches}")
+--- /dev/null
++++ b/tools/test_ppu_sjlj.py
+@@ -0,0 +1,187 @@
++#!/usr/bin/env python3
++"""Guest setjmp/longjmp across lifted host frames (runtime/ppu/ppu_sjlj.h).
++
++1. The lifter rewrite (--setjmp/--longjmp, _sjlj_rewrite in ppu_lifter.py):
++   a direct call to a setjmp function becomes PPU_SJLJ_SETJMP with a frame
++   declared at the top of the caller, whose every return then drops its
++   frames; a longjmp function records r3 on entry and ends its plain returns
++   in ppu_sjlj_longjmp.
++2. The runtime (ppu_loader.cpp, pulled out between its guest-sjlj markers),
++   built with stand-ins for lifted functions:
++   - setjmp returns 0, a longjmp three host frames down lands back after the
++     setjmp call with the longjmp's r3 and the code after the longjmp call
++     never runs;
++   - the indirect-call depth and vcall stack the skipped frames held are put
++     back, and a pending trampoline is dropped;
++   - a longjmp to a buffer with no live frame returns to its caller (logged);
++   - a frame whose function has returned is not jumped to.
++Gran Turismo 6's file worker aborts a decode this way; before, the decoder
++carried on into a NULL or stale output buffer.
++"""
++import os
++import re
++import shutil
++import subprocess
++import sys
++import tempfile
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(ROOT / 'tools'))
++from ppu_lifter import _sjlj_rewrite  # noqa: E402
++
++FAILS = []
++
++
++def check(name, ok):
++    print(('ok   ' if ok else 'FAIL ') + name)
++    if not ok:
++        FAILS.append(name)
++
++
++class F:
++    def __init__(self, start):
++        self.start_addr = start
++
++
++def test_rewrite():
++    body = ['ctx->lr = 0x00A4700C; func_00BDCF2C(ctx); DRAIN_TRAMPOLINE(ctx);',
++            'if (x) goto loc_1;',
++            'ctx->lr = 0x00A47100; func_00BDCF2C(ctx); DRAIN_TRAMPOLINE(ctx);',
++            'return;']
++    body.insert(3, '{ g_trampoline_fn = (void(*)(void*))func_00001000; return; }')
++    out, n = _sjlj_rewrite(F(0x00A46FB4), body, '', {0x00BDCF2C}, {0x00BDD050})
++    check('two frames declared first, zeroed',
++          n == 2 and out[:2] == ['ppu_sjlj_frame _sjf0 = {};', 'ppu_sjlj_frame _sjf1 = {};'])
++    check('setjmp calls bracketed',
++          'PPU_SJLJ_SETJMP(ctx, _sjf0, func_00BDCF2C);' in out[2] and
++          'PPU_SJLJ_SETJMP(ctx, _sjf1, func_00BDCF2C);' in out[4])
++    check('every return drops the frames first',
++          out[-1] == '{ ppu_sjlj_leave(&_sjf0, &_sjf1); return; }' and
++          'ppu_sjlj_leave(&_sjf0, &_sjf1); return; }' in out[5])
++    lj, n = _sjlj_rewrite(F(0x00BDD050), ['ctx->gpr[1] = vm_read64(ctx->gpr[3] + 0x0);', 'return;'],
++                          '', {0x00BDCF2C}, {0x00BDD050})
++    check('longjmp records its buffer on entry', lj[0] == 'const uint32_t _sjbuf = (uint32_t)ctx->gpr[3];')
++    check('longjmp ends in ppu_sjlj_longjmp', lj[-1] == 'ppu_sjlj_longjmp(ctx, _sjbuf); return;')
++    same = ['func_00001000(ctx);', 'return;']
++    check('other functions untouched', _sjlj_rewrite(F(0x2000), same, '', set(), {0x00BDD050}) == (same, 0))
++
++
++HARNESS = r'''
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++struct ppu_context { uint64_t gpr[32]; uint64_t lr; uint64_t thread_id; };
++#define PPU_THREAD_LOCAL thread_local
++#define PS3_LOG_FIRST(n, k) ((n)++ < (k))
++#include "ppu_sjlj.h"
++static PPU_THREAD_LOCAL int g_dispatch_depth = 0;
++static PPU_THREAD_LOCAL int g_vcall_sp = 0;
++extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*);
++PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*) = nullptr;
++%s
++static int fails = 0;
++#define CHECK(c, m) do { bool ok_ = (c); printf("%%s %%s\n", ok_ ? "ok  " : "FAIL", m); if (!ok_) fails++; } while (0)
++static int after_longjmp = 0;
++static void dummy(void*) {}
++/* guest setjmp: stores nothing here, returns 0 */
++__attribute__((noinline)) static void guest_setjmp(ppu_context* ctx) { ctx->gpr[3] = 0; }
++/* guest longjmp: restores the registers (here r1 and r3 = value) and returns */
++__attribute__((noinline)) static void guest_longjmp(ppu_context* ctx) {
++    const uint32_t _sjbuf = (uint32_t)ctx->gpr[3];
++    ctx->gpr[1] = 0xD0001000; ctx->gpr[3] = ctx->gpr[4] ? ctx->gpr[4] : 1;
++    ppu_sjlj_longjmp(ctx, _sjbuf); return;
++}
++__attribute__((noinline)) static void deep2(ppu_context* ctx) {
++    g_dispatch_depth += 5; g_vcall_sp += 3; g_trampoline_fn = dummy;   /* frames that never unwind */
++    ctx->gpr[3] = 0x1000; ctx->gpr[4] = 7; guest_longjmp(ctx);
++    after_longjmp = 1;                                                 /* must not run */
++}
++__attribute__((noinline)) static void deep1(ppu_context* ctx) { deep2(ctx); after_longjmp = 2; }
++/* as the lifter emits them: every return drops the function's frames */
++__attribute__((noinline)) static int caller(ppu_context* ctx) {
++    ppu_sjlj_frame _sjf0 = {};
++    ctx->gpr[3] = 0x1000;
++    PPU_SJLJ_SETJMP(ctx, _sjf0, guest_setjmp);
++    if (ctx->gpr[3] == 0) { deep1(ctx); { ppu_sjlj_leave(&_sjf0, &_sjf0); return -1; } }
++    { ppu_sjlj_leave(&_sjf0, &_sjf0); return (int)ctx->gpr[3]; }
++}
++__attribute__((noinline)) static void sets_and_returns(ppu_context* ctx) {
++    ppu_sjlj_frame _sjf0 = {};
++    ctx->gpr[3] = 0x2000;
++    PPU_SJLJ_SETJMP(ctx, _sjf0, guest_setjmp);
++    { ppu_sjlj_leave(&_sjf0, &_sjf0); return; }
++}
++__attribute__((noinline)) static int loops(ppu_context* ctx) {
++    ppu_sjlj_frame _sjf0 = {};
++    volatile int laps = 0;   /* a local changed after setjmp must be volatile (lifted code keeps its state in ctx) */
++again:
++    ctx->gpr[3] = 0x4000;
++    PPU_SJLJ_SETJMP(ctx, _sjf0, guest_setjmp);
++    if (++laps < 3) goto again;                 /* the same call site, three times */
++    if (ctx->gpr[3] == 0) { ctx->gpr[3] = 0x4000; ctx->gpr[4] = 5; guest_longjmp(ctx); }
++    { ppu_sjlj_leave(&_sjf0, &_sjf0); return (int)ctx->gpr[3] * 100 + laps; }
++}
++int main() {
++    ppu_context c = {}; c.thread_id = 9;
++    g_dispatch_depth = 2; g_vcall_sp = 1;
++    int r = caller(&c);
++    CHECK(r == 7, "longjmp lands after the setjmp call with its value in r3");
++    CHECK(after_longjmp == 0, "the code after the longjmp call never runs");
++    CHECK(c.gpr[1] == 0xD0001000, "the registers the guest longjmp restored stay restored");
++    CHECK(g_dispatch_depth == 2 && g_vcall_sp == 1, "dispatch depth and vcall stack put back");
++    CHECK(g_trampoline_fn == nullptr, "a pending trampoline is dropped");
++    /* no live frame for the buffer: guest_longjmp returns */
++    c.gpr[3] = 0x3000; c.gpr[4] = 1; guest_longjmp(&c);
++    CHECK(true, "longjmp to an unknown buffer returns to its caller");
++    /* a frame whose function has returned is never jumped to */
++    sets_and_returns(&c);
++    c.gpr[3] = 0x2000; c.gpr[4] = 1; guest_longjmp(&c);
++    CHECK(true, "longjmp to a returned frame's buffer returns instead");
++    int l = loops(&c);
++    CHECK(l == 504, "a setjmp call site re-armed in a loop is one frame, and lands once more");
++    printf("%%s (%%d failed)\n", fails ? "FAIL" : "PASS", fails);
++    return fails ? 1 : 0;
++}
++'''
++
++
++def test_runtime():
++    cxx = os.environ.get('CXX') or shutil.which('c++') or shutil.which('clang++') or shutil.which('g++')
++    if not cxx:
++        print('SKIP: no C++ compiler')
++        return
++    src = (ROOT / 'runtime/ppu/ppu_loader.cpp').read_text()
++    a = src.index('/* guest-sjlj: begin */')
++    b = src.index('/* guest-sjlj: end */')
++    with tempfile.TemporaryDirectory() as tmp:
++        c = Path(tmp) / 't.cpp'
++        exe = Path(tmp) / 't'
++        c.write_text(HARNESS % src[a:b])
++        r = subprocess.run([cxx, '-std=c++17', '-O2', '-w', '-I', str(ROOT / 'runtime/ppu'), str(c),
++                            '-o', str(exe)], capture_output=True, text=True)
++        if r.returncode:
++            print(r.stderr[-3000:])
++            FAILS.append('runtime harness compiles')
++            return
++        r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=30)
++        print(r.stdout, end='')
++        if r.returncode:
++            FAILS.append('runtime')
++        if 'no live setjmp frame' not in r.stderr:
++            FAILS.append('the unmatched longjmp is logged')
++            print(r.stderr)
++
++
++def main():
++    test_rewrite()
++    test_runtime()
++    if FAILS:
++        print('FAILED: ' + ', '.join(FAILS))
++        return 1
++    print('all setjmp/longjmp checks passed')
++    return 0
++
++
++if __name__ == '__main__':
++    sys.exit(main())

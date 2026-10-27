@@ -10,7 +10,9 @@ USRDIR/EMAIN.SELF.elf, the executable a v1.22 console launches. Two steps:
 ppu_loader (function list, import stubs, image manifest), then ppu_lifter with
 --code-end set to the end of the last executable ELF section, read from the section
 headers (D25). Without it the lifter promotes call targets inside read-only data and
-the embedded SPU programs to functions and writes 3.7 GB of bogus code.
+the embedded SPU programs to functions and writes 3.7 GB of bogus code. The C library's
+setjmp and longjmp, found by their instructions, are passed as --setjmp/--longjmp so a
+guest longjmp unwinds the lifted host frames (translate.json["sjlj"]).
 
 Then the SPU step (D27): build_spu_workloads --input EMAIN finds and lifts the
 embedded SPU ELF programs and writes their registry; the SPURS job modules stored
@@ -78,6 +80,35 @@ def code_end(elf_bytes):
     if end is None:
         raise ValueError("no executable sections")
     return end
+
+
+# The C library's setjmp and longjmp, by their first six instructions: align the jmp_buf
+# (addi r3,r3,15; rldicr r3,r3,0,59), then store (setjmp) or load (longjmp) r1, r2, r13,
+# r14. The lifter brackets setjmp calls and ends longjmp with a host longjmp, so a guest
+# longjmp unwinds the lifted host frames (patch 0009).
+SETJMP_SIG = (0x3863000F, 0x786306E4, 0xF8230000, 0xF8430008, 0xF9A30010, 0xF9C30018)
+LONGJMP_SIG = (0x3863000F, 0x786306E4, 0xE8230000, 0xE8430008, 0xE9A30010, 0xE9C30018)
+
+
+def find_sjlj(elf_bytes):
+    """(setjmp addresses, longjmp addresses) in the executable sections of a big-endian
+    ELF64, found by SETJMP_SIG / LONGJMP_SIG at word-aligned addresses."""
+    shoff, = struct.unpack_from(">Q", elf_bytes, 0x28)
+    shentsize, shnum = struct.unpack_from(">HH", elf_bytes, 0x3A)
+    pats = [b"".join(struct.pack(">I", w) for w in sig) for sig in (SETJMP_SIG, LONGJMP_SIG)]
+    found = ([], [])
+    for i in range(shnum):
+        _, _, flags, addr, off, size = struct.unpack_from(">IIQQQQ", elf_bytes, shoff + i * shentsize)
+        if not flags & SHF_EXECINSTR or not size:
+            continue
+        sec = elf_bytes[off:off + size]
+        for k, pat in enumerate(pats):
+            at = sec.find(pat)
+            while at >= 0:
+                if (addr + at) % 4 == 0:
+                    found[k].append(addr + at)
+                at = sec.find(pat, at + 1)
+    return sorted(found[0]), sorted(found[1])
 
 
 def patches_hash(folder=PATCHES):
@@ -303,6 +334,10 @@ def translate(tree, out, python, tools, chunks=64, jobs=None):
         args = [elf, "--functions", loader / "EMAIN.SELF.functions.json",
                 "--hle-stubs", loader / "EMAIN.SELF.imports.json",
                 "--code-end", hex(end), "--chunks", chunks]
+        setjmps, longjmps = find_sjlj(data)
+        if setjmps and longjmps:
+            args += ["--setjmp", ",".join(hex(a) for a in setjmps),
+                     "--longjmp", ",".join(hex(a) for a in longjmps)]
         if jobs:
             args += ["-j", jobs]
         args += ["-o", staging / "ppu"]
@@ -321,6 +356,7 @@ def translate(tree, out, python, tools, chunks=64, jobs=None):
             "code_end": hex(end),
             "chunks": chunks,
             "functions": int(m.group(1)),
+            "sjlj": {"setjmp": [hex(a) for a in setjmps], "longjmp": [hex(a) for a in longjmps]},
             "seconds": {k: v["seconds"] for k, v in status.items()},
             "spu": spu,
         }

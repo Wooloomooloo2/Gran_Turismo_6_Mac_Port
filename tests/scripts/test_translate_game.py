@@ -181,7 +181,8 @@ def test_record_fields(tree, tmp_path):
     rec = translate_game.translate(tree, out, sys.executable, fake_tools(tmp_path, "a", 4242))
     assert json.loads((out / "translate.json").read_text()) == rec
     assert set(rec) == {"elf", "elf_sha256", "ps3recomp_commit", "ps3recomp_patches",
-                        "code_end", "chunks", "functions", "seconds", "spu"}
+                        "code_end", "chunks", "functions", "sjlj", "seconds", "spu"}
+    assert rec["sjlj"] == {"setjmp": [], "longjmp": []}
     assert rec["elf"] == ELF_REL
     assert rec["code_end"] == "0x10320"
     assert rec["functions"] == 4242 and rec["chunks"] == 64
@@ -242,6 +243,40 @@ def test_spu_tool_failure_keeps_previous_output(tree, tmp_path):
     assert "lift_jobmods failed" in str(e.value)
     assert (out / "ppu" / "ppu_recomp_000.cpp").read_text() == "one"
     assert sorted(p.name for p in tmp_path.iterdir()) == ["out", "tools", "tree"]
+
+
+def make_elf_with_code(words, addr=0x10200):
+    """Big-endian ELF64 with one executable section holding `words` at `addr`."""
+    code = b"".join(struct.pack(">I", w) for w in words)
+    shoff = 64 + len(code)
+    sh = bytearray(64) + struct.pack(">IIQQQQIIQQ", 0, 1, 0x6, addr, 64, len(code), 0, 0, 0, 0)
+    hdr = bytearray(64)
+    hdr[:16] = b"\x7fELF\x02\x02\x01" + bytes(9)
+    struct.pack_into(">HHIQQQIHHHHHH", hdr, 16, 2, 21, 1, 0, 0, shoff, 0, 64, 0, 0, 64, 2, 0)
+    return bytes(hdr) + code + bytes(sh)
+
+
+def test_find_sjlj():
+    nop = 0x60000000
+    words = [nop] + list(translate_game.SETJMP_SIG) + [nop, nop] + list(translate_game.LONGJMP_SIG)
+    sj, lj = translate_game.find_sjlj(make_elf_with_code(words))
+    assert sj == [0x10204] and lj == [0x10204 + 4 * 8]
+    assert translate_game.find_sjlj(make_elf_with_code([nop] * 8)) == ([], [])
+
+
+def test_sjlj_passed_to_the_lifter(tmp_path):
+    t = tmp_path / "tree"
+    elf = t / ELF_REL
+    elf.parent.mkdir(parents=True)
+    words = list(translate_game.SETJMP_SIG) + list(translate_game.LONGJMP_SIG)
+    elf.write_bytes(make_elf_with_code(words, addr=0x10300))
+    tools = fake_tools(tmp_path, "a", 1)
+    lifter = (tools / "ppu_lifter.py").read_text().replace(
+        'assert "--code-end" in a and a[a.index("--code-end") + 1] == "0x10320", a',
+        'assert a[a.index("--setjmp") + 1] == "0x10300" and a[a.index("--longjmp") + 1] == "0x10318", a')
+    (tools / "ppu_lifter.py").write_text(lifter)
+    rec = translate_game.translate(t, tmp_path / "out", sys.executable, tools)
+    assert rec["sjlj"] == {"setjmp": ["0x10300"], "longjmp": ["0x10318"]}
 
 
 def test_fnv1a64_matches_the_runtime():
