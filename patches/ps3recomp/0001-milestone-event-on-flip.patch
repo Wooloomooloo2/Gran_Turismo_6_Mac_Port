@@ -1,0 +1,231 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] cellGcmSys: record a gcm:flip milestone for each guest flip request
+
+Upstream: not yet submitted
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514
+
+Every guest flip request that the present loop shows (the three places that
+bump s_flip_request_count: the FIFO flip marker, cellGcmSetFlipCommand and
+cellGcmSetPrepareFlip) now goes through gcm_note_flip_request(), which also
+calls ps3_ms("gcm:flip"). The milestone log then says whether a title ever
+reached its first frame, and its counts say how many it showed, without any
+port-side code. With PS3_MILESTONE_OUT unset this costs one relaxed load.
+
+The unit tests that #include cellGcmSys.c get an empty ps3_ms stub beside
+their other stubs, so they still link.
+
+Note for upstream: existing regress.py goldens gain one key ("gcm:flip") for
+every title that flips.
+
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 298ee7de..9e282daf 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -27,6 +27,7 @@ static u32 s_gcm_context_ea = 0;
+ #include <stdlib.h>
+ #include <stdint.h>
+ #include "ps3emu/log_first.h"
++#include "ps3emu/milestone.h"   /* ps3_ms -- boot milestone log */
+ 
+ #ifdef _WIN32
+ #include <windows.h>
+@@ -103,6 +104,16 @@ u32 cellGcm_flip_request_count(void)
+ {
+     return s_flip_request_count;
+ }
++
++/* A guest flip request the present loop will show: bump the frame-boundary
++ * count and record it in the milestone log, so a regression run can tell a
++ * title that reaches its first frame from one that only draws. */
++static void gcm_note_flip_request(void)
++{
++    s_flip_request_count++;
++    ps3_ms("gcm:flip");
++}
++
+ static u32  s_debug_level = CELL_GCM_DEBUG_LEVEL0;
+ 
+ /* Display buffers */
+@@ -2307,7 +2318,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                  * guest-visible half of the request. */
+                 gcm_set_current_display_buffer(w & 7u);
+                 s_flip_pending = 1;
+-                s_flip_request_count++;
++                gcm_note_flip_request();
+                 /* Not past `queued`: a resync may already have written off
+                  * this flip. */
+                 if (s_fifo_flips_reached != s_fifo_flips_queued) s_fifo_flips_reached++;
+@@ -3104,7 +3115,7 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
+     if (!in_fifo) {
+         gcm_set_current_display_buffer(bufferId);
+         s_flip_pending = 1;   /* ticker: present BEFORE the next drain */
+-        s_flip_request_count++;
++        gcm_note_flip_request();
+         s_flip_direct_pending = 1;
+     }
+     /* Flip requested but not yet shown: a subsequent cellGcmSetWaitFlip blocks
+@@ -3218,7 +3229,7 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
+ 
+     gcm_set_current_display_buffer(bufferId);
+     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+-    s_flip_request_count++;
++    gcm_note_flip_request();
+     s_last_flip_time = get_timestamp_ns();
+ 
+     /* Invoke the guest flip handler via OPD resolution -- s_flip_handler holds
+diff --git a/libs/video/tests/test_gcm_fifo_user_command.c b/libs/video/tests/test_gcm_fifo_user_command.c
+index c1ef1854..3de6bf19 100644
+--- a/libs/video/tests/test_gcm_fifo_user_command.c
++++ b/libs/video/tests/test_gcm_fifo_user_command.c
+@@ -13,6 +13,7 @@
+  *   (clang on macOS: -Wl,-dead_strip)
+  */
+ #include "../cellGcmSys.c"
++void ps3_ms(const char* key) { (void)key; }   /* the milestone log is not under test */
+ #include <stdio.h>
+ #include <stdlib.h>
+ uint8_t* vm_base;
+diff --git a/libs/video/tests/test_gcm_flip_status.c b/libs/video/tests/test_gcm_flip_status.c
+index d4d3ed7b..09b9e45f 100644
+--- a/libs/video/tests/test_gcm_flip_status.c
++++ b/libs/video/tests/test_gcm_flip_status.c
+@@ -9,6 +9,7 @@
+  * completes it, and so must one that outlives cellGcmSetWaitFlip's bound.
+  */
+ #include "../cellGcmSys.c"
++void ps3_ms(const char* key) { (void)key; }   /* the milestone log is not under test */
+ #include <assert.h>
+ uint8_t* vm_base;
+ uint32_t ppu_vm_size;
+diff --git a/libs/video/tests/test_gcm_flip_stream.c b/libs/video/tests/test_gcm_flip_stream.c
+index 0db6ccff..1bcc0a59 100644
+--- a/libs/video/tests/test_gcm_flip_stream.c
++++ b/libs/video/tests/test_gcm_flip_stream.c
+@@ -28,6 +28,7 @@
+  *   -o /tmp/test_gcm_flip_stream        (clang on macOS: -Wl,-dead_strip)
+  */
+ #include "../cellGcmSys.c"
++void ps3_ms(const char* key) { (void)key; }   /* the milestone log is not under test */
+ #include <stdio.h>
+ #include <stdlib.h>
+ uint8_t* vm_base;
+diff --git a/libs/video/tests/test_gcm_flip_wrap.c b/libs/video/tests/test_gcm_flip_wrap.c
+index b4667524..4735a946 100644
+--- a/libs/video/tests/test_gcm_flip_wrap.c
++++ b/libs/video/tests/test_gcm_flip_wrap.c
+@@ -15,6 +15,7 @@
+  *   -o /tmp/test_gcm_flip_wrap        (clang on macOS: -Wl,-dead_strip)
+  */
+ #include "../cellGcmSys.c"
++void ps3_ms(const char* key) { (void)key; }   /* the milestone log is not under test */
+ #include <stdio.h>
+ #include <stdlib.h>
+ uint8_t* vm_base;
+diff --git a/libs/video/tests/test_gcm_get_on_jump.c b/libs/video/tests/test_gcm_get_on_jump.c
+index 24c40f99..c2528ae6 100644
+--- a/libs/video/tests/test_gcm_get_on_jump.c
++++ b/libs/video/tests/test_gcm_get_on_jump.c
+@@ -17,6 +17,7 @@
+  *   (clang on macOS: -Wl,-dead_strip)
+  */
+ #include "../cellGcmSys.c"
++void ps3_ms(const char* key) { (void)key; }   /* the milestone log is not under test */
+ #include <stdio.h>
+ #include <stdlib.h>
+ uint8_t* vm_base;
+diff --git a/libs/video/tests/test_gcm_get_on_release.c b/libs/video/tests/test_gcm_get_on_release.c
+index 67094140..731b8981 100644
+--- a/libs/video/tests/test_gcm_get_on_release.c
++++ b/libs/video/tests/test_gcm_get_on_release.c
+@@ -22,6 +22,7 @@
+  *   (clang on macOS: -Wl,-dead_strip)
+  */
+ #include "../cellGcmSys.c"
++void ps3_ms(const char* key) { (void)key; }   /* the milestone log is not under test */
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+diff --git a/libs/video/tests/test_gcm_legacy_state_filter.c b/libs/video/tests/test_gcm_legacy_state_filter.c
+index 02126946..e16e7cb6 100644
+--- a/libs/video/tests/test_gcm_legacy_state_filter.c
++++ b/libs/video/tests/test_gcm_legacy_state_filter.c
+@@ -11,6 +11,7 @@
+  *   (gcc: -Wl,--gc-sections -pthread -lm)
+  */
+ #include "../cellGcmSys.c"
++void ps3_ms(const char* key) { (void)key; }   /* the milestone log is not under test */
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+diff --git a/libs/video/tests/test_gcm_nop_runs.c b/libs/video/tests/test_gcm_nop_runs.c
+index 31ed59ef..284912e8 100644
+--- a/libs/video/tests/test_gcm_nop_runs.c
++++ b/libs/video/tests/test_gcm_nop_runs.c
+@@ -12,6 +12,7 @@
+  *   (clang on macOS: -Wl,-dead_strip)
+  */
+ #include "../cellGcmSys.c"
++void ps3_ms(const char* key) { (void)key; }   /* the milestone log is not under test */
+ #include <stdio.h>
+ #include <stdlib.h>
+ uint8_t* vm_base;
+diff --git a/libs/video/tests/test_gcm_park_reuse.c b/libs/video/tests/test_gcm_park_reuse.c
+index 30cfb62f..29f7496c 100644
+--- a/libs/video/tests/test_gcm_park_reuse.c
++++ b/libs/video/tests/test_gcm_park_reuse.c
+@@ -20,6 +20,7 @@
+  *   (clang on macOS: -Wl,-dead_strip)
+  */
+ #include "../cellGcmSys.c"
++void ps3_ms(const char* key) { (void)key; }   /* the milestone log is not under test */
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <unistd.h>
+diff --git a/libs/video/tests/test_gcm_resync_labels.c b/libs/video/tests/test_gcm_resync_labels.c
+index cc591fd4..1d7d9b3d 100644
+--- a/libs/video/tests/test_gcm_resync_labels.c
++++ b/libs/video/tests/test_gcm_resync_labels.c
+@@ -18,6 +18,7 @@
+  *   (clang on macOS: -Wl,-dead_strip)
+  */
+ #include "../cellGcmSys.c"
++void ps3_ms(const char* key) { (void)key; }   /* the milestone log is not under test */
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <time.h>
+diff --git a/libs/video/tests/test_gcm_user_command.c b/libs/video/tests/test_gcm_user_command.c
+index 0df54dbc..8b4d7185 100644
+--- a/libs/video/tests/test_gcm_user_command.c
++++ b/libs/video/tests/test_gcm_user_command.c
+@@ -3,6 +3,7 @@
+  *   -o /tmp/test_gcm_user_command && /tmp/test_gcm_user_command
+  */
+ #include "../cellGcmSys.c"
++void ps3_ms(const char* key) { (void)key; }   /* the milestone log is not under test */
+ #include <assert.h>
+ #include <pthread.h>
+ #include <stdatomic.h>
+diff --git a/libs/video/tests/test_gcm_walker_prof.c b/libs/video/tests/test_gcm_walker_prof.c
+index 065fb54d..0213d160 100644
+--- a/libs/video/tests/test_gcm_walker_prof.c
++++ b/libs/video/tests/test_gcm_walker_prof.c
+@@ -11,6 +11,7 @@
+  *      /tmp/test_gcm_walker_prof off <file>  (RSX_WALKER_PROF unset)
+  */
+ #include "../cellGcmSys.c"
++void ps3_ms(const char* key) { (void)key; }   /* the milestone log is not under test */
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+diff --git a/libs/video/tests/test_nv3089_engine_read.c b/libs/video/tests/test_nv3089_engine_read.c
+index 733d77d1..346f06fb 100644
+--- a/libs/video/tests/test_nv3089_engine_read.c
++++ b/libs/video/tests/test_nv3089_engine_read.c
+@@ -16,6 +16,7 @@
+  *   (gcc: -ffunction-sections -fdata-sections -Wl,--gc-sections)
+  */
+ #include "../cellGcmSys.c"
++void ps3_ms(const char* key) { (void)key; }   /* the milestone log is not under test */
+ #include <stdio.h>
+ #include <stdlib.h>
+ uint8_t* vm_base;

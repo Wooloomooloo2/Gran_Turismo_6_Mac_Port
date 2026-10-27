@@ -1,0 +1,131 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] ppu_lifter: computed jumps that subtract from a constant base
+
+Upstream: not yet submitted
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514
+
+What: _const_base_targets() also accepts `subf rC,rOff,rC` as the newest
+definition of the CTR source, so `lis/addi rC; subf rC,rOff,rC; mtctr rC;
+bctr` is recognised. The landing sites are the base and every word before it,
+back to the previous terminator (normally the dispatching bctr).
+
+Why: Gran Turismo 6's memset (func_00A8DE98) enters its unrolled stb/std runs
+by subtracting the remaining length from the run's END address, three times.
+Only the additive form was known, so each bctr lifted to an unresolved
+indirect call: short memsets and the 8..128-byte tails stored nothing, and the
+first C++ static constructors left their objects unzeroed (first symptom at
+boot: "unresolved indirect call -> 0x00A8DFF0" from func_00FD7724).
+
+Test: tools/test_ppu_jumptables.py test_const_base_subtracted, and
+test_const_base_subtracted_wrong_way (`subf r8,r8,r5`, the constant as
+subtrahend, is still rejected).
+
+--- a/tools/ppu_lifter.py
++++ b/tools/ppu_lifter.py
+@@ -4367,8 +4367,14 @@
+     (`addis`/`addi` onto rC, ending at `li`/`lis`). Anything else defining rC
+     means this is not the idiom. Returns every address from the base through
+     the first unconditional terminator (at most 64), or None.
++
++    The newest definition may also be `subf rC,rOff,rC` (rC - rOff): the jump
++    then lands BACKWARD from the base, and the sites are the base and every
++    word before it back to the previous terminator, which is normally the
++    dispatching bctr itself (Gran Turismo 6's memset func_00A8DE98:
++    `lis r8,0xA9; addi r8,r8,-8456; subf r8,r5,r8; mtctr r8; bctr`).
+     """
+-    const, have_add = 0, False
++    const, have_add, backward = 0, False, False
+     for w in reversed(win):
+         ops = [x.strip() for x in w.operands.split(',')]
+         if w.mnemonic == 'mtctr' or not ops or ops[0] != rC:
+@@ -4377,6 +4383,9 @@
+         try:
+             if m == 'add' and not have_add and rC in ops[1:3]:
+                 have_add = True
++            elif (m == 'subf' and not have_add and len(ops) == 3
++                    and ops[2] == rC and ops[1] != rC):
++                have_add = backward = True
+             elif m in ('addis', 'addi') and have_add and len(ops) == 3 and ops[1] == rC:
+                 const += int(ops[2], 0) << (16 if m == 'addis' else 0)
+             elif m in ('li', 'lis') and have_add and len(ops) == 2:
+@@ -4393,6 +4402,17 @@
+     if not (text_lo <= base < text_hi) or base & 3 or abs(base - bctr_addr) > 0x1000:
+         return None
+     targets = []
++    if backward:
++        for k in range(64):
++            a = base - 4 * k
++            v = read_u32(a)
++            if v is None:
++                return None
++            # blr, bctr, or `b` without link before the run ends it
++            if k and (v in (0x4E800020, 0x4E800420) or (v >> 26 == 18 and not v & 1)):
++                return sorted(targets)
++            targets.append(a)
++        return None
+     for k in range(64):
+         a = base + 4 * k
+         v = read_u32(a)
+--- a/tools/test_ppu_jumptables.py
++++ b/tools/test_ppu_jumptables.py
+@@ -368,6 +368,8 @@
+     test_base_before_fallthrough_split()
+     test_const_base_no_table()
+     test_const_base_needs_constant()
++    test_const_base_subtracted()
++    test_const_base_subtracted_wrong_way()
+     test_multi_toc_prefers_targets_near_the_dispatcher()
+     test_bound_compare_beyond_window()
+     test_spilled_base_reused_as_target()
+@@ -403,6 +405,51 @@
+     check("non-constant base is not a constant-base jump", got, None)
+ 
+ 
++def w_lis(rt, si):         return w_addis(rt, 0, si)
++def w_addi(rt, ra, si):    return (14 << 26) | (rt << 21) | (ra << 16) | (si & 0xFFFF)
++def w_subf(rt, ra, rb):    return (31 << 26) | (rt << 21) | (ra << 16) | (rb << 11) | (40 << 1)
++
++
++def test_const_base_subtracted():
++    """A memset that jumps BACKWARD from a constant end into its unrolled run:
++
++        lis r8,1 ; addi r8,r8,0x20 ; subf r8,r5,r8 ; mtctr r8 ; bctr
++        0x10014: stb r4,2(r6) ; stb r4,1(r6) ; stb r4,0(r6)
++        0x10020: blr
++
++    `subf r8,r5,r8` is r8 - r5, so the landing sites are the base and every
++    word before it back to the dispatching bctr (Gran Turismo 6's memset
++    func_00A8DE98 has three of these). Before, none was found and every short
++    memset lifted to an unresolved indirect call that stored nothing.
++    """
++    base = TEXT_LO + 0x20
++    words = [w_lis(8, 1), w_addi(8, 8, 0x20), w_subf(8, 5, 8), w_mtctr(8), w_bctr()]
++    mem = {TEXT_LO + 4 * i: w for i, w in enumerate(words)}
++    for k, d in enumerate((2, 1, 0)):
++        mem[TEXT_LO + 0x14 + 4 * k] = w_stb(4, 6, d)
++    mem[base] = w_blr()
++    got = discover(words, mem)
++    check("subtracted constant-base computed jump", got,
++          [TEXT_LO + 0x14, TEXT_LO + 0x18, TEXT_LO + 0x1C, base])
++
++
++def test_const_base_subtracted_wrong_way():
++    """`subf r8,r8,r5` is r5 - r8: the constant is the subtrahend, so r8 ends
++    up holding length minus base, not an address next to the dispatcher. Not
++    the idiom: no landing sites."""
++    base = TEXT_LO + 0x20
++    words = [w_lis(8, 1), w_addi(8, 8, 0x20), w_subf(8, 8, 5), w_mtctr(8), w_bctr()]
++    mem = {TEXT_LO + 4 * i: w for i, w in enumerate(words)}
++    for k, d in enumerate((2, 1, 0)):
++        mem[TEXT_LO + 0x14 + 4 * k] = w_stb(4, 6, d)
++    mem[base] = w_blr()
++    check("subf with the constant as subtrahend is not a constant-base jump",
++          discover(words, mem), None)
++
++
++def w_stb(rs, ra, d):      return (38 << 26) | (rs << 21) | (ra << 16) | (d & 0xFFFF)
++
++
+ def test_spilled_base_reused_as_target():
+     """The base is TOC-loaded, spilled to the stack, and reloaded at the
+     dispatch, which also reuses the base register for the case address:

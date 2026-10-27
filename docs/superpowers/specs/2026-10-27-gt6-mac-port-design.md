@@ -2,7 +2,7 @@
 
 Date: 2026-10-27. Status: draft for owner approval (builder-check questions answered, O9-O12).
 Owner: Wooloomooloo2 (makes every product and architecture decision).
-Repo: https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac (public from day one).
+Repo: https://github.com/Wooloomooloo2/Gran_Turismo_6_Mac_Port (public from day one).
 
 ## 1. Intent
 

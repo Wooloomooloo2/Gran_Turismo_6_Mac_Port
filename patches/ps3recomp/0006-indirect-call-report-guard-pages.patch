@@ -1,0 +1,172 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] ppu_loader: the unresolved-indirect-call report reads around guard pages
+
+Upstream: not yet submitted
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0005)
+
+What: the report ps3_indirect_call_impl prints for an unresolved indirect
+call reads guest memory through ppu_diag_read32(), which checks each host
+page with ppu_dump_readable() (once per page per report) and answers 0 for
+bytes it cannot read, instead of dereferencing vm_base + ea directly.
+
+Why: the report dumps the caller's stack (16 words, then a 700-word scan),
+objects and a whole-RAM scan. On POSIX a scan up a shallow stack runs into
+the PROT_NONE guard page vm_stack_allocate() puts below the next stack, and
+the report itself killed the title with SIGBUS (Gran Turismo 6: a worker on
+a 16 KB stack, after an unresolved call from func_00A96598).
+ppu_dump_guest_stack() already guarded its reads this way.
+
+Test: tools/test_diag_read_guard.py (new).
+
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -2290,6 +2290,29 @@
+     }
+     return true;
+ #endif
++}
++
++/* A big-endian guest word for a diagnostic, or 0 where the bytes cannot be
++ * read (out of the arena, or a guard page). The unresolved-indirect-call
++ * report reads stacks, objects and a whole-RAM scan through this. It read raw
++ * memory, so on POSIX a shallow stack's scan ran into the guard page of the
++ * next stack and the report itself killed the title with SIGBUS (Gran Turismo
++ * 6, a worker on a 16 KB stack). The probe is a syscall, so `cache` keeps the
++ * last readable and unreadable host page for the length of one report (a new
++ * stack can turn a page into a guard later): a scan pays once per page. */
++struct ppu_diag_cache { uintptr_t ok = 1, bad = 1; };   /* 1: no page (pages are aligned) */
++static uint32_t ppu_diag_read32(ppu_diag_cache& cache, uint32_t ea)
++{
++    const uintptr_t pg = (uintptr_t)vm_host_page_size();
++    const uintptr_t page = (uintptr_t)ea & ~(pg - 1);
++    const bool one_page = (((uintptr_t)ea + 3) & ~(pg - 1)) == page;
++    if (!one_page || page != cache.ok) {
++        if (one_page && page == cache.bad) return 0;
++        if (!ppu_dump_readable(ea, 4)) { if (one_page) cache.bad = page; return 0; }
++        if (one_page) cache.ok = page;
++    }
++    uint32_t t; memcpy(&t, vm_base + ea, 4);
++    return __builtin_bswap32(t);
+ }
+ 
+ extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag)
+@@ -3053,9 +3076,8 @@
+          * see where each link points (heap object vs game image vs garbage) and
+          * pinpoint how the garbage code field (e.g. 0xC708C708) got there. */
+         if (vm_base) {
+-            auto g32 = [](uint32_t ea)->uint32_t {
+-                return __builtin_bswap32(*(volatile uint32_t*)(vm_base + ea));
+-            };
++            ppu_diag_cache diag_cache;
++            auto g32 = [&diag_cache](uint32_t ea)->uint32_t { return ppu_diag_read32(diag_cache, ea); };
+             uint32_t obj = (uint32_t)ctx->gpr[3];
+             uint32_t vt  = g32(obj);
+             uint32_t opd = g32(vt);
+--- /dev/null
++++ b/tools/test_diag_read_guard.py
+@@ -0,0 +1,105 @@
++#!/usr/bin/env python3
++"""Diagnostic guest reads survive guard pages (runtime/ppu/ppu_loader.cpp).
++
++The unresolved-indirect-call report dumps the caller's stack, its objects and
++a whole-RAM scan. It read guest memory raw, so on POSIX a scan up a shallow
++stack ran into the guard page of the next stack and the report itself killed
++the title with SIGBUS (Gran Turismo 6: a worker on a 16 KB stack).
++
++Builds the real ppu_dump_readable / ppu_diag_read32 (pulled verbatim out of
++ppu_loader.cpp) over a guest arena with one PROT_NONE page and checks:
++  - words on readable pages read back big-endian;
++  - a word on the guard page reads as 0 instead of faulting, on first and
++    later reads (the cached unreadable page);
++  - a scan across all four pages returns every readable word and 0 for the
++    guard page's;
++  - a word that straddles into the guard page, and one past the arena, read 0.
++POSIX only (the probe is a no-op on Windows, whose demand-commit handler
++covers these reads).
++"""
++import os
++import shutil
++import subprocess
++import sys
++import tempfile
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++def extract(src):
++    a = src.index('static bool ppu_dump_readable(uint32_t ea, uint32_t n)')
++    m = src.index('static uint32_t ppu_diag_read32(', a)
++    i = src.index('{', m) + 1
++    depth = 1
++    while depth:
++        depth += {'{': 1, '}': -1}.get(src[i], 0)
++        i += 1
++    return src[a:i]
++
++
++HARNESS = r'''
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <sys/mman.h>
++#include <unistd.h>
++static uint8_t* vm_base;
++static uint32_t ppu_vm_size;
++static uint32_t vm_host_page_size(void) { return (uint32_t)getpagesize(); }
++static int vm_oob(uint32_t a, uint32_t n) { return (uint64_t)a + n > ppu_vm_size; }
++%s
++static int fails = 0;
++#define CHECK(c, ...) do { const bool ok_ = (c); printf(ok_ ? "[PASS] " : "[FAIL] "); printf(__VA_ARGS__); printf("\n"); if (!ok_) fails++; } while (0)
++static void put(uint32_t ea, uint32_t v) { uint32_t be = __builtin_bswap32(v); memcpy(vm_base + ea, &be, 4); }
++int main() {
++    setvbuf(stdout, NULL, _IONBF, 0);
++    const uint32_t pg = vm_host_page_size();
++    ppu_vm_size = 4 * pg;
++    vm_base = (uint8_t*)mmap(NULL, ppu_vm_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
++    for (uint32_t a = 0; a < ppu_vm_size; a += 4) put(a, 0x10000000u + a);
++    mprotect(vm_base + 2 * pg, pg, PROT_NONE);            /* the guard page */
++    ppu_diag_cache c;
++    CHECK(ppu_diag_read32(c, pg + 8) == 0x10000000u + pg + 8, "a readable word reads back big-endian");
++    CHECK(ppu_diag_read32(c, 2 * pg + 16) == 0, "a word on the guard page reads 0, no fault");
++    CHECK(ppu_diag_read32(c, 2 * pg + 20) == 0, "and again from the cached unreadable page");
++    uint32_t bad = 0, good = 0;
++    for (uint32_t a = 0; a < ppu_vm_size; a += 4) {
++        const uint32_t v = ppu_diag_read32(c, a);
++        if (a >= 2 * pg && a < 3 * pg) bad += v != 0; else good += v == 0x10000000u + a;
++    }
++    CHECK(bad == 0 && good == 3 * pg / 4, "a scan over all pages: %%u readable words right, %%u guard words non-zero", good, bad);
++    CHECK(ppu_diag_read32(c, 2 * pg - 2) == 0, "a word straddling into the guard page reads 0");
++    CHECK(ppu_diag_read32(c, ppu_vm_size) == 0, "a word past the arena reads 0");
++    printf("%%s (%%d failed)\n", fails ? "FAIL" : "PASS", fails);
++    return fails ? 1 : 0;
++}
++'''
++
++
++def main():
++    if os.name == 'nt':
++        print('SKIP: POSIX only')
++        return
++    cxx = os.environ.get('CXX') or shutil.which('c++') or shutil.which('g++') or shutil.which('clang++')
++    if not cxx:
++        print('SKIP: no C++ compiler')
++        return
++    src = (ROOT / 'runtime/ppu/ppu_loader.cpp').read_text()
++    with tempfile.TemporaryDirectory() as tmp:
++        c = Path(tmp) / 't.cpp'
++        exe = Path(tmp) / 't'
++        c.write_text(HARNESS % extract(src))
++        r = subprocess.run([cxx, '-std=c++17', '-O1', '-w', str(c), '-o', str(exe)],
++                           capture_output=True, text=True)
++        if r.returncode:
++            print(r.stderr[-3000:])
++            raise SystemExit('FAIL: harness did not compile')
++        r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=60)
++        print(r.stdout, end='')
++        if r.returncode:
++            raise SystemExit('FAIL: diagnostic reads over a guard page (exit %d)' % r.returncode)
++
++
++if __name__ == '__main__':
++    sys.exit(main())

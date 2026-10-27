@@ -16,6 +16,13 @@ RPCS3_DERIVED = {
     "tools/gt6unpack/src/pkg.cpp": ["unpkg.cpp"],
     "tools/gt6unpack/src/pkg.hpp": ["unpkg.cpp", "unpkg.h"],
 }
+# Files adapted from ps3recomp's project template (MIT). MIT lets them be offered under the
+# project's GPL-2.0-or-later, provided the copyright and permission notice stay with them.
+PS3RECOMP_DERIVED = {
+    "port/CMakeLists.txt": "templates/project/CMakeLists.txt",
+    "port/main.cpp": "templates/project/main.cpp",
+    "port/gt6_overrides.cpp": "templates/project/stubs.cpp",
+}
 
 
 def source_files():
@@ -50,6 +57,17 @@ def test_rpcs3_derived_files_name_every_source_file():
         assert "c365ea76a552961ff078ea1a46da9d4b07729674" in head, name
         for src in sources:
             assert f"rpcs3/Crypto/{src}" in head, f"{name} does not credit {src}"
+
+
+def test_ps3recomp_derived_files_keep_the_mit_notice():
+    for name, source in PS3RECOMP_DERIVED.items():
+        head = "\n".join((ROOT / name).read_text().splitlines()[:12])
+        assert f"Adapted from ps3recomp {source}" in head, name
+        assert "4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514" in head, name
+        assert "Copyright (c) 2026 Ned Heller / sp00nznet" in head, name
+        assert "MIT" in head and "THIRD-PARTY-NOTICES.md" in head, name
+    notices = (ROOT / "THIRD-PARTY-NOTICES.md").read_text()
+    assert "templates/project" in notices
 
 
 def test_notices_and_readme_state_the_split():
