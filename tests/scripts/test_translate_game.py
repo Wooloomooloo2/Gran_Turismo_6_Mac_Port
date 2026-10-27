@@ -61,13 +61,69 @@ print("  {n} functions lifted")
 '''
 
 
-def fake_tools(root, tag, n, two=False):
+# Fake build_spu_workloads.py --input: two images; with partial=True the second one is
+# unsupported, the tool prints its incomplete marker and exits 0 only under --allow-partial.
+SPU_WORKLOADS = '''import json, sys, pathlib
+a = sys.argv
+lifted = pathlib.Path(a[a.index("--lifted") + 1])
+out = pathlib.Path(a[a.index("--out") + 1])
+assert out.parent == lifted and out.name == "spu_workloads.c", a
+assert a[a.index("--input") + 1].endswith("EMAIN.SELF.elf"), a
+assert "--constructor" in a and "--allow-partial" in a, a
+assert not lifted.exists() or not any(lifted.iterdir()), "lifted dir must start empty"
+lifted.mkdir(parents=True, exist_ok=True)
+partial = {partial}
+progs = []
+for i, name in enumerate(("spu_aaaa", "spu_bbbb")):
+    bad = partial and i == 1
+    if not bad:
+        (lifted / name).mkdir()
+        (lifted / name / "spu_recomp.c").write_text("x")
+    progs.append(dict(name=name, status="unsupported" if bad else "registered"))
+progs.append(dict(status="invalid", reason="not an ELF", occurrences=[]))
+out.write_text("registry")
+(lifted / "inventory.json").write_text(json.dumps(dict(complete=not partial, programs=progs)))
+print(f"[build_spu_workloads] {{2 - partial}}/3 candidates registered; complete={{not partial}}")
+'''
+# Fake lift_jobmods.py --jobmods: one lift folder and manifest entry per module file.
+JOBMODS = '''import json, sys, pathlib
+a = sys.argv
+src = pathlib.Path(a[a.index("--jobmods") + 1])
+out = pathlib.Path(a[a.index("--out") + 1])
+reg = pathlib.Path(a[a.index("--register") + 1])
+assert reg == out / "jobmods_register.c", a
+assert (out / "spu_workloads.c").is_file(), "runs after build_spu_workloads"
+man = []
+for i, p in enumerate(sorted(src.glob("*.bin"))):
+    (out / p.stem).mkdir()
+    (out / p.stem / "spu_recomp.c").write_text("x")
+    man.append(dict(name=p.stem, funcs=3, unsupported=1 if {unsup} and i == 0 else 0))
+(out / "jobmods_manifest.json").write_text(json.dumps(man))
+reg.write_text("register")
+print(f"Lifted {{len(man)}} module(s)")
+'''
+
+
+def fake_tools(root, tag, n, two=False, partial=False, unsup=False):
     tools = root / "tools"
     tools.mkdir(exist_ok=True)
     (tools / "ppu_loader.py").write_text(LOADER)
     extra = '(out / "ppu_recomp_001.cpp").write_text("x")' if two else ""
     (tools / "ppu_lifter.py").write_text(LIFTER.format(tag=tag, n=n, extra=extra))
+    (tools / "build_spu_workloads.py").write_text(SPU_WORKLOADS.format(partial=partial))
+    (tools / "lift_jobmods.py").write_text(JOBMODS.format(unsup=unsup))
     return tools
+
+
+def make_jobmod(tag, size=0x80):
+    """A raw job module: four `ila`, entry 0x30 at +0x10, image size at +0x14, C0DEC0DE."""
+    m = bytearray(size)
+    for k in range(4):
+        m[4 * k] = 0x42
+    struct.pack_into(">II", m, 0x10, 0x30, size + 32)
+    m[0x20:0x24] = b"\xc0\xde\xc0\xde"
+    m[0x40] = tag
+    return bytes(m)
 
 
 @pytest.fixture
@@ -75,7 +131,7 @@ def tree(tmp_path):
     t = tmp_path / "tree"
     elf = t / ELF_REL
     elf.parent.mkdir(parents=True)
-    elf.write_bytes(make_elf(FIXTURE_SECTIONS))
+    elf.write_bytes(make_elf(FIXTURE_SECTIONS) + make_jobmod(1) + make_jobmod(2))
     return t
 
 
@@ -107,7 +163,7 @@ def test_record_fields(tree, tmp_path):
                         "code_end", "chunks", "functions", "seconds", "spu"}
     assert rec["elf"] == ELF_REL
     assert rec["code_end"] == "0x10320"
-    assert rec["functions"] == 4242 and rec["chunks"] == 64 and rec["spu"] is None
+    assert rec["functions"] == 4242 and rec["chunks"] == 64
     assert set(rec["seconds"]) == {"loader", "lifter"}
     assert len(rec["elf_sha256"]) == 64
     assert len(rec["ps3recomp_patches"]) == 64
@@ -123,6 +179,62 @@ def test_patches_hash_is_sorted_concatenation(tmp_path):
     (d / "b.patch").write_bytes(b"B")
     (d / "a.patch").write_bytes(b"A")
     assert translate_game.patches_hash(d) == hashlib.sha256(b"AB").hexdigest()
+
+
+def test_spu_record_with_fake_tools(tree, tmp_path):
+    out = tmp_path / "out"
+    rec = translate_game.translate(tree, out, sys.executable, fake_tools(tmp_path, "a", 1))
+    spu = rec["spu"]
+    assert set(spu) == {"images", "jobmods", "partial", "seconds"}
+    assert spu["images"] == 2
+    manifest = json.loads((out / "spu" / "jobmods_manifest.json").read_text())
+    assert spu["jobmods"] == len(manifest) == 2
+    assert spu["partial"] == []
+    assert isinstance(spu["seconds"], float)
+    # the layout the template's SPU_DIR expects
+    for f in ("spu_aaaa/spu_recomp.c", "spu_bbbb/spu_recomp.c", "spu_workloads.c",
+              "jobmods_register.c"):
+        assert (out / "spu" / f).is_file(), f
+    assert len(list((out / "spu").glob("jobmod_*/spu_recomp.c"))) == 2
+    assert (out / "logs" / "build_spu_workloads.log").is_file()
+    assert (out / "logs" / "lift_jobmods.log").is_file()
+
+
+def test_spu_partial_is_recorded_not_fatal(tree, tmp_path):
+    out = tmp_path / "out"
+    rec = translate_game.translate(tree, out, sys.executable,
+                                   fake_tools(tmp_path, "a", 1, partial=True, unsup=True))
+    assert rec["spu"]["images"] == 2
+    first = sorted(p.name for p in (out / "spu").glob("jobmod_*"))[0]
+    assert rec["spu"]["partial"] == ["spu_bbbb", first]
+    assert json.loads((out / "translate.json").read_text())["spu"]["partial"] == rec["spu"]["partial"]
+
+
+def test_spu_tool_failure_keeps_previous_output(tree, tmp_path):
+    out = tmp_path / "out"
+    translate_game.translate(tree, out, sys.executable, fake_tools(tmp_path, "one", 1))
+    tools = fake_tools(tmp_path, "two", 1)
+    (tools / "lift_jobmods.py").write_text("import sys; sys.exit('boom')")
+    with pytest.raises(SystemExit) as e:
+        translate_game.translate(tree, out, sys.executable, tools)
+    assert "lift_jobmods failed" in str(e.value)
+    assert (out / "ppu" / "ppu_recomp_000.cpp").read_text() == "one"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["out", "tools", "tree"]
+
+
+@pytest.mark.skipif(not os.environ.get("GT6_TREE"), reason="GT6_TREE not set (needs the built v1.22 tree)")
+def test_real_spu(tmp_path):
+    out = tmp_path / "recomp"
+    rec = translate_game.translate(
+        Path(os.environ["GT6_TREE"]), out, sys.executable,
+        translate_game.map_game.DEFAULT_PS3RECOMP / "tools")
+    spu = rec["spu"]
+    print(f"\nSPU: {spu}")
+    assert spu["images"] == 4
+    assert spu["jobmods"] == 57
+    assert len(list((out / "spu").glob("jobmod_*/spu_recomp.c"))) == 57
+    assert (out / "spu" / "spu_workloads.c").is_file()
+    assert (out / "spu" / "jobmods_register.c").is_file()
 
 
 @pytest.mark.skipif(not os.environ.get("GT6_TREE"), reason="GT6_TREE not set (needs the built v1.22 tree)")

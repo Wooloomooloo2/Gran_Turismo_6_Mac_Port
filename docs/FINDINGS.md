@@ -47,6 +47,37 @@ Measured with `ppu_lifter` on the v1.22 `USRDIR/EMAIN.SELF.elf` (M4 Max):
   `ps3recomp/runtime/ppu` (`ppu_vmx.h`), `ps3recomp/include`, `ps3recomp/runtime`.
 - EMAIN SHA-256 `7b4f37bd...c373d1`, ps3recomp commit `4e8f3ca`.
 
+**SPU programs and job modules** (`translate_game.py` SPU step, same run, same staging
+folder as the PPU lift):
+
+| What | Found | Lifted fully | Partial (runs interpreted, D9/O9) | Time |
+|---|---|---|---|---|
+| SPU ELF programs (`build_spu_workloads --input`) | 4 | 1 (0x1286F00, 17,400 B) | 3 | |
+| SPURS job modules (`lift_jobmods --jobmods`) | 57 | 49 | 8 | |
+| Whole SPU step | | | 11 | 36.8 s (whole translate 57.7 s) |
+
+- Output: 41 MB in `spu/` (61 image folders, `spu_workloads.c`, `jobmods_register.c`,
+  `inventory.json`, `jobmods_manifest.json`). No tool makes `taskset_policy_bytes.c` for
+  GT6, so there is none. No tool failed outright.
+- Partial SPU programs (by file offset): 0x13F9580 `ipc_spucore.elf` (14 bad words),
+  0x13FE900 (11), 0x1415080 (3). `build_spu_workloads` refuses to register an image whose
+  lift holds any `.word`, so these three are left out of `spu_workloads.c` and run
+  entirely in the SPU interpreter. Their `spu_recomp.c` is still written.
+- Partial job modules (unsupported words): `102b6697dde2` 1, `1bf6d3965594` 7, `3174b2012dbe` 4,
+  `5e2f0559e74f` 1, `94f320930490` 4, `b683cd421be4` 24, `c25145879d61` 12, `fbe88df0b81a` 261
+  (314 in all). `lift_jobmods` still registers these, and the bad words fall to the
+  interpreter.
+- Every unsupported word seen is data the lifter took for code (shuffle-mask constants such
+  as `0x1F1E1D1C`, `0x01000000`), not an SPU instruction the lifter lacks. A per-image code
+  end, like D25 for the PPU, should clear most of them (BACKLOG).
+- `lift_jobmods --engine-elf` finds only 5 of the 57 modules: it requires the load base
+  0x4000 at header +0x28, and 52 GT6 modules have 0 there. The step cuts the modules out with
+  `map_game.find_embedded_jobmods` (all 57, 16-byte aligned) and uses `--jobmods` instead, so
+  modules register by their first 16 bytes; all 57 are distinct. `lift_jobmods` falls back
+  to the base 0x4000 for a 0 field.
+- `build_spu_workloads --input` finds the 4 programs itself; `extract_spu_images` is not
+  needed. Image ids: programs get content-derived ids (0x1xxxxxxx), job modules 200-256.
+
 ## Code map of v1.22 (2026-10-27)
 
 **Risks found** (technical detail; the plain-language version is the owner summary above):

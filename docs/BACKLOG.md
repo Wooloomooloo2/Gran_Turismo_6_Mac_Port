@@ -5,6 +5,11 @@ Shortcuts taken, with the proper fix logged. Priority order: 1) Stability, 2) Pe
 
 ## 1) Stability
 
+- SPU lift: 3 of 4 SPU programs and 8 of 57 job modules lift only partly, because data inside
+  their code is decoded as instructions (FINDINGS, "Translating EMAIN"). The three programs then
+  run fully interpreted. Proper fix: a code end per image (as D25 does for the PPU), or the
+  data ranges found by disassembly, passed to the lifter; then drop them from the partial list.
+
 ## 2) Performance
 
 ## 3) Mac GUI
