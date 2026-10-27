@@ -1,0 +1,15 @@
+build/
+out/
+*.pkg
+*.iso
+*.elf
+*.self
+*.sprx
+*.PUP
+game/
+keys.local*
+keys.local/
+.superpowers/
+.venv/
+__pycache__/
+.pytest_cache/

@@ -1,0 +1,5 @@
+[
+ {"lib": "sys_fs", "nid": "0x718BF5F8", "stub": "0x0003B9D8", "name": "cellFsOpen"},
+ {"lib": "sys_fs", "nid": "0x2CB51F0D", "stub": "0x0003B930", "name": "cellFsClose"},
+ {"lib": "sceNp", "nid": "0x12345678", "stub": "0x0003C1F0"}
+]

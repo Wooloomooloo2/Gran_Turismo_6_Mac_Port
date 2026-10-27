@@ -1,0 +1,5 @@
+[
+ {"path": "dev_hdd0/USRDIR/EBOOT.BIN.elf", "bytes": 1000, "sha256": "aa", "mapped": true, "same_as": []},
+ {"path": "dev_hdd0/USRDIR/EMAIN.SELF.elf", "bytes": 5000, "sha256": "bb", "mapped": true, "same_as": ["dev_hdd0/USRDIR/COPY/EMAIN.SELF.elf"]},
+ {"path": "dev_hdd0/USRDIR/COPY/EMAIN.SELF.elf", "bytes": 5000, "sha256": "bb", "mapped": false, "same_as": ["dev_hdd0/USRDIR/EMAIN.SELF.elf"]}
+]

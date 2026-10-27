@@ -1,0 +1,2 @@
+{"ppu_loader": {"exit": 0, "ok": true, "seconds": 0.5},
+ "extract_spu_images": {"exit": 1, "ok": false, "seconds": 0.1}}

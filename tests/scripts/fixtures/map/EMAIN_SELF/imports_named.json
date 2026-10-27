@@ -1,0 +1,8 @@
+[
+ {"lib": "cellSpurs", "nid": "0xAAAA0001", "stub": "0x01000000", "name": "cellSpursInitialize"},
+ {"lib": "cellSpurs", "nid": "0xAAAA0002", "stub": "0x01000020", "name": "cellSpursFinalize"},
+ {"lib": "cellSpurs", "nid": "0xAAAA0003", "stub": "0x01000040"},
+ {"lib": "cellGcmSys", "nid": "0xBBBB0001", "stub": "0x01000060", "name": "cellGcmInit"},
+ {"lib": "sys_fs", "nid": "0x718BF5F8", "stub": "0x01000080", "name": "cellFsOpen"},
+ {"lib": "cellSail", "nid": "0xCCCC0001", "stub": "0x010000A0"}
+]
