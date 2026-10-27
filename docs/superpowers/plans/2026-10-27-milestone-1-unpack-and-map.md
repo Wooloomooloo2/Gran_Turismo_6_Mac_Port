@@ -48,7 +48,7 @@
 - [ ] **Step 5: Run.** Same command. Expected: PASS.
 - [ ] **Step 6: Docs.**
   - `README.md`: what this is (native translation, not an emulator), status "pre-alpha, milestone 1", the legal statement (players bring their own legally owned copy; nothing from Sony or Polyphony is included or ever distributed; translation runs on the player's Mac), credits (RPCS3, ps3recomp, Bloodborne port, doctest), licence.
-  - `docs/DECISIONS.md`: O1-O12 copied from spec §4 as D1-D12, plus D13 "C++ `gt6unpack` adapted from RPCS3 crypto; Python only for dev-time mapping" and D14 "Updates installed as a separate `dev_hdd0` tree, as on a real PS3, not merged into the disc tree".
+  - `docs/DECISIONS.md`: O1-O12 copied from spec §4 as D1-D12, plus D13 "C++ `gt6unpack` adapted from RPCS3 crypto; Python only for dev-time mapping" D14 "Updates installed as a separate `dev_hdd0` tree, as on a real PS3, not merged into the disc tree", and D15 "Public PS3 decryption keys live in source (owner, 2026-10-27; RPCS3/ps3recomp precedent)".
   - `CLAUDE.md`: Bloodborne-style handover (how to write for the owner, decisions-don't-re-litigate pointer, machine and paths, next steps).
   - `.gitignore`: `build/ out/ *.pkg *.iso *.elf *.self *.sprx *.PUP game/ keys.local*`
 - [ ] **Step 7: Commit.** `git add -A && scripts/check_no_game_files.py && git commit -m "Repo foundation: licence, docs, no-game-files guard"`, then run `scripts/install_hooks.sh`.
@@ -84,7 +84,7 @@
 
 ### Task 3: Key vault
 
-> **Blocked on the owner's key-handling decision (raised at plan handoff).** The default below follows RPCS3 and ps3recomp: the public keys live in source. If the owner chooses "player supplies keys", only `keys.cpp` changes. It then loads `~/Library/Application Support/GT6Mac/keys.toml` (same table shape), and the tests read the same file and are skipped when it's absent.
+> **Owner decision 2026-10-27 (D15): keys live in source**, following RPCS3 and ps3recomp precedent. Record it as D15 in `docs/DECISIONS.md` (Task 1).
 
 **Files:**
 - Create: `tools/gt6unpack/src/keys.hpp`, `tools/gt6unpack/src/keys.cpp` (adapted from RPCS3 `key_vault.cpp`, only the tables GT6 needs: APP SELF keys for all revisions, NPDRM SELF keys, NP_KLIC_FREE, NP_KLIC_KEY, and the retail PKG (GPKG) key `2e7b71d7c9c9a14ea3221f188828b8f8`)
