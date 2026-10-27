@@ -37,15 +37,11 @@ TEST_CASE("klicensee_strings handles data shorter than a key") {
     CHECK(klicensee_strings({}).empty());
 }
 
-TEST_CASE("integration: the 1.22 EBOOT.BIN holds the klicensee that opens EMAIN.SELF") {
-    const auto updates = env_path("GT6_UPDATES_DIR");
-    if (!updates) {
-        MESSAGE("GT6_UPDATES_DIR unset, skipping");
-        return;
-    }
+TEST_CASE("integration: the 1.22 EBOOT.BIN holds the klicensee that opens EMAIN.SELF" * needs_env("GT6_UPDATES_DIR")) {
+    const auto updates = require_env("GT6_UPDATES_DIR");
     namespace fs = std::filesystem;
     const fs::path tmp = fs::temp_directory_path() / ("gt6klic-" + std::to_string(std::random_device{}()));
-    extract_pkg(*updates / "EP9001-BCES01977_00-0000000000000000-A0122-V0100-PE.pkg", tmp);
+    extract_pkg(updates / "EP9001-BCES01977_00-0000000000000000-A0122-V0100-PE.pkg", tmp);
     auto read = [](const fs::path& p) {
         std::ifstream f(p, std::ios::binary);
         return std::vector<uint8_t>(std::istreambuf_iterator<char>(f), {});

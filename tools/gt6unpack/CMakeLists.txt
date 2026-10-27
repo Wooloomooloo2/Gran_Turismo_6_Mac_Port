@@ -29,5 +29,12 @@ target_include_directories(gt6unpack_tests PRIVATE ${PROJECT_SOURCE_DIR}/third_p
 target_compile_options(gt6unpack_tests PRIVATE -Wall -Wextra)
 target_link_libraries(gt6unpack_tests PRIVATE gt6build)
 
-# Integration tests read GT6_DISC_DIR / GT6_UPDATES_DIR at runtime and skip when unset.
+# Integration tests read GT6_DISC_DIR / GT6_UPDATES_DIR at runtime and are marked skipped
+# (doctest's "skipped" count) when unset.
 add_test(NAME gt6unpack_tests COMMAND gt6unpack_tests)
+# Without the data, the integration cases must show up as skipped, not as passed.
+add_test(NAME gt6unpack_integration_skips_without_data
+  COMMAND ${CMAKE_COMMAND} -E env --unset=GT6_DISC_DIR --unset=GT6_UPDATES_DIR
+          $<TARGET_FILE:gt6unpack_tests> --test-case=integration:*)
+set_tests_properties(gt6unpack_integration_skips_without_data PROPERTIES
+  PASS_REGULAR_EXPRESSION "test cases: +0 \\| +0 passed \\| +0 failed")

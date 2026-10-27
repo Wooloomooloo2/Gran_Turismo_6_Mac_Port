@@ -5,7 +5,7 @@
 // as the default of a "KeyLicensee" config entry: a "0x" + 32 hex digit string in its data
 // segment (docs/FINDINGS.md). The key is never stored in this repository; the build looks for
 // it in the player's own files and accepts a candidate only when it opens the SELF and every
-// program segment HMAC matches.
+// section flagged hashed has a matching HMAC (in GT6, every program segment).
 #pragma once
 #include "self.hpp"
 

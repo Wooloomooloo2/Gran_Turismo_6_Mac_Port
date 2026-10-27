@@ -131,9 +131,8 @@ std::string hex_of(std::span<const uint8_t> b) {
 
 // expected_sha256: the ELF RPCS3 c365ea76 produces from the same file (docs/FINDINGS.md).
 void check_disc_executable(const char* name, const char* expected_sha256) {
-    const auto disc = env_path("GT6_DISC_DIR");
-    if (!disc) return;  // skipped without real data
-    const Buf self = read_file(*disc / "PS3_GAME" / "USRDIR" / name);
+    const auto disc = require_env("GT6_DISC_DIR");
+    const Buf self = read_file(disc / "PS3_GAME" / "USRDIR" / name);
     const SelfInfo info = inspect_self(self);
     CHECK(info.key_revision == 0x001C);
     CHECK(info.program_type == 4);
@@ -157,9 +156,9 @@ void check_disc_executable(const char* name, const char* expected_sha256) {
 }
 }  // namespace
 
-TEST_CASE("integration: decrypt disc EMAIN.SELF") {
+TEST_CASE("integration: decrypt disc EMAIN.SELF" * needs_env("GT6_DISC_DIR")) {
     check_disc_executable("EMAIN.SELF", "3b543f22062d078a30ec2e5c15d16e7c8a2389cdc32375a58fec6c6842896729");
 }
-TEST_CASE("integration: decrypt disc EBOOT.BIN") {
+TEST_CASE("integration: decrypt disc EBOOT.BIN" * needs_env("GT6_DISC_DIR")) {
     check_disc_executable("EBOOT.BIN", "241c3e8c805049474dcb337914928d6552a3a4087a70cccda018356d73285b28");
 }

@@ -506,3 +506,43 @@ TEST_CASE("leftover .old and .staging folders that are not ours are not deleted"
     CHECK(error_of(w.opts()).find(w.staging().string()) != std::string::npos);
     CHECK(slurp(w.staging() / "precious.txt") == bytes("keep me"));
 }
+
+TEST_CASE("dotfiles in the updates folder (AppleDouble ._*.pkg) are ignored") {
+    World w;
+    spit(w.updates / "._a-third.pkg", std::string("\0\5\26\7 AppleDouble resource fork", 30));
+    spit(w.updates / ".hidden.pkg", std::string("not a package"));
+    build_tree(w.opts());
+    CHECK(app_ver(w.game() / "PARAM.SFO") == "01.04");
+}
+
+TEST_CASE("any error while decrypting a SELF is that file's failure, named") {
+    World w;
+    const Fixture eboot = make_fixture(Kind::App);
+    w.shas[2].second = make_update(w.updates / "a-third.pkg", "01.04", {{"USRDIR/EBOOT.BIN", eboot.self}});
+    w.write_edition("01.04");
+    BuildOptions o = w.opts();
+    o.decrypt = [](std::span<const uint8_t>, const Klicensee*) -> std::vector<uint8_t> {
+        throw std::length_error("vector too long");
+    };
+    CHECK_THROWS_WITH_AS(build_tree(o),
+                         doctest::Contains("dev_hdd0/game/BCES01977/USRDIR/EBOOT.BIN: vector too long"), SelfError);
+    CHECK_FALSE(fs::exists(w.out));
+    CHECK_FALSE(fs::exists(w.staging()));
+}
+
+TEST_CASE("an error while trying a klicensee candidate is recorded for that file") {
+    World w;
+    const Fixture eboot = make_fixture(Kind::NpdrmFree, nullptr, kGameKlicText + std::string(1, '\0'));
+    const Fixture emain = make_fixture(Kind::NpdrmFree, &kGameKlic);
+    w.shas[2].second = make_update(w.updates / "a-third.pkg", "01.04",
+                                   {{"USRDIR/EBOOT.BIN", eboot.self}, {"USRDIR/EMAIN.SELF", emain.self}});
+    w.write_edition("01.04");
+    BuildOptions o = w.opts();
+    o.decrypt = [](std::span<const uint8_t> d, const Klicensee* k) -> std::vector<uint8_t> {
+        if (k) throw std::bad_alloc();
+        return decrypt_self(d, k);
+    };
+    CHECK_THROWS_WITH_AS(build_tree(o), doctest::Contains("dev_hdd0/game/BCES01977/USRDIR/EMAIN.SELF"), SelfError);
+    CHECK_FALSE(fs::exists(w.out));
+    CHECK_FALSE(fs::exists(w.staging()));
+}

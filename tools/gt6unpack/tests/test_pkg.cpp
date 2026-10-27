@@ -106,10 +106,9 @@ TEST_CASE("read_pkg rejects non-packages and corrupt packages") {
     CHECK_THROWS_AS(read_pkg(cut), PkgError);
 }
 
-TEST_CASE("integration: update 1.02 PARAM.SFO") {
-    auto dir = env_path("GT6_UPDATES_DIR");
-    if (!dir) { MESSAGE("GT6_UPDATES_DIR unset, skipping"); return; }
-    Sfo m = pkg_param_sfo(*dir / "EP9001-BCES01977_00-0000000000000000-A0102-V0101-PE.pkg");
+TEST_CASE("integration: update 1.02 PARAM.SFO" * needs_env("GT6_UPDATES_DIR")) {
+    const auto dir = require_env("GT6_UPDATES_DIR");
+    Sfo m = pkg_param_sfo(dir / "EP9001-BCES01977_00-0000000000000000-A0102-V0101-PE.pkg");
     CHECK(std::get<std::string>(m.at("TITLE_ID")) == "BCES01977");
     CHECK(std::get<std::string>(m.at("APP_VER")) == "01.02");
 }

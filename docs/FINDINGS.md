@@ -7,7 +7,7 @@ folder, and the game's code is fully mapped. Nothing failed outright.
 
 | Question | Answer |
 |---|---|
-| Is it really v1.22? | Yes. Every game program was unlocked and the folder matches the recorded checksums. |
+| Is it really v1.22? | Yes. All 21 updates matched Sony's own published checksums before they were installed, and the installed result is byte-identical to what RPCS3's own installer produces from the same packages (16,536 files). Every game program was unlocked. The folder's checksums are now recorded, so any later build can be checked against this one. |
 | How big is the game's code? | One 23 MB program made of about 72,000 separate routines. All of it has to be translated for the Mac. |
 | Biggest risk | The game also runs many small programs on the PS3's helper chips. Recreating those on the Mac is the hardest part of what comes next. |
 | What milestone 2 needs | Your go-ahead. It starts by settling three things: a data-patching step the launcher runs, how to handle the helper-chip programs, and how long the translation takes. |
@@ -18,10 +18,13 @@ Measurements and facts, newest first within each section.
 
 ### Test run
 
-Full suite with the real disc and all updates (no skips):
+Full suite with the real disc and all updates (re-run after the final review fixes):
 
-- `ctest --test-dir build`: `test cases: 59 | 59 passed | 0 failed | 0 skipped`; `assertions: 332 | 332 passed | 0 failed`.
-- `.venv/bin/python -m pytest tests -q`: `25 passed`.
+- `ctest --test-dir build`: 2/2 passed. `gt6unpack_tests`: `test cases: 71 | 71 passed | 0 failed | 0 skipped`; `assertions: 424 | 424 passed | 0 failed`.
+  Integration cases are marked skipped when `GT6_DISC_DIR`/`GT6_UPDATES_DIR` are unset
+  (`67 passed | 4 skipped` without the data), so "0 skipped" here means all 4 ran.
+- `.venv/bin/python -m pytest tests -q`: `37 passed`.
+- `gt6unpack verify ~/Gran\ Turismo\ 6/build/BCES01977-v1.22 --manifest manifests/BCES01977-v1.22.json`: `16568 files checked: 0 mismatched, 0 missing, 0 extra` (now also checks the tree's PARAM.SFO is BCES01977 01.22).
 - `scripts/check_no_game_files.py $(git ls-files)`: clean.
 
 ## Code map of v1.22 (2026-10-27)

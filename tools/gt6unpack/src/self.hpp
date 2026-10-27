@@ -35,8 +35,10 @@ SelfInfo inspect_self(std::span<const uint8_t> self);
 using Klicensee = std::array<uint8_t, 16>;
 
 // Decrypts a retail SELF/SPRX (application or free-licence NPDRM) into an ELF64.
-// Every program segment's HMAC-SHA1 is checked against the metadata (D16); a mismatch throws
-// SelfError("section N hash mismatch"). A free-licence NPDRM SELF is opened with `klic` when
+// Each program segment section the metadata flags as hashed (hashed == 2) has its HMAC-SHA1
+// checked against the metadata (D16); a mismatch throws SelfError("section N hash mismatch").
+// Segments flagged unhashed (1) are taken as they are; the section header table and SCE
+// version sections are never checked. In GT6's executables every program segment is hashed. A free-licence NPDRM SELF is opened with `klic` when
 // given, else with the public NP_KLIC_FREE (as RPCS3's decrypt_self(file, klic_key)); a wrong
 // klicensee throws SelfError("failed to decrypt SELF metadata info (wrong key?)"). NPDRM
 // licence types other than free throw SelfError("needs a licence file (paid content, out of scope)").

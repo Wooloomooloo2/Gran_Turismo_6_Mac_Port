@@ -1,6 +1,6 @@
 # Decisions
 
-Numbered, dated, with reasoning. Do not re-litigate D1-D12 without the owner.
+Numbered, dated, with reasoning. Do not re-litigate the owner decisions (D1-D12 and D15) without the owner.
 
 ## Owner decisions (2026-10-27)
 

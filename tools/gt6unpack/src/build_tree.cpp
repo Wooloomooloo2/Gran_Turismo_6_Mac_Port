@@ -179,7 +179,7 @@ void write_file(const fs::path& out, std::span<const uint8_t> data) {
 // Free-licence NPDRM SELFs that do not open with the public klicensee are retried with each
 // klicensee string found in the decrypted update EBOOT.BIN files (see klic.hpp).
 void decrypt_all(const fs::path& staging, std::vector<Decrypted>& done, std::vector<Skipped>& skipped,
-                 const std::function<void(const std::string&)>& log) {
+                 const DecryptFn& decrypt, const std::function<void(const std::string&)>& log) {
     std::vector<Failed> failed;
     auto store = [&](const std::string& rel, std::span<const uint8_t> elf, const SelfInfo& info,
                      const std::string& klic_from) {
@@ -213,9 +213,10 @@ void decrypt_all(const fs::path& staging, std::vector<Decrypted>& done, std::vec
                 skipped.push_back({rel, "not a SELF (SCE header type " + std::to_string(header_type) + ")"});
                 continue;
             }
-            const std::vector<uint8_t> data = slurp(file);
+            std::vector<uint8_t> data;
             SelfInfo info;
             try {
+                data = slurp(file);
                 info = inspect_self(data);
             } catch (const SelfError& e) {
                 if (executable_name(file)) {
@@ -224,11 +225,16 @@ void decrypt_all(const fs::path& staging, std::vector<Decrypted>& done, std::vec
                     skipped.push_back({rel, std::string("SCE header type 1 but not accepted as a SELF: ") + e.what()});
                 }
                 continue;
+            } catch (const std::exception& e) {
+                failed.push_back({rel, e.what()});
+                continue;
             }
             try {
-                store(rel, decrypt_self(data), info, "");
+                store(rel, decrypt(data, nullptr), info, "");
             } catch (const SelfError& e) {
                 failed.push_back({rel, e.what(), info.npdrm && info.npdrm_license == 3});
+            } catch (const std::exception& e) {
+                failed.push_back({rel, e.what()});  // not a key problem: no klicensee retry
             }
         }
     }
@@ -242,23 +248,30 @@ void decrypt_all(const fs::path& staging, std::vector<Decrypted>& done, std::vec
         std::vector<Failed> still;
         for (const Failed& f : failed) {
             bool opened = false;
+            std::string other_error;  // a failure that is not "wrong key", reported with the file
             if (f.npdrm_free) {
-                const std::vector<uint8_t> data = slurp(staging / f.path);
-                for (const auto& [c, from] : cands) {
-                    try {
-                        // decrypt_self accepts the key only if the metadata opens and every
-                        // program segment HMAC matches.
-                        store(f.path, decrypt_self(data, &c.key), inspect_self(data), from);
-                        opened = true;
-                        break;
-                    } catch (const SelfError&) {
+                try {
+                    const std::vector<uint8_t> data = slurp(staging / f.path);
+                    for (const auto& [c, from] : cands) {
+                        try {
+                            // decrypt_self accepts the key only if the metadata opens and every
+                            // section flagged hashed has a matching HMAC.
+                            store(f.path, decrypt(data, &c.key), inspect_self(data), from);
+                            opened = true;
+                            break;
+                        } catch (const SelfError&) {
+                        }
                     }
+                } catch (const std::exception& e) {
+                    other_error = e.what();
                 }
             }
             if (!opened)
-                still.push_back({f.path, f.reason + (f.npdrm_free ? "; no klicensee in the decrypted update "
-                                                                    "EBOOT.BIN opens it"
-                                                                  : "")});
+                still.push_back({f.path, f.reason +
+                                             (!other_error.empty() ? "; then, trying klicensees: " + other_error
+                                              : f.npdrm_free       ? "; no klicensee in the decrypted update "
+                                                                     "EBOOT.BIN opens it"
+                                                                   : "")});
         }
         failed = std::move(still);
     }
@@ -386,7 +399,7 @@ void build_into(const BuildOptions& o, const Edition& ed, const std::vector<fs::
     r.timings.push_back({"install_updates", seconds_since(t)});
 
     t = Clock::now();
-    decrypt_all(staging, r.decrypted, r.skipped, log);
+    decrypt_all(staging, r.decrypted, r.skipped, o.decrypt, log);
     r.timings.push_back({"decrypt", seconds_since(t)});
 
     const fs::path sfo = game / "PARAM.SFO";
@@ -524,8 +537,11 @@ void build_tree(const BuildOptions& o) {
 
     std::vector<fs::path> pkgs;
     if (!fs::is_directory(o.updates_dir)) throw BuildError("no updates directory " + o.updates_dir.string());
+    // Dotfiles are skipped: macOS writes AppleDouble "._<name>.pkg" companions on non-HFS volumes.
     for (const auto& e : fs::directory_iterator(o.updates_dir))
-        if (e.is_regular_file() && lower(e.path().extension().string()) == ".pkg") pkgs.push_back(e.path());
+        if (e.is_regular_file() && !e.path().filename().string().starts_with(".") &&
+            lower(e.path().extension().string()) == ".pkg")
+            pkgs.push_back(e.path());
     std::sort(pkgs.begin(), pkgs.end());
 
     Report r;

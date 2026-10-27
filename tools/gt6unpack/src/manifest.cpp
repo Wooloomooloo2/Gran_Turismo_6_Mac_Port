@@ -3,9 +3,9 @@
 
 #include "crypto.hpp"
 #include "json_util.hpp"
+#include "sfo.hpp"
 
 #include <algorithm>
-#include <cstdio>
 #include <fstream>
 #include <iterator>
 #include <map>
@@ -146,6 +146,34 @@ private:
 
 }  // namespace
 
+TreeIdentity tree_identity(const fs::path& out) {
+    const fs::path games = out / "dev_hdd0" / "game";
+    std::error_code ec;
+    if (!fs::is_directory(games, ec)) throw ManifestError("no dev_hdd0/game in " + out.string());
+    std::vector<fs::path> dirs;
+    for (const auto& e : fs::directory_iterator(games)) dirs.push_back(e.path());
+    std::sort(dirs.begin(), dirs.end());
+    for (const fs::path& dir : dirs) {
+        const fs::path sfo = dir / "PARAM.SFO";
+        if (!fs::is_regular_file(sfo, ec)) continue;
+        std::ifstream f(sfo, std::ios::binary);
+        Sfo s;
+        try {
+            s = parse_sfo(std::vector<uint8_t>(std::istreambuf_iterator<char>(f), {}));
+        } catch (const SfoError& e) {
+            throw ManifestError(sfo.string() + ": " + e.what());
+        }
+        auto str = [&](const char* k) {
+            const auto it = s.find(k);
+            if (it == s.end() || !std::holds_alternative<std::string>(it->second))
+                throw ManifestError(sfo.string() + " has no " + k);
+            return std::get<std::string>(it->second);
+        };
+        return {str("TITLE_ID"), str("APP_VER")};
+    }
+    throw ManifestError("no PARAM.SFO under " + games.string());
+}
+
 Manifest make_manifest(const fs::path& out, const std::string& title_id, const std::string& app_ver) {
     Manifest m;
     m.title_id = title_id;
@@ -178,6 +206,15 @@ Manifest read_manifest(const fs::path& file) {
 
 VerifyReport verify_tree(const fs::path& out, const Manifest& m) {
     VerifyReport r;
+    if (m.files.empty()) r.problems.push_back("the manifest lists no files");
+    try {
+        const TreeIdentity id = tree_identity(out);
+        if (id.title_id != m.title_id || id.app_ver != m.app_ver)
+            r.problems.push_back("the tree is " + id.title_id + " " + id.app_ver + ", the manifest is for " +
+                                 m.title_id + " " + m.app_ver);
+    } catch (const ManifestError& e) {
+        r.problems.push_back(std::string("cannot read the tree's PARAM.SFO: ") + e.what());
+    }
     std::map<std::string, const ManifestFile*> want;
     for (const ManifestFile& f : m.files) want[f.path] = &f;
     for (const auto& [path, f] : want) {

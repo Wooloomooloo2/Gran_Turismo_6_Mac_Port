@@ -26,7 +26,7 @@ except `tools/gt6unpack/` (GPL-2.0-only: it holds RPCS3-derived code, D24).
 
 ## Decisions already made (don't re-litigate)
 
-See `docs/DECISIONS.md` D1-D15. Headlines: native translation not emulation (D1); target
+See `docs/DECISIONS.md`: the owner decisions D1-D12 and D15. Headlines: native translation not emulation (D1); target
 BCES-01977 v1.22 (D3); handling must match the PS3 exactly (D10); public PS3 keys live in
 source (D15). Anything that would change one goes to the owner with evidence.
 
@@ -45,8 +45,10 @@ source (D15). Anything that would change one goes to the owner with evidence.
 Milestone 1 is done on branch `m1/unpack` (not pushed). `gt6unpack build` makes a verified
 v1.22 tree at `~/Gran Turismo 6/build/BCES01977-v1.22`; `scripts/map_game.py` maps the code
 (about 72k functions, 740 imports, 4 SPU programs plus 57 SPURS job modules in EMAIN).
-Full suite with real data: 59 C++ cases and 25 Python tests, none skipped (set `GT6_DISC_DIR`
-to the mounted ISO and `GT6_UPDATES_DIR`). Facts in `docs/FINDINGS.md`; decisions D1-D23.
+Full suite with real data (set `GT6_DISC_DIR` to the mounted ISO and `GT6_UPDATES_DIR`): 71
+C++ cases, 0 skipped, and 37 Python tests. Without the data the 4 integration cases are
+reported as skipped by doctest (a ctest check enforces this), so "0 skipped" means they ran.
+Facts in `docs/FINDINGS.md`; decisions D1-D24.
 
 ## Next steps
 

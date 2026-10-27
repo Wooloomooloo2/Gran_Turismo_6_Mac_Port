@@ -2,6 +2,8 @@
 // Assembles a game tree: disc copy (dev_bdvd), updates installed in APP_VER order
 // (dev_hdd0/game/<title>), decrypted executables, and build.json. Layout per design D14.
 #pragma once
+#include "self.hpp"
+
 #include <filesystem>
 #include <functional>
 #include <stdexcept>
@@ -22,17 +24,21 @@ using CloneFn = std::function<int(const std::filesystem::path& src, const std::f
 // The default CloneFn: clonefile(2).
 int clone_with_clonefile(const std::filesystem::path& src, const std::filesystem::path& dst);
 
+// Decrypts one SELF; the default is decrypt_self.
+using DecryptFn = std::function<std::vector<uint8_t>(std::span<const uint8_t> self, const Klicensee* klic)>;
+
 struct BuildOptions {
     std::filesystem::path disc_dir, updates_dir, out_dir, edition_file;
     bool force = false;
     CloneFn clone = clone_with_clonefile;  // tests inject failures here
+    DecryptFn decrypt = [](std::span<const uint8_t> s, const Klicensee* k) { return decrypt_self(s, k); };  // and here
     std::function<void(const std::string&)> log = [](const std::string&) {};  // progress lines
 };
 
 // Builds into "<out>.staging" and renames it over <out> only when everything succeeded:
 // updates verified (before anything is written), disc cloned (or copied after a free-space
-// check), updates installed, every SELF decrypted (all failures are collected, then thrown
-// together as one SelfError), final PARAM.SFO APP_VER equal to the
+// check), updates installed, every SELF decrypted (all failures, whatever the exception, are
+// collected per file, then thrown together as one SelfError naming each file), final PARAM.SFO APP_VER equal to the
 // edition's target. On failure nothing is left at <out>.staging and <out> is untouched. With
 // --force the old tree is renamed to <out>.old, the new one renamed in, then the old one
 // removed; a run killed in between is repaired at the next start. A relative <out> or one with
