@@ -1,0 +1,159 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] cellFs: cellFsReadWithOffset and cellFsWriteWithOffset
+
+Upstream: not yet submitted
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0003)
+
+What: registers cellFsReadWithOffset (0x0D5B4A14) and cellFsWriteWithOffset
+(0x8CB722D5) as pread/pwrite on the fd's FILE*: seek, transfer and seek
+back under the stream lock (as cellFsAioRead does), so the fd's position is
+unchanged. Error answers follow RPCS3's cellFs.cpp: CELL_EFAULT for a null
+write buffer, CELL_EBADF for an unknown fd, count written as 0.
+
+Why: Gran Turismo 6 reads GT.VOL and its PDIPFS index this way from its first
+second. Unregistered, the import faked CELL_OK with nothing read, the title
+parsed zeroed headers, and boot died in a stack overrun soon after.
+
+Test: tools/test_ppu_fs_aio.py (runtime/ppu/tests/test_fs_aio.cpp, cases 3-4).
+
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -89,6 +89,8 @@
+ #define CELL_FS_EISDIR       (-2147418094)   /* 0x80010012 */
+ #define CELL_FS_EIO          (-2147418111)
+ #define CELL_FS_ENOSYS       (-2147418109)   /* 0x80010003 */
++#define CELL_FS_EFAULT       (-2147418099)   /* 0x8001000D */
++#define CELL_FS_EBADF        (-2147418070)   /* 0x8001002A */
+ #define CELL_FS_S_IFDIR      0x4000u
+ #define CELL_FS_S_IFREG      0x8000u
+ #define CELL_FS_O_RDONLY     0
+@@ -978,6 +980,53 @@
+                                  (uint64_t)(int64_t)id, (uint64_t)n, 0, 0, 0, 0);
+ }
+ 
++/* cellFsReadWithOffset(fd, offset, buf, size, nread) and
++ * cellFsWriteWithOffset(fd, offset, buf, size, nwrite): pread/pwrite. They
++ * name their own offset and leave the fd's position alone, so they take the
++ * stream lock across seek, transfer and seek back, as cellFsAioRead does.
++ * Error answers follow RPCS3's cellFs.cpp (GPL-2.0): a bad buffer for a write
++ * is CELL_EFAULT, an unknown fd CELL_EBADF, and the count is written as 0.
++ * Gran Turismo 6 reads GT.VOL and its PDIPFS files this way; unregistered,
++ * the import faked CELL_OK with nothing read. */
++static void fs_rw_with_offset(ppu_context* ctx, bool write)
++{
++    const int      fd     = (int)(uint32_t)ctx->gpr[3];
++    const uint64_t offset = ctx->gpr[4];
++    const uint32_t buf    = (uint32_t)ctx->gpr[5];
++    uint64_t       size   = ctx->gpr[6];
++    const uint32_t n_ptr  = (uint32_t)ctx->gpr[7];
++    if (write && !buf) {
++        if (n_ptr) vm_write64(n_ptr, 0);
++        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EFAULT;
++        return;
++    }
++    FILE* f = fd_file(fd);
++    if (!f) {
++        if (n_ptr) vm_write64(n_ptr, 0);
++        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EBADF;
++        return;
++    }
++    if (ppu_vm_size && (uint64_t)buf + size > ppu_vm_size) size = ppu_vm_size - buf;
++    fs_prefault(buf, size);
++    size_t n = 0;
++    HOST_LOCKFILE(f);
++    const int64_t pos = (int64_t)HOST_FTELL64(f);
++    if (HOST_FSEEK64(f, offset) == 0)
++        n = write ? fwrite(vm_base + buf, 1, (size_t)size, f)
++                  : fread(vm_base + buf, 1, (size_t)size, f);
++    if (write) fflush(f);
++    if (pos >= 0) HOST_FSEEK64(f, pos);
++    HOST_UNLOCKFILE(f);
++    if (getenv("PS3_FSLOG"))
++        fprintf(stderr, "[fs] %s with offset fd=%d off=%llu size=%llu -> %zu\n",
++                write ? "write" : "read", fd, (unsigned long long)offset,
++                (unsigned long long)size, n);
++    if (n_ptr) vm_write64(n_ptr, n);
++    ctx->gpr[3] = CELL_OK;
++}
++static void cellFsReadWithOffset(ppu_context* ctx)  { fs_rw_with_offset(ctx, false); }
++static void cellFsWriteWithOffset(ppu_context* ctx) { fs_rw_with_offset(ctx, true); }
++
+ extern "C" void ppu_fs_register(void)
+ {
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsOpen"),     "cellFsOpen",     cellFsOpen);
+@@ -988,6 +1037,8 @@
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsClose"),    "cellFsClose",    cellFsClose);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsRead"),     "cellFsRead",     cellFsRead);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsWrite"),    "cellFsWrite",    cellFsWrite);
++    ps3_hle_register_ctx(ps3_compute_nid("cellFsReadWithOffset"),  "cellFsReadWithOffset",  cellFsReadWithOffset);
++    ps3_hle_register_ctx(ps3_compute_nid("cellFsWriteWithOffset"), "cellFsWriteWithOffset", cellFsWriteWithOffset);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsLseek"),    "cellFsLseek",    cellFsLseek);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsFGetBlockSize"), "cellFsFGetBlockSize", cellFsFGetBlockSize);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsGetBlockSize"),  "cellFsGetBlockSize",  cellFsGetBlockSize);
+--- a/runtime/ppu/tests/test_fs_aio.cpp
++++ b/runtime/ppu/tests/test_fs_aio.cpp
+@@ -6,7 +6,8 @@
+  * threads, audio streamers) issue them on one fd at once. The fixture writes
+  * a file whose every 4-byte word holds its own offset, then checks both:
+  * a cellFsRead after an AIO read continues from the fd's position, and
+- * reads racing from four threads each get the words they asked for.
++ * reads racing from four threads each get the words they asked for. The
++ * same holds for cellFsReadWithOffset / cellFsWriteWithOffset (pread/pwrite).
+  *
+  *   tools/test_ppu_fs_aio.py
+  *   test_fs_aio [DIR]     (DIR: where the file goes; default the temp dir)
+@@ -115,8 +116,54 @@
+     CHECK(total == 0, "%d racing AIO reads over %d threads, %d returned the wrong bytes",
+           THREADS * ROUNDS, THREADS, total);
+ 
++    /* 3. cellFsReadWithOffset(fd, offset, buf, size, nread) is a pread: the
++     *    words at its own offset, and the fd's position does not move. */
++    memset(&ctx, 0, sizeof ctx); ctx.gpr[3] = fd; ctx.gpr[4] = 0x80; ctx.gpr[5] = 0 /* SET */; ctx.gpr[6] = 0x208;
++    cellFsLseek(&ctx);
++    memset(&ctx, 0, sizeof ctx);
++    ctx.gpr[3] = fd; ctx.gpr[4] = 0xC000; ctx.gpr[5] = 0x3000; ctx.gpr[6] = 0x40; ctx.gpr[7] = 0x218;
++    cellFsReadWithOffset(&ctx);
++    CHECK((uint32_t)ctx.gpr[3] == 0 && rd64(0x218) == 0x40 && holds(0x3000, 0xC000, 0x40),
++          "cellFsReadWithOffset returns the words at its offset (rc 0x%X, nread %llu)",
++          (uint32_t)ctx.gpr[3], (unsigned long long)rd64(0x218));
++    memset(&ctx, 0, sizeof ctx); ctx.gpr[3] = fd; ctx.gpr[4] = 0x2000; ctx.gpr[5] = 16; ctx.gpr[6] = 0x210;
++    cellFsRead(&ctx);
++    CHECK(holds(0x2000, 0x80, 16), "cellFsRead after it continues from 0x80 (got word 0x%08X)", rd32(0x2000));
++    memset(&ctx, 0, sizeof ctx);
++    ctx.gpr[3] = 77; ctx.gpr[4] = 0; ctx.gpr[5] = 0x3000; ctx.gpr[6] = 4; ctx.gpr[7] = 0x218;
++    wr64(0x218, 99);
++    cellFsReadWithOffset(&ctx);
++    CHECK((uint32_t)ctx.gpr[3] == 0x8001002Au && rd64(0x218) == 0,
++          "cellFsReadWithOffset on a closed fd is CELL_EBADF with nread 0");
++
+     memset(&ctx, 0, sizeof ctx); ctx.gpr[3] = fd;
+     cellFsClose(&ctx);
++
++    /* 4. cellFsWriteWithOffset writes at its own offset, leaving the position. */
++    memset(&ctx, 0, sizeof ctx); ctx.gpr[3] = 0x100; ctx.gpr[4] = 2 /* O_RDWR */; ctx.gpr[5] = 0x200;
++    cellFsOpen(&ctx);
++    const uint32_t wfd = rd32(0x200);
++    CHECK((uint32_t)ctx.gpr[3] == 0, "cellFsOpen O_RDWR returns CELL_OK (fd %u)", wfd);
++    wr32(0x3100, 0xCAFEF00Du);
++    memset(&ctx, 0, sizeof ctx);
++    ctx.gpr[3] = wfd; ctx.gpr[4] = 0x100; ctx.gpr[5] = 0x3100; ctx.gpr[6] = 4; ctx.gpr[7] = 0x220;
++    cellFsWriteWithOffset(&ctx);
++    CHECK((uint32_t)ctx.gpr[3] == 0 && rd64(0x220) == 4, "cellFsWriteWithOffset writes 4 bytes");
++    memset(&ctx, 0, sizeof ctx);
++    ctx.gpr[3] = wfd; ctx.gpr[4] = 0xFC; ctx.gpr[5] = 0x3200; ctx.gpr[6] = 12; ctx.gpr[7] = 0x228;
++    cellFsReadWithOffset(&ctx);
++    CHECK(rd32(0x3200) == 0xFC && rd32(0x3204) == 0xCAFEF00Du && rd32(0x3208) == 0x104,
++          "the written word reads back between its neighbours");
++    memset(&ctx, 0, sizeof ctx); ctx.gpr[3] = wfd; ctx.gpr[4] = 0x3300; ctx.gpr[5] = 4; ctx.gpr[6] = 0x230;
++    cellFsRead(&ctx);
++    CHECK(rd32(0x3300) == 0, "the fd's own position is still 0 (got word 0x%08X)", rd32(0x3300));
++    memset(&ctx, 0, sizeof ctx);
++    ctx.gpr[3] = wfd; ctx.gpr[4] = 0; ctx.gpr[5] = 0; ctx.gpr[6] = 4; ctx.gpr[7] = 0x220;
++    cellFsWriteWithOffset(&ctx);
++    CHECK((uint32_t)ctx.gpr[3] == 0x8001000Du && rd64(0x220) == 0,
++          "cellFsWriteWithOffset from a null buffer is CELL_EFAULT");
++    memset(&ctx, 0, sizeof ctx); ctx.gpr[3] = wfd;
++    cellFsClose(&ctx);
+     remove(host);
+     printf("%s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
+     return fails ? 1 : 0;

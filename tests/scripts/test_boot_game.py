@@ -90,7 +90,7 @@ def test_boot_fake_crash(tree, tmp_path):
 def test_boot_collects_unresolved(tree, tmp_path):
     rep = boot_game.boot(fake("unresolved", tmp_path), tree, seconds=30, idle=20)
     assert rep["outcome"] == "exited"
-    assert rep["unresolved_nids"] == ["0x1234ABCD", "0xDEADBEEF"]
+    assert rep["unresolved_nids"] == ["0x1234ABCD", "0xDEADBEEF", "0x0D5B4A14", "0x30AA96C4"]
     assert rep["unimplemented_syscalls"] == [891]
     run = Path(rep["run"])
     assert json.loads((run / "report.json").read_text())["outcome"] == "exited"

@@ -45,7 +45,10 @@ OUTCOMES = ("first_frame", "exited", "crashed", "hung", "timeout")
 FLIP_KEY = "gcm:flip"
 FLIP_GRACE = 5.0        # seconds to keep running after the first flip so frames get dumped
 POLL = 0.2
-UNRESOLVED_RE = re.compile(r"\[hle\] UNRESOLVED NID (0x[0-9A-Fa-f]+)")
+# ps3recomp prints both "[hle] UNRESOLVED NID 0x... -> faking" and the dispatcher's
+# "[hle] unresolved NID 0x..." (stderr, first 40 only); the milestone log has every one.
+UNRESOLVED_RE = re.compile(r"\[hle\] unresolved NID (0x[0-9A-Fa-f]+)", re.IGNORECASE)
+UNRESOLVED_KEY = "hle:unresolved:"
 SYSCALL_RE = re.compile(r"lv2_syscall (\d+) \(stub\)")
 
 
@@ -213,7 +216,7 @@ def boot(gt6, tree, seconds=300, idle=60, headless=True, env=None):
         "seconds": elapsed,
         "returncode": returncode,
         "last_keys": keys[-20:],
-        "unresolved_nids": list(dict.fromkeys(UNRESOLVED_RE.findall(err))),
+        "unresolved_nids": _unresolved(err, keys),
         "unimplemented_syscalls": sorted({int(n) for n in SYSCALL_RE.findall(err)}),
         "frames": sum(1 for f in (run / "frames").iterdir() if f.is_file()),
         "backtraces": backtraces,
@@ -223,6 +226,13 @@ def boot(gt6, tree, seconds=300, idle=60, headless=True, env=None):
     (run / "report.json").write_text(json.dumps(rep, indent=2) + "\n")
     (run / "summary.md").write_text(_summary(rep, tree))
     return rep
+
+
+def _unresolved(err, keys):
+    """Distinct unresolved import NIDs, first seen first, as 0x%08X."""
+    found = UNRESOLVED_RE.findall(err) + [k[len(UNRESOLVED_KEY):] for k in keys
+                                          if k.startswith(UNRESOLVED_KEY)]
+    return list(dict.fromkeys(f"0x{int(n, 16):08X}" for n in found))
 
 
 def main(argv=None):
