@@ -79,7 +79,6 @@ def test_runners_found():
     assert "tools/test_lwcond_wakeup.py" in found
 
 
-@pytest.mark.slow
 @pytest.mark.parametrize("runner", runners())
 def test_ps3recomp_runner(patched_tree, runner):
     r = subprocess.run([sys.executable, "-E", "-s", runner], cwd=patched_tree, capture_output=True,

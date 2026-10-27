@@ -12,9 +12,13 @@ What: two opt-in switches, defaults unchanged.
   kernel context, PM at LS 0xA00), instead of being dropped. Interpreted
   images get image ids no lifted image uses. Every run is reported to a new
   hook, g_spu_job_interp_hook (fingerprint, size), which a port can count;
-  the first 32 job runs and every 10000th are logged. SPU_DUMP_MISS still
-  dumps each image once; policy modules now dump as spupm_<fp>_<size>.bin
-  (linked for LS 0xA00) so a lift can tell them from spujob_ (LS 0).
+  the first 32 job runs and every 10000th are logged. Interpreted ids are
+  0x6 plus the fingerprint's low 28 bits, moved to the next free id on a
+  collision; the first 64 images are reported to the hook (a 65th logs once).
+  SPU_DUMP_MISS still dumps each image once. Behaviour change for every
+  title, switch or not: a policy module's dump is now always named
+  spupm_<fp>_<size>.bin (was spujob_), since it is linked for LS 0xA00 and a
+  lift must tell it from a job binary (LS 0).
 - SPURS_JOB_SYNTH_EVENTS=0: the job-chain walker stops making up completion
   events (one per job, one at END, one at the walk's end, pushed to every
   attached queue). On hardware the job manager sends none; a job reports its
@@ -30,7 +34,8 @@ when a mutex lock on the clobbered id fails.
 
 Test: tools/test_spu_job_interp.py (new): without the switch the job is
 dropped; with it, the job runs interpreted (writes its mailbox), the hook
-sees it, and SPU_DUMP_MISS dumps it once. tools/test_spu_dispatch_miss.py
+sees it, and SPU_DUMP_MISS dumps it once; spu_policy_interp_entry runs a
+policy module from LS 0xA00 and reports it; colliding ids are kept apart. tools/test_spu_dispatch_miss.py
 unchanged and passing.
 
 --- a/libs/spurs/cellSpurs.c
@@ -133,7 +138,7 @@ unchanged and passing.
  #ifdef _WIN32
  #include <windows.h>
  #else
-@@ -1017,6 +1018,72 @@
+@@ -1017,6 +1018,102 @@
  static void* spu_async_thread(void* p) { spu_async_run((spu_async_job*)p); return NULL; }
  #endif
  
@@ -158,37 +163,67 @@ unchanged and passing.
 +    return v;
 +}
 +
-+/* Image ids for interpreted images: ones no lifted image uses, so the
-+ * interpreted code's lookups never pick another image's functions (lifted ids
-+ * are small, or content derived below 0x20000000). Each remembers its
-+ * fingerprint and size for the hook. */
++/* Image ids for interpreted images: ones no lifted image uses (lifted ids are
++ * small, or content derived below 0x20000000), so the interpreted code's
++ * lookups never pick another image's functions. The id is 0x6 followed by the
++ * fingerprint's low 28 bits; two images whose fingerprints share those bits get
++ * the next free id instead, so every interpreted image has its own. Each id
++ * remembers its full fingerprint and size for the hook. */
 +#define SPU_INTERP_IMAGES 64
++#define SPU_INTERP_ID_BASE 0x60000000u
 +static struct { int id; uint64_t fp; uint32_t size; } s_interp_img[SPU_INTERP_IMAGES];
 +static unsigned s_interp_img_n;
 +static volatile LONG s_interp_img_lock;
++static void interp_img_lock(void)   { while (InterlockedExchange(&s_interp_img_lock, 1)) Sleep(0); }
++static void interp_img_unlock(void) { InterlockedExchange(&s_interp_img_lock, 0); }
 +
 +int spu_job_interp_image_id(uint64_t fp, uint32_t size)
 +{
-+    const int id = (int)(0x60000000u | (uint32_t)(fp & 0x0FFFFFFFu));
-+    while (InterlockedExchange(&s_interp_img_lock, 1)) Sleep(0);
-+    unsigned k = 0;
-+    for (; k < s_interp_img_n; k++) if (s_interp_img[k].id == id) break;
-+    if (k == s_interp_img_n && s_interp_img_n < SPU_INTERP_IMAGES) {
-+        s_interp_img[k].id = id; s_interp_img[k].fp = fp; s_interp_img[k].size = size;
-+        s_interp_img_n++;
++    uint32_t low = (uint32_t)(fp & 0x0FFFFFFFu);
++    interp_img_lock();
++    for (unsigned k = 0; k < s_interp_img_n; k++)
++        if (s_interp_img[k].fp == fp && s_interp_img[k].size == size) {
++            const int id = s_interp_img[k].id;
++            interp_img_unlock();
++            return id;
++        }
++    for (;;) {                          /* the first id no other image holds */
++        unsigned k = 0;
++        for (; k < s_interp_img_n; k++) if (s_interp_img[k].id == (int)(SPU_INTERP_ID_BASE | low)) break;
++        if (k == s_interp_img_n) break;
++        low = (low + 1) & 0x0FFFFFFFu;
 +    }
-+    InterlockedExchange(&s_interp_img_lock, 0);
++    const int id = (int)(SPU_INTERP_ID_BASE | low);
++    if (s_interp_img_n < SPU_INTERP_IMAGES) {
++        s_interp_img[s_interp_img_n].id = id;
++        s_interp_img[s_interp_img_n].fp = fp;
++        s_interp_img[s_interp_img_n].size = size;
++        s_interp_img_n++;
++    } else {
++        static int warned = 0;
++        if (!warned) {
++            warned = 1;
++            fprintf(stderr, "[spu_workload] more than %d interpreted SPU images: image "
++                    "fp=0x%016llX and later ones run, but are not reported to the hook\n",
++                    SPU_INTERP_IMAGES, (unsigned long long)fp);
++        }
++    }
++    interp_img_unlock();
 +    return id;
 +}
 +
 +static void spu_job_interp_note(int image_id)
 +{
 +    if (!g_spu_job_interp_hook) return;
++    uint64_t fp = 0; uint32_t size = 0; int found = 0;
++    interp_img_lock();
 +    for (unsigned k = 0; k < s_interp_img_n; k++)
 +        if (s_interp_img[k].id == image_id) {
-+            g_spu_job_interp_hook(s_interp_img[k].fp, s_interp_img[k].size);
-+            return;
++            fp = s_interp_img[k].fp; size = s_interp_img[k].size; found = 1;
++            break;
 +        }
++    interp_img_unlock();
++    if (found) g_spu_job_interp_hook(fp, size);   /* outside the lock: the hook may log */
 +}
 +
 +static void spu_job_interp_entry(spu_context* ctx)
@@ -206,7 +241,7 @@ unchanged and passing.
  int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
                                uint32_t job_ea, uint32_t job_desc_size)
  {
-@@ -1035,7 +1102,8 @@
+@@ -1035,7 +1132,8 @@
            if (++miss_n <= 32 || miss_n % 100000 == 0)
              fprintf(stderr, "[spurs-job] dispatch MISS fp=0x%016llX size=%u job=0x%08X (#%llu)\n",
                      (unsigned long long)fp, image_size, job_ea, miss_n); }
@@ -216,7 +251,7 @@ unchanged and passing.
          /* SPU_DUMP_MISS=<dir>: write the unrecognised image out so it can be
           * lifted and registered. SPURS job binaries are raw code+data blobs
           * the title loads from its own data files -- unlike sys_spu_image
-@@ -1060,7 +1128,16 @@
+@@ -1060,7 +1158,16 @@
                    }
                }
            } }
@@ -254,7 +289,7 @@ unchanged and passing.
  
 --- /dev/null
 +++ b/tests/test_spu_job_interp.c
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,89 @@
 +/* SPU_JOB_INTERP=1: a SPURS job binary with no lifted image runs in the SPU
 + * interpreter through the real runtime/spu/spu_workload.c and spurs_job.c,
 + * with jm2's staging, instead of being dropped. The job here loads 0x1234 into
@@ -263,12 +298,17 @@ unchanged and passing.
 + * runs this with and without the switch and checks stderr and the exit code:
 + *   without: the job is dropped (dispatch returns 0), one ERROR line;
 + *   with:    it runs (returns 1), the mailbox holds 0x1234, the hook saw it,
-+ *            and the INTERPRETED line names the fingerprint. */
++ *            and the INTERPRETED line names the fingerprint;
++ *   always:  spu_policy_interp_entry enters a policy module at LS 0xA00 and
++ *            reports it, and two fingerprints with the same low 28 bits get
++ *            different image ids. */
 +#include <stdint.h>
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <string.h>
 +#include "spu_workload.h"
++#include "spu_context.h"
++extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
 +
 +uint8_t* vm_base;
 +uint32_t ppu_vm_size = 0x20000;
@@ -316,14 +356,37 @@ unchanged and passing.
 +    int r = spu_workload_dispatch_job(bin, 256, JOB, 0x80);
 +    fprintf(stderr, "job-interp: r=%d mbox=0x%X hook=%u fp=0x%016llX\n", r, g_spurs_job_mbox,
 +            s_hook_calls, (unsigned long long)s_hook_fp);
++
++    /* A policy module: the same three words at LS 0xA00, entered there. */
++    static spu_context pm;
++    spu_context_init(&pm, 0);
++    be32(pm.ls + 0xA00, 0x40800000u | (0x5678u << 7) | 5u);
++    be32(pm.ls + 0xA04, 0x21A00000u | (28u << 7) | 5u);
++    be32(pm.ls + 0xA08, 0x00000000u);
++    const uint64_t pm_fp = 0x1122334455667788ull;
++    pm.image_id = spu_job_interp_image_id(pm_fp, 12160);
++    unsigned before = s_hook_calls;
++    spu_run_with_halt(spu_policy_interp_entry, &pm);
++    const uint32_t pm_mbox = spu_channel_has_data(&pm.ch_out_mbox) ? pm.ch_out_mbox.value : 0;
++    fprintf(stderr, "pm-interp: mbox=0x%X hook=%u fp=0x%016llX\n", pm_mbox, s_hook_calls - before,
++            (unsigned long long)s_hook_fp);
++
++    /* Ids: the same image keeps its id; a colliding fingerprint gets another. */
++    int a = spu_job_interp_image_id(0xAAAA000001234567ull, 16);
++    int b = spu_job_interp_image_id(0xBBBB000001234567ull, 16);
++    int a2 = spu_job_interp_image_id(0xAAAA000001234567ull, 16);
++    fprintf(stderr, "ids: distinct=%d stable=%d range=%d\n", a != b, a == a2,
++            (a & 0xF0000000) == 0x60000000 && (b & 0xF0000000) == 0x60000000);
 +    return 0;
 +}
 --- /dev/null
 +++ b/tools/test_spu_job_interp.py
-@@ -0,0 +1,52 @@
+@@ -0,0 +1,58 @@
 +#!/usr/bin/env python3
 +"""SPU_JOB_INTERP=1 runs a SPURS job with no lifted image in the SPU interpreter
-+(runtime/spu/spu_workload.c) instead of dropping it; without it the job is dropped."""
++(runtime/spu/spu_workload.c) instead of dropping it; without it the job is dropped.
++spu_policy_interp_entry enters a policy module at LS 0xA00 and reports it, and
++interpreted images get distinct ids even when their fingerprints' low bits collide."""
 +import os
 +from pathlib import Path
 +import platform
@@ -372,4 +435,8 @@ unchanged and passing.
 +    dumped = list(dump.glob('spujob_*.bin'))
 +    assert len(dumped) == 1 and dumped[0].stat().st_size == 256, dumped
 +    assert m.group(4) in dumped[0].name, (dumped, m.group(4))
++    pm = re.search(r'pm-interp: mbox=0x([0-9A-F]+) hook=(\d+) fp=0x([0-9A-F]{16})', p.stderr)
++    assert pm and pm.group(1) == '5678', 'the policy module ran from LS 0xA00: ' + p.stderr
++    assert pm.group(2) == '1' and pm.group(3) == '1122334455667788', 'and was reported: ' + p.stderr
++    assert 'ids: distinct=1 stable=1 range=1' in p.stderr, p.stderr
 +print('PASS')

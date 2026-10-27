@@ -186,10 +186,15 @@ def fnv1a64(data):
     return h
 
 
-def missed_image_id(fp):
-    """Image id of a lifted missed image: distinct from build_spu_workloads' content ids
-    (below 0x20000000), lift_jobmods' (200-256) and the interpreter's (0x6xxxxxxx)."""
-    return 0x58000000 | (fp & 0x00FFFFFF)
+def missed_image_id(fp, used=()):
+    """Image id of a lifted missed image: 0x58 and the fingerprint's low 24 bits, in a
+    range apart from build_spu_workloads' content ids (below 0x20000000), lift_jobmods'
+    (200-256) and the interpreter's (0x6xxxxxxx). An id already in `used` (two
+    fingerprints sharing those bits) moves to the next free one."""
+    low = fp & 0x00FFFFFF
+    while (0x58000000 | low) in used:
+        low = (low + 1) & 0x00FFFFFF
+    return 0x58000000 | low
 
 
 def _lifter_stats(log_text):
@@ -247,7 +252,8 @@ def lift_missed(missed, staging, python, tools, logs):
         if unsup:
             out["partial"].append(name)      # the bad words fall to the interpreter (D9)
         manifest.append({"name": name, "kind": kind, "fingerprint": f"0x{fp:016X}",
-                         "size": size, "base": base, "image_id": missed_image_id(fp),
+                         "size": size, "base": base,
+                         "image_id": missed_image_id(fp, {e["image_id"] for e in manifest}),
                          "funcs": funcs, "unsupported": unsup})
     out["lifted"] = len(manifest)
     (spu / "spu_missed_manifest.json").write_text(json.dumps(manifest, indent=1))

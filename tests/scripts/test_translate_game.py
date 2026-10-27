@@ -271,12 +271,22 @@ def test_sjlj_passed_to_the_lifter(tmp_path):
     words = list(translate_game.SETJMP_SIG) + list(translate_game.LONGJMP_SIG)
     elf.write_bytes(make_elf_with_code(words, addr=0x10300))
     tools = fake_tools(tmp_path, "a", 1)
-    lifter = (tools / "ppu_lifter.py").read_text().replace(
-        'assert "--code-end" in a and a[a.index("--code-end") + 1] == "0x10320", a',
-        'assert a[a.index("--setjmp") + 1] == "0x10300" and a[a.index("--longjmp") + 1] == "0x10318", a')
+    old = 'assert "--code-end" in a and a[a.index("--code-end") + 1] == "0x10320", a'
+    original = (tools / "ppu_lifter.py").read_text()
+    assert old in original, "the fake lifter's code-end check moved; update this test"
+    lifter = original.replace(
+        old, 'assert a[a.index("--setjmp") + 1] == "0x10300" and a[a.index("--longjmp") + 1] == "0x10318", a')
+    assert lifter != original
     (tools / "ppu_lifter.py").write_text(lifter)
     rec = translate_game.translate(t, tmp_path / "out", sys.executable, tools)
     assert rec["sjlj"] == {"setjmp": ["0x10300"], "longjmp": ["0x10318"]}
+
+
+def test_missed_image_ids_do_not_collide():
+    a = translate_game.missed_image_id(0xAAAA000000123456)
+    b = translate_game.missed_image_id(0xBBBB000000123456, {a})
+    assert a == 0x58123456 and b == 0x58123457
+    assert translate_game.missed_image_id(0x00FFFFFF, {0x58FFFFFF}) == 0x58000000
 
 
 def test_fnv1a64_matches_the_runtime():

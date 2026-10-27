@@ -6,13 +6,19 @@ Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0008)
 
 What: new ppu_lifter options --setjmp EA[,EA] and --longjmp EA[,EA] name the
 title's C library setjmp and longjmp. Every direct call to a setjmp becomes
-PPU_SJLJ_SETJMP (runtime/ppu/ppu_sjlj.h): a host _setjmp into a frame
-declared at the top of the calling function, registered per host thread and
-dropped on every return of that function. The longjmp function, after its
-lifted body has restored the guest registers, calls ppu_sjlj_longjmp, which
-host-longjmps to the newest frame for the same jmp_buf and puts back the
-indirect-call depth and vcall stack the skipped frames held. With no frame
-for the buffer it logs and returns, as before. The runtime half is in
+PPU_SJLJ_SETJMP (runtime/ppu/ppu_sjlj.h): a host _setjmp into one element of
+a zeroed frame array _sjf[N] declared at the top of the calling function,
+registered per host thread and dropped on every return of that function
+(ppu_sjlj_leave, by identity). The longjmp function, after its lifted body
+has restored the guest registers, calls ppu_sjlj_longjmp, which
+host-longjmps to the newest frame for the same jmp_buf, drops (and marks
+unpushed) every newer frame, and puts back the indirect-call depth and
+vcall stack the skipped frames held. Re-arming a call site unlinks only that
+frame. With no frame for the buffer it logs and returns, as before. The
+lifter warns when a --longjmp address is not a lifted function start. The
+header states the invariant (no lifted C local may change between setjmp and
+longjmp) and that jumping over a host HLE frame skips its destructors and
+locks. The runtime half is in
 ppu_loader.cpp (between guest-sjlj markers); the generated header includes
 ppu_sjlj.h only when either option is given, so other lifts are unchanged.
 
@@ -25,7 +31,9 @@ exited on a failed mutex lock.
 
 Test: tools/test_ppu_sjlj.py (new): the lifter rewrite, and the runtime with
 stand-in lifted functions (landing value, skipped code, depth restore,
-unknown and returned buffers, a re-armed call site).
+unknown and returned buffers, a re-armed call site, and two sites where a
+longjmp to the first drops the second, the second is re-armed, and a longjmp
+to the caller's buffer still lands).
 
 --- a/runtime/ppu/ppu_loader.cpp
 +++ b/runtime/ppu/ppu_loader.cpp
@@ -37,29 +45,38 @@ unknown and returned buffers, a re-armed call site).
  #include "../spu/spu_coh_bitmap.h"   /* spu_coh_line_reserved, for the stores */
  #include "ps3emu/ps3_ftrace.h"   /* PS3_FTRACE timeline */
  #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
-@@ -1567,6 +1568,70 @@
+@@ -1567,6 +1568,86 @@
  extern "C" int* ps3_ppu_dispatch_depth_slot(void) { return &g_dispatch_depth; }
  extern "C" int* ps3_ppu_vcall_sp_slot(void) { return &g_vcall_sp; }
  
-+/* ---- guest setjmp/longjmp (ppu_sjlj.h) -------------------------------------
-+ * Frames registered by PPU_SJLJ_SETJMP, newest first, per host thread. Each
-+ * lives in its lifted function's host frame, so a frame at or below a new
-+ * one's address belongs to a function that has returned and is dropped. */
++/* ---- guest setjmp/longjmp (ppu_sjlj.h) ---------------------------------- */
 +extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*);
 +/* guest-sjlj: begin */
 +/* Frames registered by PPU_SJLJ_SETJMP, newest first, per host thread. A frame
-+ * lives in its lifted function's host frame; the function drops its frames on
-+ * every return (ppu_sjlj_leave), and a longjmp drops every frame newer than the
-+ * one it lands on, so the chain holds live frames only. */
++ * is in the chain exactly when its `pushed` is set: a function drops its own
++ * frames on every return (ppu_sjlj_leave), and a longjmp drops every frame
++ * newer than the one it lands on; both clear `pushed` on what they drop. */
 +static PPU_THREAD_LOCAL ppu_sjlj_frame* g_sjlj_top = nullptr;
 +static uint32_t sjlj_align(uint32_t ea) { return (ea + 15u) & ~15u; }
++
++static void sjlj_pop_top(void)
++{
++    ppu_sjlj_frame* f = g_sjlj_top;
++    g_sjlj_top = f->prev;
++    f->pushed = 0;
++    f->prev = nullptr;
++}
 +
 +extern "C" void ppu_sjlj_push(ppu_context* ctx, ppu_sjlj_frame* f, uint32_t guest_buf)
 +{
 +    (void)ctx;
-+    if (f->pushed) {                   /* the same call site again (a loop): re-arm it */
-+        while (g_sjlj_top && g_sjlj_top != f) g_sjlj_top = g_sjlj_top->prev;
-+        if (g_sjlj_top == f) g_sjlj_top = f->prev;
++    if (f->pushed) {
++        /* The same call site again (a loop): re-arm it. Unlink it from wherever
++         * it sits; frames newer than it may be other live sites of the same
++         * function and stay. */
++        for (ppu_sjlj_frame** pp = &g_sjlj_top; *pp; pp = &(*pp)->prev)
++            if (*pp == f) { *pp = f->prev; break; }
++        f->pushed = 0;
 +    }
 +    f->guest_buf = sjlj_align(guest_buf);
 +    f->dispatch_depth = g_dispatch_depth;
@@ -69,11 +86,18 @@ unknown and returned buffers, a re-armed call site).
 +    g_sjlj_top = f;
 +}
 +
-+extern "C" void ppu_sjlj_leave(ppu_sjlj_frame* a, ppu_sjlj_frame* b)
++extern "C" void ppu_sjlj_leave(ppu_sjlj_frame* frames, int n)
 +{
-+    const uintptr_t lo = (uintptr_t)(a < b ? a : b), hi = (uintptr_t)(a < b ? b : a);
-+    while (g_sjlj_top && (uintptr_t)g_sjlj_top >= lo && (uintptr_t)g_sjlj_top <= hi)
-+        g_sjlj_top = g_sjlj_top->prev;
++    /* A returning function's frames are the newest in the chain: its callees
++     * have returned (and dropped theirs) or were jumped over. */
++    for (;;) {
++        ppu_sjlj_frame* t = g_sjlj_top;
++        int mine = 0;
++        for (int k = 0; t && k < n; k++) if (t == &frames[k]) { mine = 1; break; }
++        if (!mine) break;
++        sjlj_pop_top();
++    }
++    for (int k = 0; k < n; k++) frames[k].pushed = 0;   /* armed but already dropped */
 +}
 +
 +extern "C" void ppu_sjlj_landed(ppu_context* ctx, ppu_sjlj_frame* f)
@@ -90,7 +114,7 @@ unknown and returned buffers, a re-armed call site).
 +    const uint32_t want = sjlj_align(guest_buf);
 +    for (ppu_sjlj_frame* p = g_sjlj_top; p; p = p->prev) {
 +        if (p->guest_buf != want) continue;
-+        g_sjlj_top = p;                /* frames newer than p are gone */
++        while (g_sjlj_top != p) sjlj_pop_top();    /* frames newer than p are gone */
 +#if defined(_WIN32)
 +        longjmp(p->env, 1);
 +#else
@@ -110,7 +134,7 @@ unknown and returned buffers, a re-armed call site).
  #define VM_WRITE_COH(a, src, n)                                               \
 --- /dev/null
 +++ b/runtime/ppu/ppu_sjlj.h
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,80 @@
 +/* ppu_sjlj.h -- guest setjmp/longjmp across lifted host frames.
 + *
 + * A guest longjmp restores r1, r2, r13-r31, LR, CR and the non-volatile FP and
@@ -131,7 +155,21 @@ unknown and returned buffers, a re-armed call site).
 + * then restored every register, so execution resumes after the setjmp call
 + * with the longjmp's value in r3, exactly as on the console. With no live
 + * frame for the buffer, ppu_sjlj_longjmp logs and returns (the old behaviour).
-+ * The runtime side is in ppu_loader.cpp. */
++ * The runtime side is in ppu_loader.cpp.
++ *
++ * Invariant the lifted code must keep: no C local of a lifted function may
++ * change between the guest setjmp call and the longjmp that lands on it. After
++ * a host longjmp such a local is indeterminate (C11 7.13.2.1). It holds today
++ * because all guest state lives in ctx, the _cs_ callee-saved snapshots are
++ * written only at function entry, and _mm is const. A lifter change that
++ * caches guest registers in locals must make them volatile in functions that
++ * call setjmp, or break this.
++ *
++ * A longjmp across a host frame that is not lifted code (an HLE function that
++ * called back into the guest) skips that frame: its C++ destructors do not
++ * run and any lock it holds stays held. Only lifted frames and
++ * ps3_indirect_call (whose depth and vcall stack are restored) are safe to
++ * jump over. */
 +#pragma once
 +#include <setjmp.h>
 +#include <stdint.h>
@@ -153,8 +191,8 @@ unknown and returned buffers, a re-armed call site).
 +void ppu_sjlj_push(struct ppu_context* ctx, ppu_sjlj_frame* f, uint32_t guest_buf);
 +void ppu_sjlj_landed(struct ppu_context* ctx, ppu_sjlj_frame* f);
 +void ppu_sjlj_longjmp(struct ppu_context* ctx, uint32_t guest_buf);
-+/* The function holding frames a..b (its first and last) returns: drop them. */
-+void ppu_sjlj_leave(ppu_sjlj_frame* a, ppu_sjlj_frame* b);
++/* The function holding frames[0..n) returns: drop them. */
++void ppu_sjlj_leave(ppu_sjlj_frame* frames, int n);
 +#ifdef __cplusplus
 +}
 +#endif
@@ -167,9 +205,10 @@ unknown and returned buffers, a re-armed call site).
 +#  define PPU_SJLJ_SETJMP_RAW(env) _setjmp(env)
 +#endif
 +
-+/* A direct call to a guest setjmp. `f` is a ppu_sjlj_frame declared (zeroed) at
-+ * the top of the calling function, so it lives as long as that function's
-+ * frame, and every return from that function calls ppu_sjlj_leave. */
++/* A direct call to a guest setjmp. `f` is an element of the zeroed
++ * ppu_sjlj_frame _sjf[N] array declared at the top of the calling function, so
++ * it lives as long as that function's frame, and every return from that
++ * function calls ppu_sjlj_leave(_sjf, N). */
 +#define PPU_SJLJ_SETJMP(ctx, f, fn)                                         \
 +    do {                                                                    \
 +        ppu_sjlj_push((ctx), &(f), (uint32_t)(ctx)->gpr[3]);                \
@@ -178,7 +217,7 @@ unknown and returned buffers, a re-armed call site).
 +    } while (0)
 --- a/tools/ppu_lifter.py
 +++ b/tools/ppu_lifter.py
-@@ -800,6 +800,47 @@
+@@ -800,6 +800,59 @@
  _INSN_PATCH_RE = re.compile(r"^if \(([A-Za-z_]\w*)\) \{ .* /\* insn patch 0x[0-9A-F]{8}: ")
  
  
@@ -186,28 +225,34 @@ unknown and returned buffers, a re-armed call site).
 +    """Guest setjmp/longjmp across lifted host frames (runtime/ppu/ppu_sjlj.h).
 +
 +    Every direct call `func_<S>(ctx);` to a --setjmp function S becomes
-+    PPU_SJLJ_SETJMP(ctx, _sjfN, func_<S>), with its frame _sjfN declared (zeroed)
-+    at the top of the calling function so it lives as long as that host frame,
-+    and every `return;` of that function first drops its frames
-+    (ppu_sjlj_leave). A --longjmp function records its jmp_buf (r3) on entry and
-+    ends every plain `return;` in ppu_sjlj_longjmp, which host-longjmps to the
-+    newest setjmp frame for that buffer once the guest code has restored the
-+    registers. Returns the new body and the number of frames."""
++    PPU_SJLJ_SETJMP(ctx, _sjf[k], func_<S>), with the zeroed frame array
++    _sjf[N] declared at the top of the calling function so it lives as long as
++    that host frame, and every `return;` of that function first drops its
++    frames (ppu_sjlj_leave). A --longjmp function records its jmp_buf (r3) on
++    entry and ends every plain `return;` in ppu_sjlj_longjmp, which
++    host-longjmps to the newest setjmp frame for that buffer once the guest code
++    has restored the registers. Returns the new body and the number of frames.
++
++    Invariant: no C local of a lifted function may change between the setjmp
++    call and the longjmp (it would be indeterminate after the host longjmp).
++    The lifter keeps guest state in ctx and writes the _cs_ snapshots only at
++    function entry; anything that caches guest registers in locals must make
++    them volatile in functions with setjmp frames."""
 +    if not setjmp_addrs and func.start_addr not in longjmp_addrs:
 +        return body, 0
 +    out, frames = [], 0
 +    for line in body:
 +        for s_ea in setjmp_addrs:
 +            call = f"{prefix}func_{s_ea:08X}(ctx);"
-+            if call in line:
-+                line = line.replace(call, f"PPU_SJLJ_SETJMP(ctx, _sjf{frames}, {prefix}func_{s_ea:08X});")
++            while call in line:
++                line = line.replace(call, f"PPU_SJLJ_SETJMP(ctx, _sjf[{frames}], {prefix}func_{s_ea:08X});", 1)
 +                frames += 1
 +        if func.start_addr in longjmp_addrs and line.strip() == "return;":
 +            line = line.replace("return;", "ppu_sjlj_longjmp(ctx, _sjbuf); return;")
 +        out.append(line)
 +    if frames:
 +        out = [sjlj_leave_returns(line, frames) for line in out]
-+    head = [f"ppu_sjlj_frame _sjf{k} = {{}};" for k in range(frames)]
++    head = [f"ppu_sjlj_frame _sjf[{frames}] = {{}};"] if frames else []
 +    if func.start_addr in longjmp_addrs:
 +        head.append("const uint32_t _sjbuf = (uint32_t)ctx->gpr[3];")
 +    return head + out, frames
@@ -220,13 +265,19 @@ unknown and returned buffers, a re-armed call site).
 +    """Every `return;` of a function holding setjmp frames drops them first."""
 +    if not frames:
 +        return line
-+    return _RETURN_RE.sub(f"{{ ppu_sjlj_leave(&_sjf0, &_sjf{frames - 1}); return; }}", line)
++    return _RETURN_RE.sub(f"{{ ppu_sjlj_leave(_sjf, {frames}); return; }}", line)
++
++
++def sjlj_unrewritten_longjmps(lifter):
++    """--longjmp addresses that no lifted function starts at (so got no rewrite)."""
++    starts = {f.start_addr for f in lifter.functions}
++    return sorted(a for a in getattr(lifter, "longjmp_addrs", ()) if a not in starts)
 +
 +
  def load_insn_patches(path: str) -> dict[int, tuple[int, int, str]]:
      """Read an --insn-patches file:
  
-@@ -1064,6 +1105,9 @@
+@@ -1064,6 +1117,9 @@
              prefix += "_"
          self.prefix = prefix
          self.weak_emit = bool(weak_emit)
@@ -236,7 +287,7 @@ unknown and returned buffers, a re-armed call site).
          # Cache for _range_insns: (instructions, len, ordered, addrs). Keyed by
          # the instruction-list identity so the FULL list (mid-function / serial
          # lift) is sorted+indexed once, not rescanned per call.
-@@ -3993,6 +4037,9 @@
+@@ -3993,6 +4049,9 @@
                                              self.prefix + "function_table")
                      if self.prefix else HEADER_PREAMBLE)
          lines = [preamble]
@@ -246,7 +297,7 @@ unknown and returned buffers, a re-armed call site).
          # Forward declarations
          for func in self.functions:
              lines.append(f"void {func.name}(ppu_context* ctx);")
-@@ -4178,7 +4225,10 @@
+@@ -4178,7 +4237,10 @@
                        f"extern int {g};", "#endif"]
          lines.append(f"void {weak}{func.name}(ppu_context* ctx) {{")
          lines.append("    PPU_MM_SNAP")
@@ -258,7 +309,7 @@ unknown and returned buffers, a re-armed call site).
              lines.append(f"    {bline}" if not bline.endswith(":") else bline)
  
          # If a function doesn't end with blr/b/bctr (a return or unconditional
-@@ -4207,11 +4257,14 @@
+@@ -4207,11 +4269,14 @@
                      if nxt.start_addr == func.fallthrough_to:
                          target = nxt.name
              if target:
@@ -275,7 +326,7 @@ unknown and returned buffers, a re-armed call site).
  
          lines.append("}")
          lines.append("")
-@@ -5102,6 +5155,15 @@
+@@ -5102,6 +5167,15 @@
                               "is emitted as `if (guard) {new} else {orig}`, guard "
                               "being an int the port defines. The input must hold "
                               "`orig` at `addr` or the lift stops.")
@@ -291,7 +342,7 @@ unknown and returned buffers, a re-armed call site).
      args = parser.parse_args()
  
      # Load firmware-import stubs (addr -> NID) up front; applied to func_bounds
-@@ -5558,6 +5620,11 @@
+@@ -5558,6 +5632,11 @@
      lifter.hle_stub_nids = hle_stubs
      lifter.function_entries = _func_entries
      lifter.jump_tables = jt_dispatchers
@@ -303,9 +354,20 @@ unknown and returned buffers, a re-armed call site).
      if args.insn_patches:
          lifter.insn_patches = load_insn_patches(args.insn_patches)
          print(f"  insn-patches: {len(lifter.insn_patches)} from {args.insn_patches}")
+@@ -5618,6 +5697,10 @@
+             sys.exit("[ppu_lifter] insn patches at no lifted instruction: " +
+                      ", ".join(f"0x{a:08X}" for a in missing))
+ 
++    for a in sjlj_unrewritten_longjmps(lifter):
++        print(f"  WARNING: --longjmp 0x{a:08X} is not the start of a lifted function; "
++              f"it was not rewritten and a guest longjmp there will not unwind", flush=True)
++
+     os.makedirs(args.output, exist_ok=True)
+ 
+     header_path = os.path.join(args.output, args.header_name)
 --- /dev/null
 +++ b/tools/test_ppu_sjlj.py
-@@ -0,0 +1,187 @@
+@@ -0,0 +1,222 @@
 +#!/usr/bin/env python3
 +"""Guest setjmp/longjmp across lifted host frames (runtime/ppu/ppu_sjlj.h).
 +
@@ -336,7 +398,7 @@ unknown and returned buffers, a re-armed call site).
 +
 +ROOT = Path(__file__).resolve().parents[1]
 +sys.path.insert(0, str(ROOT / 'tools'))
-+from ppu_lifter import _sjlj_rewrite  # noqa: E402
++from ppu_lifter import _sjlj_rewrite, sjlj_unrewritten_longjmps  # noqa: E402
 +
 +FAILS = []
 +
@@ -359,20 +421,25 @@ unknown and returned buffers, a re-armed call site).
 +            'return;']
 +    body.insert(3, '{ g_trampoline_fn = (void(*)(void*))func_00001000; return; }')
 +    out, n = _sjlj_rewrite(F(0x00A46FB4), body, '', {0x00BDCF2C}, {0x00BDD050})
-+    check('two frames declared first, zeroed',
-+          n == 2 and out[:2] == ['ppu_sjlj_frame _sjf0 = {};', 'ppu_sjlj_frame _sjf1 = {};'])
++    check('one zeroed frame array declared first', n == 2 and out[0] == 'ppu_sjlj_frame _sjf[2] = {};')
 +    check('setjmp calls bracketed',
-+          'PPU_SJLJ_SETJMP(ctx, _sjf0, func_00BDCF2C);' in out[2] and
-+          'PPU_SJLJ_SETJMP(ctx, _sjf1, func_00BDCF2C);' in out[4])
++          'PPU_SJLJ_SETJMP(ctx, _sjf[0], func_00BDCF2C);' in out[1] and
++          'PPU_SJLJ_SETJMP(ctx, _sjf[1], func_00BDCF2C);' in out[3])
 +    check('every return drops the frames first',
-+          out[-1] == '{ ppu_sjlj_leave(&_sjf0, &_sjf1); return; }' and
-+          'ppu_sjlj_leave(&_sjf0, &_sjf1); return; }' in out[5])
++          out[-1] == '{ ppu_sjlj_leave(_sjf, 2); return; }' and
++          'ppu_sjlj_leave(_sjf, 2); return; }' in out[4])
 +    lj, n = _sjlj_rewrite(F(0x00BDD050), ['ctx->gpr[1] = vm_read64(ctx->gpr[3] + 0x0);', 'return;'],
 +                          '', {0x00BDCF2C}, {0x00BDD050})
 +    check('longjmp records its buffer on entry', lj[0] == 'const uint32_t _sjbuf = (uint32_t)ctx->gpr[3];')
 +    check('longjmp ends in ppu_sjlj_longjmp', lj[-1] == 'ppu_sjlj_longjmp(ctx, _sjbuf); return;')
 +    same = ['func_00001000(ctx);', 'return;']
 +    check('other functions untouched', _sjlj_rewrite(F(0x2000), same, '', set(), {0x00BDD050}) == (same, 0))
++
++    class L:
++        functions = [F(0x00BDD050)]
++        longjmp_addrs = {0x00BDD050, 0x00BDE000}
++    check('a --longjmp address no function starts at is reported',
++          sjlj_unrewritten_longjmps(L()) == [0x00BDE000])
 +
 +
 +HARNESS = r'''
@@ -408,27 +475,55 @@ unknown and returned buffers, a re-armed call site).
 +__attribute__((noinline)) static void deep1(ppu_context* ctx) { deep2(ctx); after_longjmp = 2; }
 +/* as the lifter emits them: every return drops the function's frames */
 +__attribute__((noinline)) static int caller(ppu_context* ctx) {
-+    ppu_sjlj_frame _sjf0 = {};
++    ppu_sjlj_frame _sjf[1] = {};
 +    ctx->gpr[3] = 0x1000;
-+    PPU_SJLJ_SETJMP(ctx, _sjf0, guest_setjmp);
-+    if (ctx->gpr[3] == 0) { deep1(ctx); { ppu_sjlj_leave(&_sjf0, &_sjf0); return -1; } }
-+    { ppu_sjlj_leave(&_sjf0, &_sjf0); return (int)ctx->gpr[3]; }
++    PPU_SJLJ_SETJMP(ctx, _sjf[0], guest_setjmp);
++    if (ctx->gpr[3] == 0) { deep1(ctx); { ppu_sjlj_leave(_sjf, 1); return -1; } }
++    { ppu_sjlj_leave(_sjf, 1); return (int)ctx->gpr[3]; }
 +}
 +__attribute__((noinline)) static void sets_and_returns(ppu_context* ctx) {
-+    ppu_sjlj_frame _sjf0 = {};
++    ppu_sjlj_frame _sjf[1] = {};
 +    ctx->gpr[3] = 0x2000;
-+    PPU_SJLJ_SETJMP(ctx, _sjf0, guest_setjmp);
-+    { ppu_sjlj_leave(&_sjf0, &_sjf0); return; }
++    PPU_SJLJ_SETJMP(ctx, _sjf[0], guest_setjmp);
++    { ppu_sjlj_leave(_sjf, 1); return; }
++}
++/* The review's case: sites A (0x100) and B (0x200) in one function, a longjmp
++ * to A drops B, B is reached again, then a longjmp to the CALLER's buffer
++ * (0x300) must still land in the caller. */
++static volatile int ab_stage = 0;
++__attribute__((noinline)) static void two_sites(ppu_context* ctx) {
++    ppu_sjlj_frame _sjf[2] = {};
++    ctx->gpr[3] = 0x100;
++    PPU_SJLJ_SETJMP(ctx, _sjf[0], guest_setjmp);                    /* site A */
++    if (ctx->gpr[3] == 0) {
++        ctx->gpr[3] = 0x200;
++        PPU_SJLJ_SETJMP(ctx, _sjf[1], guest_setjmp);                /* site B */
++        ctx->gpr[3] = 0x100; ctx->gpr[4] = 1; guest_longjmp(ctx);  /* to A: drops B */
++    }
++    ab_stage = 1;
++    ctx->gpr[3] = 0x200;
++    PPU_SJLJ_SETJMP(ctx, _sjf[1], guest_setjmp);                    /* B again */
++    ab_stage = 2;
++    ctx->gpr[3] = 0x300; ctx->gpr[4] = 9; guest_longjmp(ctx);      /* to the caller */
++    ab_stage = 3;                                                   /* must not run */
++    { ppu_sjlj_leave(_sjf, 2); return; }
++}
++__attribute__((noinline)) static int ab_caller(ppu_context* ctx) {
++    ppu_sjlj_frame _sjf[1] = {};
++    ctx->gpr[3] = 0x300;
++    PPU_SJLJ_SETJMP(ctx, _sjf[0], guest_setjmp);
++    if (ctx->gpr[3] == 0) { two_sites(ctx); { ppu_sjlj_leave(_sjf, 1); return -1; } }
++    { ppu_sjlj_leave(_sjf, 1); return (int)ctx->gpr[3]; }
 +}
 +__attribute__((noinline)) static int loops(ppu_context* ctx) {
-+    ppu_sjlj_frame _sjf0 = {};
++    ppu_sjlj_frame _sjf[1] = {};
 +    volatile int laps = 0;   /* a local changed after setjmp must be volatile (lifted code keeps its state in ctx) */
 +again:
 +    ctx->gpr[3] = 0x4000;
-+    PPU_SJLJ_SETJMP(ctx, _sjf0, guest_setjmp);
++    PPU_SJLJ_SETJMP(ctx, _sjf[0], guest_setjmp);
 +    if (++laps < 3) goto again;                 /* the same call site, three times */
 +    if (ctx->gpr[3] == 0) { ctx->gpr[3] = 0x4000; ctx->gpr[4] = 5; guest_longjmp(ctx); }
-+    { ppu_sjlj_leave(&_sjf0, &_sjf0); return (int)ctx->gpr[3] * 100 + laps; }
++    { ppu_sjlj_leave(_sjf, 1); return (int)ctx->gpr[3] * 100 + laps; }
 +}
 +int main() {
 +    ppu_context c = {}; c.thread_id = 9;
@@ -448,6 +543,8 @@ unknown and returned buffers, a re-armed call site).
 +    CHECK(true, "longjmp to a returned frame's buffer returns instead");
 +    int l = loops(&c);
 +    CHECK(l == 504, "a setjmp call site re-armed in a loop is one frame, and lands once more");
++    int ab = ab_caller(&c);
++    CHECK(ab == 9 && ab_stage == 2, "after a longjmp to A drops B and B is re-armed, a longjmp to the caller still lands");
 +    printf("%%s (%%d failed)\n", fails ? "FAIL" : "PASS", fails);
 +    return fails ? 1 : 0;
 +}
