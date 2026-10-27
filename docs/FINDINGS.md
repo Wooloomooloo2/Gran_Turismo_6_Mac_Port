@@ -27,6 +27,16 @@ Full suite with the real disc and all updates (re-run after the final review fix
 - `gt6unpack verify ~/Gran\ Turismo\ 6/build/BCES01977-v1.22 --manifest manifests/BCES01977-v1.22.json`: `16568 files checked: 0 mismatched, 0 missing, 0 extra` (now also checks the tree's PARAM.SFO is BCES01977 01.22).
 - `scripts/check_no_game_files.py $(git ls-files)`: clean.
 
+## Bring-up log (milestone 2)
+
+One row per bring-up round, newest first. Runs are `scripts/boot_game.py` on a fresh play
+folder (`prepare_play.py --force`) unless the row says otherwise; run folders are under
+`<tree>/runs/`.
+
+| Round | What stopped it | Root cause | Fix | Outcome after |
+|---|---|---|---|---|
+| 1 (run 20261027-183727, Task 5 smoke) | SIGBUS after 0.2 s, last key `hle:cellSysutilRegisterCallback`; the first anomaly is earlier: `unresolved indirect call -> 0x00A8DFF0` from func_00FD7724, then 7 more into 0x00A8Dxxx | GT6's memset (func_00A8DE98) enters its unrolled `stb`/`std` runs with `lis/addi rC; subf rC,rOff,rC; mtctr; bctr` (the run's end minus the length). The lifter only knew the additive form, so all three bctrs lifted to unresolved indirect calls and short memsets stored nothing (static constructors left objects unzeroed) | patch 0002: `_const_base_targets` accepts `subf`, landing sites from the base back to the dispatching bctr; test `test_const_base_subtracted` | run 20261027-184429: memset calls resolve; still SIGBUS (1.6 s), same last key; 12 unresolved indirect calls left, other addresses |
+
 ## What the 1.22 EBOOT leaves on disk, and how EMAIN is launched (2026-10-27)
 
 **Verdict: EMAIN needs what the EBOOT changes.** The EBOOT rewrites 6 small files in the
