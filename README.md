@@ -35,9 +35,19 @@ Online play is out of scope (Sony shut the servers down in 2018).
 
 ## Guard against game files
 
-`scripts/check_no_game_files.py` refuses any file that looks like PS3 game content. Run
-`scripts/install_hooks.sh` once after cloning to install it as a pre-commit hook; CI runs it
-on every push.
+`scripts/check_no_game_files.py` refuses a file when any of these is true:
+
+- it is larger than 50 MB;
+- it starts with a PS3 file signature: SCE container (SELF, SPRX), PKG, firmware PUP,
+  PARAM.SFO, EDAT/SDAT, trophy file (TRP), or a PS3 PPU or SPU ELF;
+- its SHA-256 is listed in a manifest under `manifests/` (the hashes of every file of a
+  built v1.22 game folder). This catches game files that carry no signature at all, which is
+  most of them.
+
+It cannot recognise game files from other versions or editions that have no signature, so
+`gt6unpack build` also refuses to write its output inside a git work tree. Run
+`scripts/install_hooks.sh` once after cloning to install the check as a pre-commit hook; CI
+runs it on every push.
 
 ## Credits
 
