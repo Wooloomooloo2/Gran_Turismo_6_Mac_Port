@@ -1,0 +1,11 @@
+name: no-game-files
+on:
+  push:
+  pull_request:
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Block PS3 game files
+        run: git ls-files -z | xargs -0 python3 scripts/check_no_game_files.py
