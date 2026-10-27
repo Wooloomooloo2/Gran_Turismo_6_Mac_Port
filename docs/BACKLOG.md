@@ -9,8 +9,8 @@ Shortcuts taken, with the proper fix logged. Priority order: 1) Stability, 2) Pe
   their code is decoded as instructions (FINDINGS, "Translating EMAIN"). The three programs then
   run fully interpreted. Proper fix: a code end per image (as D25 does for the PPU), or the
   data ranges found by disassembly, passed to the lifter; then drop them from the partial list.
-- Reproduce the 1.22 EBOOT's rewrite of `TPPS-01.07/update.txt` and the `TPPS-01.07` to `01.11` `PDIPFS/UPDATENODEINFO` files before EMAIN first runs (D31). Without it EMAIN skips the 1.07 data patch. Four of the five node-info files are copies of `USRDIR/UPDATENODEINFO/UPDATENODEINFO.01xx`; the 1.09 one changes one entry by a rule not yet decoded from the EBOOT's 0x1143c. Proper fix: decode 0x1143c and add it as a post-install step to `gt6unpack build`, with tests, and refresh the manifest.
-- EMAIN's first run installs the staged `TPPS-*` data into `USRDIR/PDIPFS` (more than 5 minutes under RPCS3), so the tree stops matching the v1.22 manifest after the first launch. `gt6unpack verify` needs a post-install mode, or the port must run on a copy of the verified tree. An install that is cut off part-way must be resumed safely: check that EMAIN resumes it.
+- `scripts/prepare_play.py` does not reproduce the EBOOT's `K/4D` comparison before each node-info merge (0x161ac, 0x32b88); it only checks that `K/4D` exists. It is exact for v1.22 (hash-checked against the real EBOOT's output), but decode the check before using the script on any other edition or version.
+- EMAIN's first run installs the staged `TPPS-*` data into `USRDIR/PDIPFS` (more than 5 minutes under RPCS3). It runs in the play folder (D32), but check that a cut-off install resumes safely, and decide what the player's app does when the play folder is stale.
 
 ## 2) Performance
 
@@ -38,7 +38,7 @@ Shortcuts taken, with the proper fix logged. Priority order: 1) Stability, 2) Pe
 
 ## Milestone 2 open questions
 
-- Answered: the 1.22 launcher's data-patch step rewrites 6 files that EMAIN needs (FINDINGS, "What the 1.22 EBOOT leaves on disk"; D31). Still open: how to reproduce them (see 1) Stability).
+- Answered: the 1.22 launcher's data-patch step rewrites 6 files that EMAIN needs (FINDINGS, "What the 1.22 EBOOT leaves on disk"; D31). Reproduced by `scripts/prepare_play.py` (D32).
 - GT.VOL may hold more helper-chip (SPU) code that the game loads while running. Unknown.
 - 217 imported functions in EMAIN are missing from ps3recomp's name list. RPCS3 names all but 5, so feed the names back to ps3recomp upstream.
 

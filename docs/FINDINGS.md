@@ -34,6 +34,14 @@ Full suite with the real disc and all updates (re-run after the final review fix
 to decide which update data it installs. Started without them, EMAIN skips the 1.07 data
 patch (971 MB) completely.
 
+**Reproduced exactly.** `scripts/prepare_play.py <tree>` clones `<tree>/dev_hdd0` to
+`<tree>/play/dev_hdd0` (APFS clone, 2.6 s, no extra space) and applies the EBOOT's changes
+there, using the rule decoded from 0x1143c (below). The resulting `play/dev_hdd0/game/BCES01977`
+is byte-identical to the folder the real EBOOT left under RPCS3: `eboot_effects.py diff` of
+the two snapshots shows nothing added, removed or changed (21,653 entries). The SHA-256 of the
+6 files are pinned in `tests/scripts/test_prepare_play.py`, which checks them when `GT6_TREE`
+is set. The port runs on the play folder; the verified tree is never run (D32).
+
 Measured with RPCS3 0.0.43-20410 (official build, firmware 4.50) on an APFS clone (`cp -c -R`)
 of the verified `dev_hdd0/game/BCES01977`, installed as RPCS3's `dev_hdd0/game/BCES01977`,
 with `games.yml` pointing BCES01977's disc at the built `dev_bdvd`. `sys_fs` and `sys_process`
@@ -63,11 +71,42 @@ the order is from the log):
    - For 01.07, 01.08, 01.10 and 01.11 the result is byte-identical to
      `UPDATENODEINFO.01xx`. For 01.09 it differs from `UPDATENODEINFO.0109` in one entry
      (line 440 of 581): its last column is the entry's own size (column 2) instead of the value
-     in `.0109`. The rule behind that one change is not decoded (it is in 0x1143c).
+     in `.0109`. The decoded rule below explains it.
    - `TPPS-01.12` to `01.22` are read (`UPDATENODEINFO` and `K/4D`) but not changed. There is
      no `UPDATENODEINFO.0112` or later, and their `update.txt` already reads `99.98 99.99`.
 3. Nothing else: no `FIXEDELF114` swap (as predicted below), and no change outside
    `TPPS-01.07` to `TPPS-01.11`. On a second boot the EBOOT changes nothing.
+
+**The node-info rule** (decoded from 0x1143c and its helpers, in `prepare_play.py`):
+
+- A version `TPPS-MM.mm` is processed when `TPPS-MM.mm/PDIPFS/UPDATENODEINFO`,
+  `TPPS-MM.mm/PDIPFS/K/4D` and `USRDIR/UPDATENODEINFO/UPDATENODEINFO.MMmm` exist and the two
+  node-info files have the same number of entries (0x11b00).
+  - The EBOOT also reads `K/4D` and compares something from it before the merge (0x161ac,
+    0x32b88). That check is not decoded. It passed for all five versions, and
+    `prepare.json` notes it.
+- An entry is `id size type ref hash flag size7 size8`. It is written with
+  `%06d %010llu %1d %06d %s %1d %010llu %010llu` (va 0x3ed28), the hash as 16 bytes of `%02x`.
+  A 7-column entry's missing `size8` equals `size7`.
+- The merge walks the TPPS entries in order while it is still checking:
+  - The `.MMmm` entry with the same id replaces the TPPS entry.
+  - The EBOOT stats the main `USRDIR/PDIPFS/<name>`. If that file exists and its size equals
+    the entry's `size` or `size8`, it is already installed and the entry is dropped.
+  - Checking stops once 6 entries have been kept (0x11fe0). Every later entry stays as the
+    TPPS copy.
+  - That is why 1.09's entry 440 keeps `size8 = size7`. The other 4 versions have no entry
+    whose `size8` differs, and none of the 30 checked entries was dropped.
+- `<name>` comes from the node id (0x169a4).
+  - Each id range has a prefix, a Galois-field polynomial and a digit count: below 0x400 `K`,
+    0x499, 10 bits, 2 digits; then `5`, 0x8891, 15, 3; `9`, 0x111889, 20, 4; `W`, 0x2242211,
+    25, 5; `4`, 0x88891111, 31, 6.
+  - The id minus the range start is shifted left once per bit, XOR-ing the polynomial each
+    time the top bit appears (0x1659c).
+  - The result is written in base 36 over the alphabet `K59W4S6H7DOVJPERUQMT8BAIC2YLG30Z1FNX`
+    (va 0x3d110), most significant digit first, with a `/` before each pair of digits
+    (0x168b0).
+  - So 1 gives `K/4D`, and 42258 to 42263 give the 6 names the EBOOT stats for 1.09
+    (`9/JF/OC` ... `9/QD/OS`).
 
 **What EMAIN does with them.** On its first run EMAIN installs the staged update data itself.
 It stats `USRDIR/update.txt`, lists `USRDIR`, then reads every `TPPS-01.xx/update.txt` and
@@ -90,12 +129,14 @@ than 5 minutes under RPCS3.
   files was not measured.
 - EMAIN deletes staged files with a path that has **no leading slash**
   (`dev_hdd0/game/BCES01977/USRDIR/TPPS-01.xx/PDIPFS/...`, 6,933 `sys_fs_unlink` calls in
-  run 2). RPCS3 accepts it and the files go. The port's file layer must accept it too.
+  run 2). RPCS3 accepts it and the files go. **The port's file layer must accept it too
+  (Task 6):** map `dev_hdd0/...` like `/dev_hdd0/...`.
 - EMAIN holds the same strings (`TPPS-%02d.%02d`, `UPDATENODEINFO`, `update.txt`) and the
   `PDIPFSStoragePatchHddGame` / `PDIPFSPatchInstaller` classes. The installer is EMAIN's own
   code, so the port runs it natively; only the EBOOT's prior rewrite is missing.
-- **The install changes the game folder.** After the first launch the tree no longer matches
-  `manifests/BCES01977-v1.22.json` (`gt6unpack verify` will report the moved files).
+- **The install changes the game folder.** That is why the port runs on `<tree>/play` (D32).
+  After the first launch the play folder no longer matches `manifests/BCES01977-v1.22.json`.
+  The verified tree still does. `prepare_play.py --force` makes a fresh play folder.
 
 **The launch contract** (run 1; RPCS3 lines quoted from `sys_process`, which logs the
 arguments `_sys_process_exit2` receives):

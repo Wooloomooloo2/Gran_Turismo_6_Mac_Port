@@ -109,3 +109,18 @@ def test_real_port_builds():
     p = subprocess.run([str(exe)], capture_output=True, text=True, timeout=30)
     assert p.returncode != 0
     assert "usage:" in (p.stdout + p.stderr)
+    # /dev_hdd0 defaults to the play folder (D32), and a missing one stops the start.
+    assert f'"{tree}/play/dev_hdd0"' in (build / "port" / "gt6_paths.h").read_text()
+    env = dict(os.environ, PS3_HDD0_ROOT=str(tree / "no-such-play" / "dev_hdd0"))
+    p = subprocess.run([str(exe), "unused.elf"], capture_output=True, text=True, timeout=30,
+                       env=env)
+    assert p.returncode != 0
+    assert "scripts/prepare_play.py" in (p.stdout + p.stderr)
+
+
+def test_port_runs_on_the_play_folder():
+    """The port's /dev_hdd0 is <tree>/play/dev_hdd0, never the verified tree (D31, D32)."""
+    cmake = (REPO / "port" / "CMakeLists.txt").read_text()
+    assert 'gt6_c_string(GT6_DEFAULT_HDD0_ROOT "${GT6_TREE}/play/dev_hdd0")' in cmake
+    main = (REPO / "port" / "main.cpp").read_text()
+    assert "run scripts/prepare_play.py first" in main

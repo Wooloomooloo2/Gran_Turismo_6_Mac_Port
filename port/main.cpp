@@ -7,8 +7,9 @@
  *
  * The GT6 runner: gt6 <path to EMAIN.SELF.elf>. Changes from the template, and nothing
  * else: the usage line and banner, the window title, and the VFS roots (the disc tree and
- * /dev_hdd0 default to the gt6unpack tree this build was configured for, gt6_paths.h;
- * PS3_VFS_ROOT and PS3_HDD0_ROOT override). The template's Windows and Linux paths are kept
+ * /dev_hdd0 default to the gt6unpack tree this build was configured for, gt6_paths.h, with
+ * /dev_hdd0 on its play folder; PS3_VFS_ROOT and PS3_HDD0_ROOT override; a missing /dev_hdd0
+ * folder stops the start). The template's Windows and Linux paths are kept
  * so the file stays diffable against the template; the port builds on macOS arm64 only.
  *
  * Template header follows.
@@ -56,6 +57,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>   /* stat: the /dev_hdd0 folder check, see configure_vfs_roots */
 
 #ifndef _WIN32
 #include <sys/mman.h>   /* mmap: the guest arena, see alloc_guest_vm */
@@ -284,10 +286,14 @@ static DWORD WINAPI frame_clock(LPVOID)
  * $PS3_HDD0_ROOT override. Both are also published in the environment, because the two
  * file layers read them there: ppu_fs.cpp takes PS3_HDD0_ROOT on first use, and cellFs.c
  * seeds its /dev_bdvd mapping from PS3_VFS_ROOT (third_party/ps3recomp/docs/CELLFS_VFS_ROOT.md).
- * This runs before anything touches either layer. */
+ * This runs before anything touches either layer.
+ *
+ * /dev_hdd0 defaults to <tree>/play/dev_hdd0, a clone of the verified tree carrying the 1.22
+ * EBOOT's on-disk effects, made by scripts/prepare_play.py (D31, D32). The verified tree is
+ * never run: EMAIN's first run changes thousands of files there. */
 static char s_hdd0_mapping[1024];
 
-static void configure_vfs_roots(void)
+static bool configure_vfs_roots(void)
 {
     const char* bdvd = getenv("PS3_VFS_ROOT");
     if (!bdvd || !*bdvd) { setenv("PS3_VFS_ROOT", GT6_DEFAULT_VFS_ROOT, 1); bdvd = getenv("PS3_VFS_ROOT"); }
@@ -295,8 +301,15 @@ static void configure_vfs_roots(void)
 
     const char* hdd0 = getenv("PS3_HDD0_ROOT");
     if (!hdd0 || !*hdd0) { setenv("PS3_HDD0_ROOT", GT6_DEFAULT_HDD0_ROOT, 1); hdd0 = getenv("PS3_HDD0_ROOT"); }
+    struct stat st;
+    if (stat(hdd0, &st) != 0 || !(st.st_mode & S_IFDIR)) {
+        fprintf(stderr, "ERROR: no /dev_hdd0 folder at %s: run scripts/prepare_play.py first "
+                        "(it makes <tree>/play from the verified tree)\n", hdd0);
+        return false;
+    }
     snprintf(s_hdd0_mapping, sizeof s_hdd0_mapping, "%s/", hdd0);
     cellfs_add_path_mapping("/dev_hdd0/", s_hdd0_mapping);
+    return true;
 }
 
 /* ---------------------------------------------------------------------------
@@ -431,7 +444,8 @@ int main(int argc, char** argv)
 
     printf("=== Gran Turismo 6 (ps3recomp runner) ===\n");
 
-    configure_vfs_roots();
+    if (!configure_vfs_roots())
+        return 1;
 
     if (!alloc_guest_vm()) {
         fprintf(stderr, "ERROR: could not allocate the guest address space\n");
