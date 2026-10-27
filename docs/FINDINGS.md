@@ -1,5 +1,21 @@
 # Findings
 
+## Owner summary: milestone 2 (2026-10-27)
+
+**The game now starts on the Mac and reaches its first screen update, but the one picture we
+captured is solid black, so "draws something" is not yet shown.** It ran on 2 fresh play
+folders (and again after the fixes: runs 20261027-202305, 20261027-202348, 20261027-203953),
+with no crash, for about 5 seconds each time, and then the test harness stopped it.
+
+| Question | Answer |
+|---|---|
+| Does it start and run? | Yes. The translated program boots, loads its data and presents its first frame (`first_frame`) on every fresh run after round 8's fix. Eight bring-up rounds, nine patches to the runtime we borrow (listed in the bring-up log). |
+| Does it draw something? | Not shown yet. The first dumped frame is solid black. GT6 is running its first-run data install at that moment (more than 5 minutes under RPCS3), and a black frame cannot tell "cleared to black" from "nothing drawn". The next step is to compare against an RPCS3 capture of the same moment. |
+| Biggest risk | Three calls that let the game run helper "fibers" are not implemented and pretend to succeed. They are the likely next blocker; the install cannot finish without them. 12 imports in all are faked this way (backlog). |
+| What milestone 3 needs | Your go-ahead. It starts with the RPCS3 comparison, then the fiber calls, and aims at the first menu. |
+
+One smaller risk: the disc has not yet been checked against an independent source (backlog).
+
 ## Owner summary: milestone 1 (2026-10-27)
 
 **Milestone 1 is done.** Your copy of the game now turns into a verified version 1.22 game
@@ -16,7 +32,15 @@ One smaller risk: the disc has not yet been checked against an independent sourc
 
 Measurements and facts, newest first within each section.
 
-### Test run
+### Test run, milestone 2 handover
+
+- `ctest --test-dir build`: 2/2 passed (also with `GT6_TREE` set; the two ctest cases do not use it).
+- `.venv/bin/python -m pytest tests -q`: `153 passed, 5 skipped` (the skips need the game folder).
+- Same with `GT6_TREE="~/Gran Turismo 6/build/BCES01977-v1.22"`: `158 passed`, 0 skipped.
+- C++ integration cases (`GT6_DISC_DIR`, `GT6_UPDATES_DIR`) were not re-run: milestone 2 changed no C++ unpacker code (last full run above: 71/71).
+- `scripts/check_no_game_files.py $(git ls-files)`: clean.
+
+### Test run, milestone 1
 
 Full suite with the real disc and all updates (re-run after the final review fixes):
 

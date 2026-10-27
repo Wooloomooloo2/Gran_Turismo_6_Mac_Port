@@ -21,7 +21,7 @@ The owner makes every product and architecture decision.
 ## What this repo is
 
 A native Apple Silicon port of Gran Turismo 6 (PS3) by static recompilation, not emulation.
-GitHub: https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac (public). Licence GPL-2.0-or-later,
+GitHub: https://github.com/Wooloomooloo2/Gran_Turismo_6_Mac_Port (public). Licence GPL-2.0-or-later,
 except `tools/gt6unpack/` (GPL-2.0-only: it holds RPCS3-derived code, D24).
 
 ## Decisions already made (don't re-litigate)
@@ -42,21 +42,26 @@ source (D15). Anything that would change one goes to the owner with evidence.
 
 ## State as of 2026-10-27
 
-Milestone 1 is done on branch `m1/unpack` (not pushed). `gt6unpack build` makes a verified
-v1.22 tree at `~/Gran Turismo 6/build/BCES01977-v1.22`; `scripts/map_game.py` maps the code
-(about 72k functions, 740 imports, 4 SPU programs plus 57 SPURS job modules in EMAIN).
-Full suite with real data (set `GT6_DISC_DIR` to the mounted ISO and `GT6_UPDATES_DIR`): 71
-C++ cases, 0 skipped, and 37 Python tests. Without the data the 4 integration cases are
-reported as skipped by doctest (a ctest check enforces this), so "0 skipped" means they ran.
-Facts in `docs/FINDINGS.md`; decisions D1-D24.
+Milestone 1 (unpack and map) is done on `m1/unpack`; milestone 2 is done on `m2/first-frame`
+(neither pushed). `gt6unpack build` makes a verified v1.22 tree at
+`~/Gran Turismo 6/build/BCES01977-v1.22` (`$GT6_TREE`). Milestone 2 adds, all dev-only:
+`scripts/translate_game.py` (translation into `$GT6_TREE/recomp`), `scripts/prepare_play.py`
+(play folder `$GT6_TREE/play`), the port (`port/`, `-DGT6_BUILD_PORT=ON -DGT6_TREE=...`, binary
+`$GT6_TREE/port-build/port/gt6`) and `scripts/boot_game.py` (runs in `$GT6_TREE/runs/`). The
+README section "Translate and boot" has the commands. ps3recomp changes are patches 0001-0009 in
+`patches/ps3recomp/` (D28). Outcome: the game reaches `first_frame` on fresh play folders; the
+dumped frame is solid black while GT6 runs its first-run install, and whether that is
+"cleared" or "nothing drawn" is unknown until compared with an RPCS3 capture. Likely next
+blocker: three unimplemented `cellFiberPpuContext*` imports that fake success.
+Dev tools: Homebrew `sdl2 spirv-cross` (D29). Suite: 2 ctest, 158 pytest with `GT6_TREE`
+set (153 + 5 skipped without), 71 C++ cases (4 integration cases need `GT6_DISC_DIR`/`GT6_UPDATES_DIR`).
+Facts in `docs/FINDINGS.md`; decisions D1-D34.
 
 ## Next steps
 
-Milestone 2: the translated program starts and draws something. Plan it first (in
-`.superpowers/sdd/`, local only). Its first questions:
+Milestone 3: reach the first menu. First: (1) capture what RPCS3 shows at the same point and
+compare with our first frame; (2) implement the `cellFiberPpuContext*` calls (BACKLOG, 1) so
+the first-run install can finish; (3) work through the 12 faked imports in `docs/BACKLOG.md`.
+Plan it first (in `.superpowers/sdd/`, local only).
 
-1. The EBOOT data-patch step (PDIPFS/TPPS): what it leaves on disk, and do we reproduce it?
-2. SPURS/SPU strategy: the 57 job modules are raw in EMAIN; job chains and tasks are needed.
-3. Compile time and size of translating 72k functions.
-
-Also see `docs/BACKLOG.md` (milestone 2 open questions and polish list).
+Also see `docs/BACKLOG.md`.
