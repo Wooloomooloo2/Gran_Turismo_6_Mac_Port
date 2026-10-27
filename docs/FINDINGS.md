@@ -27,6 +27,96 @@ Full suite with the real disc and all updates (re-run after the final review fix
 - `gt6unpack verify ~/Gran\ Turismo\ 6/build/BCES01977-v1.22 --manifest manifests/BCES01977-v1.22.json`: `16568 files checked: 0 mismatched, 0 missing, 0 extra` (now also checks the tree's PARAM.SFO is BCES01977 01.22).
 - `scripts/check_no_game_files.py $(git ls-files)`: clean.
 
+## What the 1.22 EBOOT leaves on disk, and how EMAIN is launched (2026-10-27)
+
+**Verdict: EMAIN needs what the EBOOT changes.** The EBOOT rewrites 6 small files in the
+`TPPS-01.07` to `TPPS-01.11` folders. EMAIN's first run reads exactly those files and uses them
+to decide which update data it installs. Started without them, EMAIN skips the 1.07 data
+patch (971 MB) completely.
+
+Measured with RPCS3 0.0.43-20410 (official build, firmware 4.50) on an APFS clone (`cp -c -R`)
+of the verified `dev_hdd0/game/BCES01977`, installed as RPCS3's `dev_hdd0/game/BCES01977`,
+with `games.yml` pointing BCES01977's disc at the built `dev_bdvd`. `sys_fs` and `sys_process`
+were logged at Trace through `--config` (a copy of the owner's config, so `config.yml` was
+never edited). Snapshots and diffs come from `scripts/eboot_effects.py` (SHA-256 of every file,
+plus every folder). Run outputs are in `<tree>/runs/eboot-effects/`. RPCS3's log holds the
+klicensee, so only non-key lines of it are quoted here.
+
+| Run | Boot | Time | Result |
+|---|---|---|---|
+| 1 | `USRDIR/EBOOT.BIN`, pristine clone | EBOOT reached the spawn at 76 s (it compiled PPU caches first); EMAIN ran 150 s more, but its own PPU cache compile took about 108 s, so it executed for about 40 s | the EBOOT's changes (below); EMAIN made no further change in the folder |
+| 2 | `USRDIR/EBOOT.BIN` again, on run 1's result | spawn at 2 s (cached); EMAIN ran 300 s | the EBOOT changed nothing this time; EMAIN began its data install (below) |
+| 3 | `USRDIR/EMAIN.SELF` directly, pristine clone | RPCS3 refused: "Failed to decrypt SELF" (the klicensee only reaches RPCS3 through the EBOOT's spawn) | none |
+| 3b | the decrypted EMAIN ELF, saved as `USRDIR/EMAIN.SELF` in a pristine clone (the port's case) | about 108 s PPU compile, then about 190 s of EMAIN | EMAIN skipped `TPPS-01.07` (below) |
+
+**What the EBOOT changes** (run 1 diff: nothing added, nothing removed, 6 files changed;
+the order is from the log):
+
+1. `USRDIR/TPPS-01.07/update.txt`: `01.06 01.07` becomes `99.98 99.99` (opened write+truncate).
+2. For each of `TPPS-01.07`, `01.08`, `01.09`, `01.10`, `01.11` (the versions that have a
+   `USRDIR/UPDATENODEINFO/UPDATENODEINFO.01xx`): it reads `TPPS-01.xx/PDIPFS/UPDATENODEINFO`,
+   `TPPS-01.xx/PDIPFS/K/4D` and `UPDATENODEINFO.01xx`, checks the size of 6 files in the main
+   `USRDIR/PDIPFS/9/...`, writes `TPPS-01.xx/PDIPFS/UPDATENODEINFO.upd`, deletes
+   `UPDATENODEINFO` and renames the `.upd` over it.
+   - The node-info files are text, one entry per line. The installed `TPPS` copies have 7
+     columns; the `USRDIR/UPDATENODEINFO/*.01xx` copies and the results have 8.
+   - For 01.07, 01.08, 01.10 and 01.11 the result is byte-identical to
+     `UPDATENODEINFO.01xx`. For 01.09 it differs from `UPDATENODEINFO.0109` in one entry
+     (line 440 of 581): its last column is the entry's own size (column 2) instead of the value
+     in `.0109`. The rule behind that one change is not decoded (it is in 0x1143c).
+   - `TPPS-01.12` to `01.22` are read (`UPDATENODEINFO` and `K/4D`) but not changed. There is
+     no `UPDATENODEINFO.0112` or later, and their `update.txt` already reads `99.98 99.99`.
+3. Nothing else: no `FIXEDELF114` swap (as predicted below), and no change outside
+   `TPPS-01.07` to `TPPS-01.11`. On a second boot the EBOOT changes nothing.
+
+**What EMAIN does with them.** On its first run EMAIN installs the staged update data itself.
+It stats `USRDIR/update.txt`, lists `USRDIR`, then reads every `TPPS-01.xx/update.txt` and
+`TPPS-01.xx/PDIPFS/UPDATENODEINFO` in order. It then moves (rename) or patches (bsdiff, with
+`.bsdiff`, `.fdupm` and `.fdupi` temporaries) each staged file into the main `USRDIR/PDIPFS` and
+deletes the staged copy. It also creates `USRDIR/PDIPFS_bdmark/` and RPCS3's per-game
+`dev_hdd1` cache (`/dev_hdd1/pditsm`, `/dev_hdd1/PDIPFS/...`). After 300 s in run 2 it had
+removed 4,396 staged files from `TPPS-01.07` to `01.12` and added 6,972 files under `PDIPFS`
+and `PDIPFS_bdmark`, and was still working inside `TPPS-01.12`. The full install takes longer
+than 5 minutes under RPCS3.
+
+- **With the EBOOT's changes** (run 2), `TPPS-01.07/update.txt` is followed by
+  `TPPS-01.07/PDIPFS/UPDATENODEINFO`, and EMAIN installs 01.07's files.
+- **Without them** (run 3b), EMAIN reads `TPPS-01.07/update.txt` (`01.06 01.07`), never opens
+  `TPPS-01.07/PDIPFS/UPDATENODEINFO`, and goes straight to `TPPS-01.08`. The first 309
+  file-system calls of both runs are identical; this is where they part.
+- So `update.txt` reads as "from to": `01.06 01.07` is a step that needs 1.06 data, and
+  `99.98 99.99` marks a step that always applies. The node-info rewrite feeds the same
+  install; whether EMAIN would install `TPPS-01.08` to `01.11` correctly from the old 7-column
+  files was not measured.
+- EMAIN deletes staged files with a path that has **no leading slash**
+  (`dev_hdd0/game/BCES01977/USRDIR/TPPS-01.xx/PDIPFS/...`, 6,933 `sys_fs_unlink` calls in
+  run 2). RPCS3 accepts it and the files go. The port's file layer must accept it too.
+- EMAIN holds the same strings (`TPPS-%02d.%02d`, `UPDATENODEINFO`, `update.txt`) and the
+  `PDIPFSStoragePatchHddGame` / `PDIPFSPatchInstaller` classes. The installer is EMAIN's own
+  code, so the port runs it natively; only the EBOOT's prior rewrite is missing.
+- **The install changes the game folder.** After the first launch the tree no longer matches
+  `manifests/BCES01977-v1.22.json` (`gt6unpack verify` will report the moved files).
+
+**The launch contract** (run 1; RPCS3 lines quoted from `sys_process`, which logs the
+arguments `_sys_process_exit2` receives):
+
+- The EBOOT spawns through `sceNpDrmProcessExitSpawn2` (the DRM branch, not
+  `sys_game_process_exitspawn2`), with `path` = the static buffer at 0x52a10, a non-null
+  `argv`, `envp` = NULL, no data block (`data_size` 0), `prio` 1001 and `flags` 0x40.
+- Process path: `/dev_hdd0/game/BCES01977/USRDIR/EMAIN.SELF` (RPCS3: `Process finished ->
+  /dev_hdd0/game/BCES01977/USRDIR/EMAIN.SELF`, then the same `Elf path` for the new boot).
+- **argv** (argc = 2): `argv[0]` = `/dev_hdd0/game/BCES01977/USRDIR/EMAIN.SELF`,
+  `argv[1]` = `/dev_hdd0/game/BCES01977/USRDIR/EMAIN.SELF`. RPCS3 logged
+  `*** arg: “/dev_hdd0/game/BCES01977/USRDIR/EMAIN.SELF”` twice: the spawn puts the path
+  first, then the EBOOT's one-entry `argv`, which is the path again.
+- **envp**: empty (no `*** env:` line). No exit-spawn data block.
+- The disc stays mounted at `/dev_bdvd` across the spawn (EMAIN opens
+  `/dev_bdvd/PS3_GAME/USRDIR/GT.VOL` first), and the game folder is
+  `/dev_hdd0/game/BCES01977/`.
+- Booted directly (run 3b), RPCS3 gives EMAIN argc = 1 (the path only). EMAIN behaved the
+  same up to the `TPPS-01.07` decision above, so argc 1 or 2 made no visible difference there.
+  The port follows the contract (argc = 2).
+
 ## Building the port (2026-10-27)
 
 `port/` builds the native `gt6` executable from the translated tree (M4 Max, Apple clang 21,
@@ -149,7 +239,7 @@ exception.
 - It then opens `TPPS-01.07/update.txt` in that folder and, if the file exists, overwrites it
   with `99.98 99.99` (string at va 0x3d100). As installed, `TPPS-01.07/update.txt` reads
   `01.06 01.07`, and every later `TPPS-01.xx/update.txt` already reads `99.98 99.99`.
-- 0x1143c is a data-patch step (not yet analysed). It scans the `TPPS-%02d.%02d` folders,
+- 0x1143c is a data-patch step (measured in "What the 1.22 EBOOT leaves on disk" above). It scans the `TPPS-%02d.%02d` folders,
   `PDIPFS` and `UPDATENODEINFO`, writes `UPDATENODEINFO.upd` and renames files. It receives the
   launch path only as a source to copy from, so it cannot change it.
 - 0x108f0 is the repair swap. It reads the size of the current `EMAIN.SELF` (`cellFsFstat`)

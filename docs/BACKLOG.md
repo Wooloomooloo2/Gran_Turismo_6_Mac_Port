@@ -9,6 +9,8 @@ Shortcuts taken, with the proper fix logged. Priority order: 1) Stability, 2) Pe
   their code is decoded as instructions (FINDINGS, "Translating EMAIN"). The three programs then
   run fully interpreted. Proper fix: a code end per image (as D25 does for the PPU), or the
   data ranges found by disassembly, passed to the lifter; then drop them from the partial list.
+- Reproduce the 1.22 EBOOT's rewrite of `TPPS-01.07/update.txt` and the `TPPS-01.07` to `01.11` `PDIPFS/UPDATENODEINFO` files before EMAIN first runs (D31). Without it EMAIN skips the 1.07 data patch. Four of the five node-info files are copies of `USRDIR/UPDATENODEINFO/UPDATENODEINFO.01xx`; the 1.09 one changes one entry by a rule not yet decoded from the EBOOT's 0x1143c. Proper fix: decode 0x1143c and add it as a post-install step to `gt6unpack build`, with tests, and refresh the manifest.
+- EMAIN's first run installs the staged `TPPS-*` data into `USRDIR/PDIPFS` (more than 5 minutes under RPCS3), so the tree stops matching the v1.22 manifest after the first launch. `gt6unpack verify` needs a post-install mode, or the port must run on a copy of the verified tree. An install that is cut off part-way must be resumed safely: check that EMAIN resumes it.
 
 ## 2) Performance
 
@@ -36,7 +38,7 @@ Shortcuts taken, with the proper fix logged. Priority order: 1) Stability, 2) Pe
 
 ## Milestone 2 open questions
 
-- The 1.22 launcher runs a data-patch step (PDIPFS/TPPS folders) before it starts the game. Milestone 2 may need to reproduce what it leaves on disk.
+- Answered: the 1.22 launcher's data-patch step rewrites 6 files that EMAIN needs (FINDINGS, "What the 1.22 EBOOT leaves on disk"; D31). Still open: how to reproduce them (see 1) Stability).
 - GT.VOL may hold more helper-chip (SPU) code that the game loads while running. Unknown.
 - 217 imported functions in EMAIN are missing from ps3recomp's name list. RPCS3 names all but 5, so feed the names back to ps3recomp upstream.
 
