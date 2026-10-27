@@ -1,0 +1,375 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] SPURS: unlifted job binaries and policy modules can run interpreted; synthetic job events can be turned off
+
+Upstream: not yet submitted
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0007)
+
+What: two opt-in switches, defaults unchanged.
+- SPU_JOB_INTERP=1: a SPURS job binary with no lifted image
+  (spu_workload_dispatch_job) and a workload policy module with no lifted
+  image (cellSpurs.c spurs_resolve_pm) run in the SPU interpreter through
+  spu_dispatch, with the same staging as lifted code (jm2 job context at LS 0;
+  kernel context, PM at LS 0xA00), instead of being dropped. Interpreted
+  images get image ids no lifted image uses. Every run is reported to a new
+  hook, g_spu_job_interp_hook (fingerprint, size), which a port can count;
+  the first 32 job runs and every 10000th are logged. SPU_DUMP_MISS still
+  dumps each image once; policy modules now dump as spupm_<fp>_<size>.bin
+  (linked for LS 0xA00) so a lift can tell them from spujob_ (LS 0).
+- SPURS_JOB_SYNTH_EVENTS=0: the job-chain walker stops making up completion
+  events (one per job, one at END, one at the walk's end, pushed to every
+  attached queue). On hardware the job manager sends none; a job reports its
+  end itself, through its own SPU user event (already routed by
+  spurs_port_queue) or memory.
+
+Why: Gran Turismo 6 runs at least 16 job binaries that are not lifted and its
+Wws_Job policy module. Dropped, their work never happens, and the made-up
+events (data2 = job index) are read by GT6's event-queue worker as its own
+callback indices. Its first-run install then decompresses data no job
+produced, overruns a static buffer into the USB driver's state, and exits
+when a mutex lock on the clobbered id fails.
+
+Test: tools/test_spu_job_interp.py (new): without the switch the job is
+dropped; with it, the job runs interpreted (writes its mailbox), the hook
+sees it, and SPU_DUMP_MISS dumps it once. tools/test_spu_dispatch_miss.py
+unchanged and passing.
+
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -1684,20 +1684,31 @@
+     uint64_t fp = spu_workload_fingerprint(vm_base + (uint32_t)(uintptr_t)w->pm,
+                                            w->sizePm);
+     r->fn = spu_workload_find_img(fp, &r->image_id);
++    /* No lifted image: with SPU_JOB_INTERP=1 the policy module runs in the SPU
++     * interpreter (spu_workload.c) rather than the workload never running. */
++    if (!r->fn && spu_job_interp_enabled()) {
++        r->fn = spu_policy_interp_entry;
++        r->image_id = spu_job_interp_image_id(fp, w->sizePm);
++        printf("[cellSpurs] wid=%u PM has no lifted image (fp=0x%016llX size=%u) -- runs "
++               "INTERPRETED\n", wid, (unsigned long long)fp, w->sizePm);
++    }
+     r->resolved = r->fn ? 1 : -1;
+-    if (r->fn)
++    if (r->fn && r->fn != spu_policy_interp_entry)
+         printf("[cellSpurs] wid=%u PM resolved (fp=0x%016llX image=%d)\n",
+                wid, (unsigned long long)fp, r->image_id);
+-    else {
+-        printf("[cellSpurs] wid=%u PM NOT LIFTED (fp=0x%016llX size=%u) -- workload will not run\n",
+-               wid, (unsigned long long)fp, w->sizePm);
++    if (!r->fn || r->fn == spu_policy_interp_entry) {
++        if (!r->fn)
++            printf("[cellSpurs] wid=%u PM NOT LIFTED (fp=0x%016llX size=%u) -- workload will "
++                   "not run\n", wid, (unsigned long long)fp, w->sizePm);
+         /* SPU_DUMP_MISS=<dir>: write the PM exactly as fingerprinted, like the
+          * two miss paths in spu_workload.c. This path refused the workload
+          * before either of those ran, so an unlifted PM was never captured. */
+         const char* dir = getenv("SPU_DUMP_MISS");
+         if (dir && *dir) {
+             char path[512];
+-            snprintf(path, sizeof(path), "%s/spujob_%016llX_%u.bin",
++            /* spupm_, not spujob_: a policy module is linked for LS 0xA00 and
++             * a job binary for LS 0, so the lift needs to tell them apart. */
++            snprintf(path, sizeof(path), "%s/spupm_%016llX_%u.bin",
+                      dir, (unsigned long long)fp, w->sizePm);
+             FILE* f = fopen(path, "wb");
+             if (f) {
+@@ -2724,6 +2735,23 @@
+     }
+ }
+ 
++/* SPURS_JOB_SYNTH_EVENTS=0: the chain walker does not make up completion
++ * events. By default it pushes one to every attached queue per job, one at
++ * END and one when the walk ends (jc_signal_done), because the titles this
++ * was built for wait on them while their jobs are not run for real. On
++ * hardware the job manager sends nothing of the sort: an application learns
++ * of a job's end from the job itself, which sends its own SPU event (routed
++ * by spurs_port_queue) or writes memory. A title whose jobs run (lifted, or
++ * interpreted with SPU_JOB_INTERP=1) and that reads the events' data as its
++ * own (Gran Turismo 6 indexes a callback table with data2) gets wrong state
++ * from made-up ones. */
++static int jc_synth_events(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("SPURS_JOB_SYNTH_EVENTS"); v = (e && *e == '0') ? 0 : 1; }
++    return v;
++}
++
+ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
+ {
+     u32 pc = entry_ea, ret_pc = 0;
+@@ -2752,7 +2780,7 @@
+              * and sat in event_queue_receive 30 times -- so batching the
+              * completion into one event per pass leaves it waiting for
+              * completions that, from its point of view, never arrive. */
+-            jc_signal_done(jc_ea, idx);
++            if (jc_synth_events()) jc_signal_done(jc_ea, idx);
+             pc += 8; continue;
+         }
+         if (op == 1) { pc = (u32)(cmd & ~7ull); continue; }   /* RESET_PC */
+@@ -2761,7 +2789,7 @@
+         if (op == 7) {
+             if (ext == (7 | (15 << 3))) {                     /* END */
+                 printf("[cellSpurs] chain 0x%08X: END after %d job(s)\n", jc_ea, jobs);
+-                if (jobs) jc_signal_done(jc_ea, jobs - 1);
++                if (jobs && jc_synth_events()) jc_signal_done(jc_ea, jobs - 1);
+                 return;
+             }
+             if (ext == (7 | (14 << 3))) {                     /* RET */
+@@ -2803,7 +2831,7 @@
+     s_jobchains[slot].running = 0;
+     /* Tell the application the chain is done. Without this the walk finishes
+      * in silence and a thread waiting on the attached queue never runs again. */
+-    jc_signal_done(s_jobchains[slot].jc_ea, -1);
++    if (jc_synth_events()) jc_signal_done(s_jobchains[slot].jc_ea, -1);
+     return 0;
+ }
+ 
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -13,6 +13,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include "ps3emu/log_first.h"
++#include "spu_interp.h"         /* spu_dispatch: the interpreter fallback for jobs */
+ #ifdef _WIN32
+ #include <windows.h>
+ #else
+@@ -1017,6 +1018,72 @@
+ static void* spu_async_thread(void* p) { spu_async_run((spu_async_job*)p); return NULL; }
+ #endif
+ 
++/* SPU_JOB_INTERP=1: a SPURS job binary or workload policy module with no lifted
++ * image runs in the SPU interpreter instead of being dropped. A job gets the
++ * same jm2 staging as a lifted one (spu_run_spurs_job) and enters at LS 0, a
++ * policy module the same kernel context (spu_run_policy_module) and enters at
++ * LS 0xA00, both through spu_dispatch, which hands over to lifted code wherever
++ * some is registered (job modules a job streams in). Every run is reported to
++ * g_spu_job_interp_hook when a port sets one (a port's boot log counts them);
++ * the first 32 job runs and every 10000th are logged too, so the image can be
++ * dumped (SPU_DUMP_MISS) and lifted ahead of time for the next build. Off by
++ * default: a dropped job is what the runtime has always done, and a title whose
++ * chain walker synthesises job completions (SPURS_JOB_SYNTH_EVENTS, cellSpurs.c)
++ * would then see both the job's own events and the made-up ones. */
++void (*g_spu_job_interp_hook)(uint64_t fp, uint32_t size) = 0;
++
++int spu_job_interp_enabled(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("SPU_JOB_INTERP"); v = (e && *e == '1') ? 1 : 0; }
++    return v;
++}
++
++/* Image ids for interpreted images: ones no lifted image uses, so the
++ * interpreted code's lookups never pick another image's functions (lifted ids
++ * are small, or content derived below 0x20000000). Each remembers its
++ * fingerprint and size for the hook. */
++#define SPU_INTERP_IMAGES 64
++static struct { int id; uint64_t fp; uint32_t size; } s_interp_img[SPU_INTERP_IMAGES];
++static unsigned s_interp_img_n;
++static volatile LONG s_interp_img_lock;
++
++int spu_job_interp_image_id(uint64_t fp, uint32_t size)
++{
++    const int id = (int)(0x60000000u | (uint32_t)(fp & 0x0FFFFFFFu));
++    while (InterlockedExchange(&s_interp_img_lock, 1)) Sleep(0);
++    unsigned k = 0;
++    for (; k < s_interp_img_n; k++) if (s_interp_img[k].id == id) break;
++    if (k == s_interp_img_n && s_interp_img_n < SPU_INTERP_IMAGES) {
++        s_interp_img[k].id = id; s_interp_img[k].fp = fp; s_interp_img[k].size = size;
++        s_interp_img_n++;
++    }
++    InterlockedExchange(&s_interp_img_lock, 0);
++    return id;
++}
++
++static void spu_job_interp_note(int image_id)
++{
++    if (!g_spu_job_interp_hook) return;
++    for (unsigned k = 0; k < s_interp_img_n; k++)
++        if (s_interp_img[k].id == image_id) {
++            g_spu_job_interp_hook(s_interp_img[k].fp, s_interp_img[k].size);
++            return;
++        }
++}
++
++static void spu_job_interp_entry(spu_context* ctx)
++{
++    spu_job_interp_note(ctx->image_id);
++    spu_dispatch(ctx, 0);       /* job binaries are loaded and entered at LS 0 */
++}
++
++void spu_policy_interp_entry(spu_context* ctx)
++{
++    spu_job_interp_note(ctx->image_id);
++    spu_dispatch(ctx, 0xA00);   /* policy modules are loaded and entered at LS 0xA00 */
++}
++
+ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
+                               uint32_t job_ea, uint32_t job_desc_size)
+ {
+@@ -1035,7 +1102,8 @@
+           if (++miss_n <= 32 || miss_n % 100000 == 0)
+             fprintf(stderr, "[spurs-job] dispatch MISS fp=0x%016llX size=%u job=0x%08X (#%llu)\n",
+                     (unsigned long long)fp, image_size, job_ea, miss_n); }
+-        spu_workload_report_miss("SPURS job", fp, image_size, job_ea);
++        const int interp = spu_job_interp_enabled();
++        if (!interp) spu_workload_report_miss("SPURS job", fp, image_size, job_ea);
+         /* SPU_DUMP_MISS=<dir>: write the unrecognised image out so it can be
+          * lifted and registered. SPURS job binaries are raw code+data blobs
+          * the title loads from its own data files -- unlike sys_spu_image
+@@ -1060,7 +1128,16 @@
+                   }
+               }
+           } }
+-        return 0;
++        if (!interp) return 0;
++        /* The D9-style fallback: run it interpreted, and say so on every use. */
++        { static unsigned long long interp_n = 0;
++          if (++interp_n <= 32 || interp_n % 10000 == 0)
++              fprintf(stderr, "[spurs-job] INTERPRETED (no lifted image) fp=0x%016llX size=%u "
++                      "job=0x%08X (#%llu)\n", (unsigned long long)fp, image_size, job_ea,
++                      interp_n); }
++        spu_run_spurs_job(spu_job_interp_entry, spu_job_interp_image_id(fp, image_size),
++                          job_ea, job_desc_size);
++        return 1;
+     }
+     /* Two lines plus two explicit flushes PER JOB. A title running its audio
+      * chain does ~1500 jobs/s, so this alone was ~6k writes/s through one FILE
+--- a/runtime/spu/spu_workload.h
++++ b/runtime/spu/spu_workload.h
+@@ -110,6 +110,15 @@
+  * ioBuffer from the descriptor's input DMA list, builds the context, and runs
+  * the lifted entry. `job_desc_size` is the jobchain's sizeJobDescriptor (0 =>
+  * assume 256). Returns 0 if the job ran, negative if it could not be staged. */
++/* SPU_JOB_INTERP=1 (spu_workload.c): SPURS job binaries and policy modules
++ * with no lifted image run in the SPU interpreter. The hook is called on every
++ * such run (unset by default); the id is one no lifted image uses; the entry
++ * enters a policy module at LS 0xA00 for spu_run_policy_module. */
++extern void (*g_spu_job_interp_hook)(uint64_t fp, uint32_t size);
++int  spu_job_interp_enabled(void);
++int  spu_job_interp_image_id(uint64_t fp, uint32_t size);
++void spu_policy_interp_entry(spu_context* ctx);
++
+ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
+                       uint32_t job_ea, uint32_t job_desc_size);
+ 
+--- /dev/null
++++ b/tests/test_spu_job_interp.c
+@@ -0,0 +1,63 @@
++/* SPU_JOB_INTERP=1: a SPURS job binary with no lifted image runs in the SPU
++ * interpreter through the real runtime/spu/spu_workload.c and spurs_job.c,
++ * with jm2's staging, instead of being dropped. The job here loads 0x1234 into
++ * a register, writes it to its outbound mailbox and stops; the runner captures
++ * the mailbox after the run. The Python driver (tools/test_spu_job_interp.py)
++ * runs this with and without the switch and checks stderr and the exit code:
++ *   without: the job is dropped (dispatch returns 0), one ERROR line;
++ *   with:    it runs (returns 1), the mailbox holds 0x1234, the hook saw it,
++ *            and the INTERPRETED line names the fingerprint. */
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include "spu_workload.h"
++
++uint8_t* vm_base;
++uint32_t ppu_vm_size = 0x20000;
++uint32_t g_ww_lo, g_ww_hi, g_barrier_sync_watch;
++uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;
++int g_resv_store_active;
++void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
++void ppu_resv_break_store(uint64_t ea) { (void)ea; }
++void sys_event_queue_cancel_by_id(uint32_t id) { (void)id; }
++void sys_event_queue_uncancel_by_id(uint32_t id) { (void)id; }
++void spu_thread_publish_ctx(uint32_t tid, void* ctx) { (void)tid; (void)ctx; }
++uint32_t g_ydkj_real_spurs_ea, g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
++unsigned long long ps3_ms_now(void) { return 0; }
++void spurs_ef_set_from_spu(uint32_t ea, uint16_t bits) { (void)ea; (void)bits; abort(); }
++void ydkj_wake_all_event_flags(void) { abort(); }
++uint64_t spurs_pm_build_context(uint8_t* ls, uint32_t a, uint32_t b, uint32_t c, uint32_t d)
++{ (void)ls; (void)a; (void)b; (void)c; (void)d; abort(); }
++
++#if defined(_MSC_VER)
++extern __declspec(thread) uint32_t g_spurs_job_mbox;
++#else
++extern __thread uint32_t g_spurs_job_mbox;
++#endif
++
++static unsigned s_hook_calls;
++static uint64_t s_hook_fp;
++static void note(uint64_t fp, uint32_t size) { (void)size; s_hook_calls++; s_hook_fp = fp; }
++
++static void be32(uint8_t* p, uint32_t v)
++{ p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v; }
++
++int main(void)
++{
++    vm_base = (uint8_t*)calloc(1, ppu_vm_size);
++    g_spu_job_interp_hook = note;
++    const uint32_t BIN = 0x8000, JOB = 0x2000;
++    uint8_t* bin = vm_base + BIN;
++    be32(bin + 0, 0x40800000u | (0x1234u << 7) | 5u);   /* il   $5, 0x1234         */
++    be32(bin + 4, 0x21A00000u | (28u << 7) | 5u);       /* wrch $SPU_WrOutMbox, $5 */
++    be32(bin + 8, 0x00000000u);                         /* stop 0                  */
++    /* CellSpursJobHeader: eaBinary (u64), sizeBinary (u16, bytes >> 4) */
++    be32(vm_base + JOB + 4, BIN);
++    vm_base[JOB + 8] = 0; vm_base[JOB + 9] = 0x10;     /* 256 bytes */
++    g_spurs_job_mbox = 0;
++    int r = spu_workload_dispatch_job(bin, 256, JOB, 0x80);
++    fprintf(stderr, "job-interp: r=%d mbox=0x%X hook=%u fp=0x%016llX\n", r, g_spurs_job_mbox,
++            s_hook_calls, (unsigned long long)s_hook_fp);
++    return 0;
++}
+--- /dev/null
++++ b/tools/test_spu_job_interp.py
+@@ -0,0 +1,52 @@
++#!/usr/bin/env python3
++"""SPU_JOB_INTERP=1 runs a SPURS job with no lifted image in the SPU interpreter
++(runtime/spu/spu_workload.c) instead of dropping it; without it the job is dropped."""
++import os
++from pathlib import Path
++import platform
++import re
++import subprocess
++import tempfile
++root = Path(__file__).resolve().parents[1]
++if os.name == 'nt':
++    print('SKIP: fixture currently uses POSIX linking')
++    raise SystemExit(0)
++with tempfile.TemporaryDirectory(prefix='spu-job-interp-') as tmp:
++    out = Path(tmp) / 'test'
++    units = ['spu_channels', 'spu_drain', 'spu_lockstep', 'spu_coherency', 'spu_workload',
++             'spurs_policy', 'spurs_job', 'spu_tsp_weak', 'spu_vm_pagemap',
++             'spurs_policy_blob_weak', 'spu_interp']
++    subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-D_GNU_SOURCE', '-O1', '-UNDEBUG',
++                    '-ffunction-sections', '-fdata-sections',
++                    '-Wl,-dead_strip' if platform.system() == 'Darwin' else '-Wl,--gc-sections',
++                    '-I' + str(root / 'include'), '-I' + str(root / 'runtime/spu'),
++                    '-I' + str(root / 'runtime/platform'),
++                    str(root / 'tests/test_spu_job_interp.c'),
++                    *[str(root / 'runtime/spu' / f'{u}.c') for u in units],
++                    str(root / 'runtime/platform/win32_compat.c'), '-pthread', '-lm', '-o', str(out)],
++                   check=True)
++    base = {k: v for k, v in os.environ.items()
++            if k not in ('SPU_MISS_FATAL', 'SPU_DUMP_MISS', 'SPU_JOB_INTERP')}
++
++    p = subprocess.run([str(out)], env=base, capture_output=True, text=True, timeout=15)
++    assert p.returncode == 0, (p.returncode, p.stderr)
++    m = re.search(r'job-interp: r=(\d+) mbox=0x([0-9A-F]+) hook=(\d+)', p.stderr)
++    assert m and m.group(1) == '0' and m.group(3) == '0', p.stderr
++    assert 'DROPPED' in p.stderr and 'INTERPRETED' not in p.stderr, p.stderr
++
++    dump = Path(tmp) / 'dump'
++    dump.mkdir()
++    p = subprocess.run([str(out)], env={**base, 'SPU_JOB_INTERP': '1', 'SPU_DUMP_MISS': str(dump)},
++                       capture_output=True, text=True, timeout=15)
++    assert p.returncode == 0, (p.returncode, p.stderr)
++    m = re.search(r'job-interp: r=(\d+) mbox=0x([0-9A-F]+) hook=(\d+) fp=0x([0-9A-F]{16})', p.stderr)
++    assert m, p.stderr
++    assert m.group(1) == '1', 'the interpreted job must count as run: ' + p.stderr
++    assert m.group(2) == '1234', 'the job ran and wrote its mailbox: ' + p.stderr
++    assert m.group(3) == '1', 'the hook sees every interpreted run: ' + p.stderr
++    assert 'DROPPED' not in p.stderr, p.stderr
++    assert re.search(r'INTERPRETED .*fp=0x%s' % m.group(4), p.stderr), p.stderr
++    dumped = list(dump.glob('spujob_*.bin'))
++    assert len(dumped) == 1 and dumped[0].stat().st_size == 256, dumped
++    assert m.group(4) in dumped[0].name, (dumped, m.group(4))
++print('PASS')

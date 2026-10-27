@@ -10,8 +10,9 @@
  * /dev_hdd0 default to the gt6unpack tree this build was configured for, gt6_paths.h, with
  * /dev_hdd0 on its play folder; PS3_VFS_ROOT and PS3_HDD0_ROOT override; a /dev_hdd0 folder
  * without prepare.json beside it stops the start), and the guest command line (the launch
- * contract, configure_guest_argv). The template's Windows and Linux paths are kept
- * so the file stays diffable against the template; the port builds on macOS arm64 only.
+ * contract, configure_guest_argv), and the SPURS set-up call (gt6_configure_spurs). The
+ * template's Windows and Linux paths are kept so the file stays diffable against the
+ * template; the port builds on macOS arm64 only.
  *
  * Template header follows.
  *
@@ -94,6 +95,7 @@ int      ppu_run(uint32_t entry_opd, uint32_t stack_top);
  * into guest RAM and register their exports. stubs.cpp has the empty version
  * a game with no lifted PRX wants. */
 void     ps3_load_prx_modules(void);
+void     gt6_configure_spurs(void);           /* gt6_spurs.cpp: the SPU fallback set-up (D33) */
 
 extern const char* ppu_vfs_root;              /* host dir the PS3 mount points map into */
 void     cellfs_add_path_mapping(const char* ps3_prefix, const char* host_path); /* cellFs.c */
@@ -479,6 +481,7 @@ int main(int argc, char** argv)
     if (!configure_vfs_roots())
         return 1;
     configure_guest_argv();
+    gt6_configure_spurs();
 
     if (!alloc_guest_vm()) {
         fprintf(stderr, "ERROR: could not allocate the guest address space\n");

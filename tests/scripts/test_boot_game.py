@@ -43,7 +43,7 @@ def fake(name, tmp_path):
 def test_parse_milestones():
     m = boot_game.parse_milestones(LOG)
     assert m == {"keys": ["boot:start", "fs:open", "gcm:flip"],
-                 "kv": {"spurs:groups": 3}, "ended": True}
+                 "kv": {"spurs:groups": 3}, "counts": {"gcm:flip": "10-99"}, "ended": True}
 
 
 def test_parse_milestones_truncated():
@@ -92,6 +92,7 @@ def test_boot_collects_unresolved(tree, tmp_path):
     assert rep["outcome"] == "exited"
     assert rep["unresolved_nids"] == ["0x1234ABCD", "0xDEADBEEF", "0x0D5B4A14", "0x30AA96C4"]
     assert rep["unimplemented_syscalls"] == [891]
+    assert rep["spu_interpreted"] == {"F523F26F69764538": "100-999", "CB9BD0241BB0DE67": "1"}
     run = Path(rep["run"])
     assert json.loads((run / "report.json").read_text())["outcome"] == "exited"
     assert (run / "summary.md").read_text().startswith("The game")

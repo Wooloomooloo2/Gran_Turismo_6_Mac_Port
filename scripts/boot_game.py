@@ -49,19 +49,24 @@ POLL = 0.2
 # "[hle] unresolved NID 0x..." (stderr, first 40 only); the milestone log has every one.
 UNRESOLVED_RE = re.compile(r"\[hle\] unresolved NID (0x[0-9A-Fa-f]+)", re.IGNORECASE)
 UNRESOLVED_KEY = "hle:unresolved:"
+INTERP_KEY = "spu:interp:"     # an SPU image run in the interpreter (D9, D33): key per image
 SYSCALL_RE = re.compile(r"lv2_syscall (\d+) \(stub\)")
 
 
 def parse_milestones(text):
     """Read a ps3recomp milestone log (v1). A last line without a newline may be half
     written and is ignored."""
-    keys, kv, ended = [], {}, False
+    keys, kv, counts, ended = [], {}, {}, False
     lines = text.split("\n")
     lines.pop()                     # text after the final newline: empty, or a partial line
     for line in lines:
         if line == "# end":
             ended = True
-        elif line.startswith("#") or line.startswith("count\t"):
+        elif line.startswith("count\t"):
+            parts = line.split("\t")
+            if len(parts) == 3:
+                counts[parts[1]] = parts[2]   # the runtime writes a number or a range
+        elif line.startswith("#"):
             continue
         elif line.startswith("kv\t"):
             parts = line.split("\t")
@@ -69,7 +74,7 @@ def parse_milestones(text):
                 kv[parts[1]] = int(parts[2])
         elif "\t" in line:
             keys.append(line.split("\t", 1)[1])
-    return {"keys": keys, "kv": kv, "ended": ended}
+    return {"keys": keys, "kv": kv, "counts": counts, "ended": ended}
 
 
 def classify(returncode, timed_out, hung, keys):
@@ -151,6 +156,8 @@ def _summary(rep, tree):
              f"- Last milestones: {', '.join(rep['last_keys'][-5:]) or 'none'}",
              f"- Unresolved imports: {len(rep['unresolved_nids'])}; "
              f"unimplemented system calls: {len(rep['unimplemented_syscalls'])}",
+             f"- SPU images run in the interpreter (lift them: translate_game.py): "
+             f"{len(rep['spu_interpreted'])}",
              f"- Run folder: {rep['run']}"]
     if rep["backtraces"]:
         lines += ["", "Where it was stuck (first lines):", "", "```"]
@@ -209,7 +216,8 @@ def boot(gt6, tree, seconds=300, idle=60, headless=True, env=None):
         finally:
             _kill_group(proc)
     elapsed = round(time.monotonic() - start, 1)
-    keys = parse_milestones(_read(run / "milestones.log"))["keys"]
+    ms = parse_milestones(_read(run / "milestones.log"))
+    keys = ms["keys"]
     err = _read(run / "stderr.log") + _read(run / "stdout.log")
     rep = {
         "outcome": classify(returncode, timed_out, hung, keys),
@@ -218,6 +226,8 @@ def boot(gt6, tree, seconds=300, idle=60, headless=True, env=None):
         "last_keys": keys[-20:],
         "unresolved_nids": _unresolved(err, keys),
         "unimplemented_syscalls": sorted({int(n) for n in SYSCALL_RE.findall(err)}),
+        "spu_interpreted": {k[len(INTERP_KEY):]: ms["counts"].get(k, "1")
+                            for k in keys if k.startswith(INTERP_KEY)},
         "frames": sum(1 for f in (run / "frames").iterdir() if f.is_file()),
         "backtraces": backtraces,
         "pid": proc.pid,

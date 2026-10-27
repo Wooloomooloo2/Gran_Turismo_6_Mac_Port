@@ -104,6 +104,25 @@ print(f"Lifted {{len(man)}} module(s)")
 '''
 
 
+# Fake wrap_spu_elf.py and spu_lifter.py for the spu-missed step (D33).
+WRAP = '''import sys, pathlib
+a = sys.argv
+raw = pathlib.Path(a[1]).read_bytes()
+pathlib.Path(a[a.index("--out") + 1]).write_bytes(b"ELF" + a[a.index("--base") + 1].encode() + raw)
+'''
+SPU_LIFTER = '''import sys, pathlib
+a = sys.argv
+out = pathlib.Path(a[a.index("-o") + 1]); out.mkdir(parents=True)
+base = a[a.index("--base") + 1]
+assert a[a.index("--extra-funcs") + 1] == base, a
+assert a[a.index("--symbol-prefix") + 1] == out.name + "_", a
+(out / "spu_recomp.c").write_text("lifted at " + base)
+print("  3 function(s) lifted")
+if base == "0xa00":
+    print("  2 unsupported instruction(s)")
+'''
+
+
 def fake_tools(root, tag, n, two=False, partial=False, unsup=False):
     tools = root / "tools"
     tools.mkdir(exist_ok=True)
@@ -112,6 +131,8 @@ def fake_tools(root, tag, n, two=False, partial=False, unsup=False):
     (tools / "ppu_lifter.py").write_text(LIFTER.format(tag=tag, n=n, extra=extra))
     (tools / "build_spu_workloads.py").write_text(SPU_WORKLOADS.format(partial=partial))
     (tools / "lift_jobmods.py").write_text(JOBMODS.format(unsup=unsup))
+    (tools / "wrap_spu_elf.py").write_text(WRAP)
+    (tools / "spu_lifter.py").write_text(SPU_LIFTER)
     return tools
 
 
@@ -185,7 +206,8 @@ def test_spu_record_with_fake_tools(tree, tmp_path):
     out = tmp_path / "out"
     rec = translate_game.translate(tree, out, sys.executable, fake_tools(tmp_path, "a", 1))
     spu = rec["spu"]
-    assert set(spu) == {"images", "jobmods", "partial", "seconds"}
+    assert set(spu) == {"images", "jobmods", "partial", "missed", "seconds"}
+    assert spu["missed"] == {"found": 0, "lifted": 0, "partial": [], "rejected": [], "failed": []}
     assert spu["images"] == 2
     manifest = json.loads((out / "spu" / "jobmods_manifest.json").read_text())
     assert spu["jobmods"] == len(manifest) == 2
@@ -220,6 +242,43 @@ def test_spu_tool_failure_keeps_previous_output(tree, tmp_path):
     assert "lift_jobmods failed" in str(e.value)
     assert (out / "ppu" / "ppu_recomp_000.cpp").read_text() == "one"
     assert sorted(p.name for p in tmp_path.iterdir()) == ["out", "tools", "tree"]
+
+
+def test_fnv1a64_matches_the_runtime():
+    # runtime/spu/spu_workload.c spu_workload_fingerprint, offset basis 1469598103934665603
+    assert translate_game.fnv1a64(b"") == 1469598103934665603
+    assert translate_game.fnv1a64(b"a") == 0x44BD8AD473CD9906
+
+
+def test_spu_missed_images_are_lifted(tree, tmp_path):
+    """Images dumped to <tree>/spu-missed are lifted at their link base and registered by
+    fingerprint; a file whose bytes do not match its name is rejected, others ignored."""
+    missed = tree / "spu-missed"
+    missed.mkdir()
+    job, pm = b"\x40\x80\x00\x05" * 8, b"\x24\x00\x40\x80" * 16
+    fj, fp = translate_game.fnv1a64(job), translate_game.fnv1a64(pm)
+    (missed / f"spujob_{fj:016X}_{len(job)}.bin").write_bytes(job)
+    (missed / f"spupm_{fp:016X}_{len(pm)}.bin").write_bytes(pm)
+    (missed / f"spujob_{fj ^ 1:016X}_{len(job)}.bin").write_bytes(job)   # wrong fingerprint
+    (missed / "notes.txt").write_text("not an image")
+    out = tmp_path / "out"
+    rec = translate_game.translate(tree, out, sys.executable, fake_tools(tmp_path, "a", 1))
+    m = rec["spu"]["missed"]
+    assert m["found"] == 3 and m["lifted"] == 2
+    assert m["rejected"] == [f"spujob_{fj ^ 1:016X}_{len(job)}.bin"]
+    assert m["partial"] == [f"missed_{fp:016x}"] and m["failed"] == []
+    man = json.loads((out / "spu" / "spu_missed_manifest.json").read_text())
+    by = {e["kind"]: e for e in man}
+    assert by["spujob"]["base"] == 0 and by["spupm"]["base"] == 0xA00
+    assert by["spujob"]["fingerprint"] == f"0x{fj:016X}"
+    assert (out / "spu" / f"missed_{fj:016x}" / "spu_recomp.c").read_text() == "lifted at 0x0"
+    assert (out / "spu" / f"missed_{fp:016x}" / "spu_recomp.c").read_text() == "lifted at 0xa00"
+    reg = (out / "spu" / "spu_missed_register.c").read_text()
+    assert f"spu_workload_register_img(0x{fj:016X}ULL, missed_{fj:016x}_spu_func_00000000," in reg
+    assert f"spu_workload_register_img(0x{fp:016X}ULL, missed_{fp:016x}_spu_func_00000A00," in reg
+    assert "__attribute__((constructor))" in reg
+    assert len({e["image_id"] for e in man}) == 2
+    assert all(0x58000000 <= e["image_id"] < 0x59000000 for e in man)
 
 
 @pytest.mark.skipif(not os.environ.get("GT6_TREE"), reason="GT6_TREE not set (needs the built v1.22 tree)")

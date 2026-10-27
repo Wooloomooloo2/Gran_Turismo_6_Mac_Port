@@ -20,6 +20,13 @@ raw in EMAIN are cut out with map_game.find_embedded_jobmods (lift_jobmods
 that lifted only partly is listed in translate.json["spu"]["partial"] and runs in
 ps3recomp's SPU interpreter at runtime (logged fallback, D9).
 
+SPU images the game ran that no step above found (SPURS job binaries and policy
+modules, D33) are dumped at run time to <tree>/spu-missed/ as spujob_<fp>_<size>.bin
+(linked for LS 0) and spupm_<fp>_<size>.bin (LS 0xA00). Each one whose bytes match its
+fingerprint is wrapped as an SPU ELF (wrap_spu_elf), lifted (spu_lifter
+--auto-functions) and registered by that fingerprint in spu/spu_missed_register.c, so
+the next build runs it as native code; counts in translate.json["spu"]["missed"].
+
 Output (replaced as a whole on every run, via <out>.staging and <out>.old):
 
     <out>/ppu/        ppu_recomp.h, ppu_recomp_NNN.cpp, ppu_recomp_table.cpp
@@ -28,6 +35,8 @@ Output (replaced as a whole on every run, via <out>.staging and <out>.old):
                       spu_workloads.c, jobmods_register.c, inventory.json and
                       jobmods_manifest.json (the template's SPU_DIR)
     <out>/spu_inputs/jobmods/   the raw job modules cut out of EMAIN
+    <out>/spu/missed_<fp>/, spu_missed_register.c, spu_missed_manifest.json
+                      the images lifted from <tree>/spu-missed/
     <out>/logs/       one log per tool
     <out>/translate.json   what was translated, with what, and how long it took
 
@@ -132,8 +141,112 @@ def spu_partial(spu_dir, module_names):
     return len(programs), len(manifest), partial
 
 
-def lift_spu(elf, data, staging, python, tools, logs):
-    """The SPU step: lift EMAIN's SPU programs and job modules into staging/spu."""
+MISSED_RE = re.compile(r"^(spujob|spupm)_([0-9A-F]{16})_(\d+)\.bin$")
+MISSED_BASE = {"spujob": 0x0, "spupm": 0xA00}   # LS address each kind is linked for
+
+
+def fnv1a64(data):
+    """The runtime's SPU image fingerprint (spu_workload_fingerprint): FNV-1a 64 with
+    ps3recomp's offset basis 1469598103934665603, one digit short of the standard
+    14695981039346656037. build_spu_workloads.py uses the same value, so it is kept."""
+    h = 1469598103934665603
+    for b in data:
+        h = ((h ^ b) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return h
+
+
+def missed_image_id(fp):
+    """Image id of a lifted missed image: distinct from build_spu_workloads' content ids
+    (below 0x20000000), lift_jobmods' (200-256) and the interpreter's (0x6xxxxxxx)."""
+    return 0x58000000 | (fp & 0x00FFFFFF)
+
+
+def _lifter_stats(log_text):
+    funcs = unsup = 0
+    for line in log_text.splitlines():
+        s = line.strip()
+        m = re.match(r"(\d+) function\(s\) lifted", s)
+        if m:
+            funcs = int(m.group(1))
+        m = re.match(r"(\d+) unsupported instruction\(s\)", s)
+        if m:
+            unsup = int(m.group(1))
+    return funcs, unsup
+
+
+def lift_missed(missed, staging, python, tools, logs):
+    """Lift the images the game dumped to `missed` (D33) into staging/spu."""
+    out = {"found": 0, "lifted": 0, "partial": [], "rejected": [], "failed": []}
+    if missed is None or not missed.is_dir():
+        return out
+    spu = staging / "spu"
+    inputs = staging / "spu_inputs" / "missed"
+    inputs.mkdir(parents=True)
+    manifest = []
+    for f in sorted(missed.iterdir()):
+        m = MISSED_RE.match(f.name)
+        if not m:
+            continue
+        out["found"] += 1
+        kind, fp, size = m.group(1), int(m.group(2), 16), int(m.group(3))
+        raw = f.read_bytes()
+        if len(raw) != size or fnv1a64(raw) != fp:
+            out["rejected"].append(f.name)   # truncated or not what its name says
+            continue
+        base = MISSED_BASE[kind]
+        name = f"missed_{fp:016x}"
+        img_logs = logs / name
+        img_logs.mkdir()
+        elf = inputs / f"{name}.elf"
+        (inputs / f.name).write_bytes(raw)
+        st = map_game.run_tool(python, tools, "wrap_spu_elf",
+                               [inputs / f.name, "--entry", hex(base), "--base", hex(base),
+                                "--out", elf], img_logs)
+        if st["ok"]:
+            st = map_game.run_tool(python, tools, "spu_lifter",
+                                   [elf, "--auto-functions", elf, "--base", hex(base),
+                                    "--symbol-prefix", f"{name}_", "-o", spu / name,
+                                    "--source-name", "spu_recomp.c",
+                                    "--header-name", "spu_recomp.h",
+                                    "--extra-funcs", hex(base)], img_logs)
+        if not st["ok"] or not (spu / name / "spu_recomp.c").is_file():
+            out["failed"].append(f.name)
+            continue
+        funcs, unsup = _lifter_stats((img_logs / "spu_lifter.log").read_text())
+        if unsup:
+            out["partial"].append(name)      # the bad words fall to the interpreter (D9)
+        manifest.append({"name": name, "kind": kind, "fingerprint": f"0x{fp:016X}",
+                         "size": size, "base": base, "image_id": missed_image_id(fp),
+                         "funcs": funcs, "unsupported": unsup})
+    out["lifted"] = len(manifest)
+    (spu / "spu_missed_manifest.json").write_text(json.dumps(manifest, indent=1))
+    if manifest:
+        lines = ["/* spu_missed_register.c -- GENERATED by scripts/translate_game.py from the",
+                 " * SPU images the game dumped to <tree>/spu-missed (D33). Registers each by",
+                 " * its fingerprint so spu_workload_dispatch_job and the SPURS policy",
+                 " * dispatch find it. */",
+                 '#include "spu_workload.h"', "",
+                 "extern void spu_begin_image(int image_id);"]
+        for e in manifest:
+            n = e["name"]
+            lines += [f"extern void {n}_spu_func_{e['base']:08X}(spu_context*);",
+                      f"extern void {n}_spu_recomp_register(void);"]
+        lines += ["", "static void gt6_spu_missed_register(void)", "{"]
+        for e in manifest:
+            n = e["name"]
+            lines += [f"    spu_begin_image({e['image_id']}); {n}_spu_recomp_register();",
+                      f"    spu_workload_register_img({e['fingerprint']}ULL, "
+                      f"{n}_spu_func_{e['base']:08X}, {e['image_id']}, \"{n}\");"]
+        lines += ["    spu_begin_image(0);", "}", "",
+                  "__attribute__((constructor)) static void gt6_spu_missed_ctor(void)",
+                  "{", "    gt6_spu_missed_register();", "}", ""]
+        (spu / "spu_missed_register.c").write_text("\n".join(lines))
+    return out
+
+
+def lift_spu(elf, data, staging, python, tools, logs, missed_dir=None):
+    """The SPU step: lift EMAIN's SPU programs and job modules, and the images dumped to
+    missed_dir at run time, into staging/spu."""
     t0 = time.monotonic()
     spu = staging / "spu"
     st = map_game.run_tool(python, tools, "build_spu_workloads",
@@ -157,7 +270,8 @@ def lift_spu(elf, data, staging, python, tools, logs):
         if not st["ok"]:
             raise SystemExit(f"error: lift_jobmods failed, see {logs / 'lift_jobmods.log'}")
     images, jobmods, partial = spu_partial(spu, names)
-    return {"images": images, "jobmods": jobmods, "partial": partial,
+    missed = lift_missed(missed_dir, staging, python, tools, logs)
+    return {"images": images, "jobmods": jobmods, "partial": partial, "missed": missed,
             "seconds": round(time.monotonic() - t0, 2)}
 
 
@@ -198,7 +312,7 @@ def translate(tree, out, python, tools, chunks=64, jobs=None):
         m = re.search(r"(\d+) functions lifted", (logs / "ppu_lifter.log").read_text())
         if not m:
             raise SystemExit("error: ppu_lifter did not report a function count")
-        spu = lift_spu(elf, data, staging, python, tools, logs)
+        spu = lift_spu(elf, data, staging, python, tools, logs, tree / "spu-missed")
         record = {
             "elf": ELF_REL.as_posix(),
             "elf_sha256": map_game.sha256_file(elf),
