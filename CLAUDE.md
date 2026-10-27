@@ -39,8 +39,21 @@ source (D15). Anything that would change one goes to the owner with evidence.
 - **Never commit game files, keys, firmware or translated code.** Run `scripts/install_hooks.sh`
   once; `scripts/check_no_game_files.py` blocks PS3 signatures. Never push without the owner's say-so.
 
+## State as of 2026-10-27
+
+Milestone 1 is done on branch `m1/unpack` (not pushed). `gt6unpack build` makes a verified
+v1.22 tree at `~/Gran Turismo 6/build/BCES01977-v1.22`; `scripts/map_game.py` maps the code
+(about 72k functions, 740 imports, 4 SPU programs plus 57 SPURS job modules in EMAIN).
+Full suite with real data: 59 C++ cases and 25 Python tests, none skipped (set `GT6_DISC_DIR`
+to the mounted ISO and `GT6_UPDATES_DIR`). Facts in `docs/FINDINGS.md`; decisions D1-D23.
+
 ## Next steps
 
-Milestone 1 (unpack and map): `gt6unpack` (PKG/SELF decrypt, apply updates 1.02-1.22 in
-order, verify against a hash manifest), then map EMAIN.SELF code, imports and SPU programs.
-Plan lives in `.superpowers/sdd/` (local only).
+Milestone 2: the translated program starts and draws something. Plan it first (in
+`.superpowers/sdd/`, local only). Its first questions:
+
+1. The EBOOT data-patch step (PDIPFS/TPPS): what it leaves on disk, and do we reproduce it?
+2. SPURS/SPU strategy: the 57 job modules are raw in EMAIN; job chains and tasks are needed.
+3. Compile time and size of translating 72k functions.
+
+Also see `docs/BACKLOG.md` (milestone 2 open questions and polish list).

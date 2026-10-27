@@ -1,6 +1,27 @@
 # Findings
 
-Measurements and facts, newest first within each section.
+## Owner summary: milestone 1 (2026-10-27)
+
+**Milestone 1 is done.** Your copy of the game now turns into a verified version 1.22 game
+folder, and the game's code is fully mapped. Nothing failed outright.
+
+| Question | Answer |
+|---|---|
+| Is it really v1.22? | Yes. All 21 programs decrypted and the folder matches the recorded checksums. |
+| How big is the code? | One 23 MB program: about 72,000 functions, 15 MB of main-processor code. |
+| Helper-chip programs | 61 (the PS3 has small helper processors, "SPUs"): 4 stand-alone, 57 job modules, 1.76 MB in all. |
+| System calls to replace | 740 PS3 system functions from 46 libraries; about 290 are online-only and can be stubs. |
+| Biggest risk | The helper-chip code, which the game schedules with Sony's job system ("SPURS"). It is the largest piece of milestone 2 and our tools only half cover it. |
+| Other risk | The disc itself is not yet checked against an independent source (backlog). |
+| What milestone 2 needs | Your decision to start it. It will first settle how the launcher's data-patch step is handled, the helper-chip strategy, and how long translating 72,000 functions takes. |
+
+### Test run
+
+Full suite with the real disc and all updates (no skips):
+
+- `ctest --test-dir build`: `test cases: 59 | 59 passed | 0 failed | 0 skipped`; `assertions: 332 | 332 passed | 0 failed`.
+- `.venv/bin/python -m pytest tests -q`: `25 passed`.
+- `scripts/check_no_game_files.py $(git ls-files)`: clean.
 
 ## Code map of v1.22 (2026-10-27)
 

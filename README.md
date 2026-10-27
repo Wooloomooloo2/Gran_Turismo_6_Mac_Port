@@ -13,14 +13,17 @@ The PS3's system software is replaced by a Mac runtime, and its graphics command
 > code never leaves it. This project is not affiliated with or endorsed by Sony Interactive
 > Entertainment or Polyphony Digital.
 
-## Status: pre-alpha, milestone 1
+## Status: pre-alpha, milestone 1 done
 
-Milestone 1 is "unpack and map": turn your copy of the game into a verified version 1.22
-game folder, and map all its code, imports and SPU programs. Nothing is playable yet.
+Milestone 1 ("unpack and map") is done: your copy of the game turns into a verified version
+1.22 game folder, and its code, imports and SPU programs are mapped. Nothing is playable yet.
+
+**What's next:** milestone 2, where the translated program starts on the Mac and draws
+something.
 
 | Milestone | Outcome | State |
 |---|---|---|
-| 1 | Game unpacked, verified as v1.22, fully mapped | in progress |
+| 1 | Game unpacked, verified as v1.22, fully mapped | done |
 | 2 | Translated program starts on the Mac and draws something | not started |
 | 3 | Reach the first menu | not started |
 | 4 | A race | not started |
