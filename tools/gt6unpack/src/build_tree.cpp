@@ -431,9 +431,20 @@ int clone_with_clonefile(const fs::path& src, const fs::path& dst) {
 void build_tree(const BuildOptions& o) {
     const auto t0 = Clock::now();
     const Edition ed = load_edition(o.edition_file);
-    const fs::path out = o.out_dir;
+    if (o.out_dir.empty()) throw BuildError("no output directory given");
+    fs::path out = fs::absolute(o.out_dir).lexically_normal();
+    if (!out.has_filename()) out = out.parent_path();  // trailing separator
+    if (!out.has_filename() || out == out.root_path())
+        throw BuildError("bad output directory \"" + o.out_dir.string() + "\"");
     const fs::path staging = out.string() + ".staging";
-    if (out.empty() || !out.has_filename()) throw BuildError("bad output directory \"" + out.string() + "\"");
+    const fs::path old = out.string() + ".old";
+
+    // A run killed between moving <out> aside and moving the new tree in leaves <out>.old and no
+    // <out>: put the old tree back before anything else.
+    if (!fs::exists(fs::symlink_status(out)) && fs::exists(fs::symlink_status(old))) {
+        fs::rename(old, out);
+        o.log("restored " + out.string() + " from an interrupted earlier run");
+    }
     if (fs::exists(out) && !o.force) throw BuildError(out.string() + " already exists (use --force to rebuild)");
 
     // Inputs: the disc must be this title; every update present and verified before writing.
@@ -460,15 +471,30 @@ void build_tree(const BuildOptions& o) {
                              uint64_t(fs::file_size(ordered[i]))});
 
     fs::create_directories(out.parent_path());
-    if (fs::exists(staging)) remove_tree(staging);  // leftovers of an interrupted earlier run
+    // Leftovers of an interrupted earlier run. <out> (if any) is the good tree at this point:
+    // a staging tree is never the only copy, and an .old tree beside <out> is superseded.
+    if (fs::exists(fs::symlink_status(staging))) remove_tree(staging);
+    if (fs::exists(fs::symlink_status(old))) remove_tree(old);
     fs::create_directories(staging);
     try {
         std::string final_ver;
         build_into(o, ed, ordered, staging, r, final_ver);
         r.timings.push_back({"total", seconds_since(t0)});
         write_build_json(staging / "build.json", o, ed, final_ver, r);
-        if (fs::exists(out)) remove_tree(out);
-        fs::rename(staging, out);
+        // Swap by renames only, so <out> is always either the old or the new complete tree.
+        const bool replacing = fs::exists(fs::symlink_status(out));
+        if (replacing) fs::rename(out, old);
+        try {
+            fs::rename(staging, out);
+        } catch (...) {
+            if (replacing) fs::rename(old, out);
+            throw;
+        }
+        if (replacing) {
+            std::error_code ec;
+            remove_tree(old, ec);  // best effort; the next run removes what is left
+            if (ec) o.log("could not remove the previous build at " + old.string() + ": " + ec.message());
+        }
     } catch (...) {
         std::error_code ec;
         remove_tree(staging, ec);

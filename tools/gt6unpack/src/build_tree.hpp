@@ -32,7 +32,10 @@ struct BuildOptions {
 // updates verified (before anything is written), disc cloned (or copied after a free-space
 // check), updates installed, every SELF decrypted (all failures are collected, then thrown
 // together as one SelfError), final PARAM.SFO APP_VER equal to the
-// edition's target. On failure nothing is left at <out>.staging and <out> is untouched.
+// edition's target. On failure nothing is left at <out>.staging and <out> is untouched. With
+// --force the old tree is renamed to <out>.old, the new one renamed in, then the old one
+// removed; a run killed in between is repaired at the next start. A relative <out> or one with
+// a trailing separator is accepted.
 // Throws BuildError, UpdateError, PkgError or SelfError.
 void build_tree(const BuildOptions& opts);
 

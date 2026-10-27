@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <random>
 #include <string>
 
@@ -116,6 +117,7 @@ struct World {
 
     BuildOptions opts() const { return {disc, updates, out, edition, false}; }
     fs::path staging() const { return fs::path(out.string() + ".staging"); }
+    fs::path old() const { return fs::path(out.string() + ".old"); }
     fs::path game() const { return out / "dev_hdd0" / "game" / "BCES01977"; }
 };
 
@@ -323,5 +325,68 @@ TEST_CASE("an NPDRM SELF whose klicensee is nowhere fails the build, naming the 
     CHECK_THROWS_WITH_AS(build_tree(w.opts()),
                          doctest::Contains("dev_hdd0/game/BCES01977/USRDIR/EMAIN.SELF"), SelfError);
     CHECK_FALSE(fs::exists(w.out));
+    CHECK_FALSE(fs::exists(w.staging()));
+}
+
+namespace {
+// Every file under root (relative path -> contents), for byte-for-byte tree comparisons.
+std::map<std::string, Buf> snapshot(const fs::path& root) {
+    std::map<std::string, Buf> m;
+    for (const auto& e : fs::recursive_directory_iterator(root))
+        if (e.is_regular_file()) m[fs::relative(e.path(), root).generic_string()] = slurp(e.path());
+    return m;
+}
+}  // namespace
+
+TEST_CASE("a --force rebuild that fails late leaves the old tree intact") {
+    World w;
+    build_tree(w.opts());
+    const auto before = snapshot(w.out);
+    REQUIRE(before.count("build.json"));
+    w.write_edition("01.05");  // fails at the final APP_VER check, after the whole build
+    BuildOptions o = w.opts();
+    o.force = true;
+    CHECK_THROWS_WITH_AS(build_tree(o), doctest::Contains("01.05"), BuildError);
+    CHECK(snapshot(w.out) == before);
+    CHECK_FALSE(fs::exists(w.staging()));
+    CHECK_FALSE(fs::exists(w.old()));
+}
+
+TEST_CASE("an interrupted swap is recovered, not deleted") {
+    World w;
+    build_tree(w.opts());
+    const auto before = snapshot(w.out);
+    // As if killed between moving the old tree aside and moving the new one in.
+    fs::rename(w.out, w.old());
+    spit(w.staging() / "partial.bin", std::string("half a build"));
+    CHECK_THROWS_WITH_AS(build_tree(w.opts()), doctest::Contains("already exists"), BuildError);
+    CHECK(snapshot(w.out) == before);  // the old tree is back in place
+    CHECK_FALSE(fs::exists(w.old()));
+
+    BuildOptions o = w.opts();
+    o.force = true;
+    build_tree(o);
+    CHECK(app_ver(w.game() / "PARAM.SFO") == "01.04");
+    CHECK_FALSE(fs::exists(w.out / "partial.bin"));
+    CHECK_FALSE(fs::exists(w.staging()));
+    CHECK_FALSE(fs::exists(w.old()));
+}
+
+TEST_CASE("a relative --out or one with a trailing slash works") {
+    World w;
+    struct Cwd {
+        fs::path saved = fs::current_path();
+        ~Cwd() { fs::current_path(saved); }
+    } cwd;
+    fs::current_path(w.base);
+    BuildOptions o = w.opts();
+    o.out_dir = "BCES01977-rel";
+    build_tree(o);
+    CHECK(app_ver(w.base / "BCES01977-rel" / "dev_hdd0" / "game" / "BCES01977" / "PARAM.SFO") == "01.04");
+    CHECK_FALSE(fs::exists(w.base / "BCES01977-rel.staging"));
+
+    o.out_dir = w.out.string() + "/";
+    build_tree(o);
+    CHECK(app_ver(w.game() / "PARAM.SFO") == "01.04");
     CHECK_FALSE(fs::exists(w.staging()));
 }
