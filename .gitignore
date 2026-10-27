@@ -8,6 +8,7 @@ out/
 *.PUP
 game/
 keys.local*
+keys.local/
 .superpowers/
 .venv/
 __pycache__/

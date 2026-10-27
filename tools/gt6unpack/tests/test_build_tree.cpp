@@ -3,6 +3,7 @@
 #include "crypto.hpp"
 #include "pkg_builder.hpp"
 #include "self.hpp"
+#include "self_builder.hpp"
 #include "sfo.hpp"
 #include "updates.hpp"
 
@@ -18,8 +19,6 @@ using namespace gt6test;
 namespace fs = std::filesystem;
 
 namespace {
-
-using Buf = std::vector<uint8_t>;
 
 Buf slurp(const fs::path& p) {
     std::ifstream f(p, std::ios::binary);
@@ -288,5 +287,41 @@ TEST_CASE("a read-only disc tree copies, clones and rebuilds") {
         CHECK((perms & fs::perms::owner_write) != fs::perms::none);
     }
     build_tree([&] { BuildOptions o = w.opts(); o.force = true; return o; }());
+    CHECK_FALSE(fs::exists(w.staging()));
+}
+
+namespace {
+// The klicensee kGameKlic as the game's EBOOT stores it: a hex string in its data.
+const std::string kGameKlicText = "0x1032547698badcfe0123456789abcdef";
+}  // namespace
+
+TEST_CASE("an NPDRM SELF opens with the klicensee found in the update EBOOT") {
+    World w;
+    const Fixture eboot = make_fixture(Kind::NpdrmFree, nullptr, kGameKlicText + std::string(1, '\0'));
+    const Fixture emain = make_fixture(Kind::NpdrmFree, &kGameKlic);
+    w.shas[2].second = make_update(w.updates / "a-third.pkg", "01.04",
+                                   {{"USRDIR/EBOOT.BIN", eboot.self}, {"USRDIR/TPPS/EMAIN.SELF", emain.self}});
+    w.write_edition("01.04");
+    build_tree(w.opts());
+    const fs::path dec = w.out / "decrypted" / "dev_hdd0" / "game" / "BCES01977" / "USRDIR";
+    CHECK(slurp(dec / "EBOOT.BIN.elf") == eboot.elf);
+    CHECK(slurp(dec / "TPPS" / "EMAIN.SELF.elf") == emain.elf);
+    const Buf j = slurp(w.out / "build.json");
+    const std::string json(j.begin(), j.end());
+    CHECK(json.find("\"klicensee_from\": \"decrypted/dev_hdd0/game/BCES01977/USRDIR/EBOOT.BIN.elf\"") !=
+          std::string::npos);
+    CHECK(json.find(kGameKlicText.substr(2)) == std::string::npos);  // the key itself is never written
+}
+
+TEST_CASE("an NPDRM SELF whose klicensee is nowhere fails the build, naming the file") {
+    World w;
+    const Fixture eboot = make_fixture(Kind::NpdrmFree);
+    const Fixture emain = make_fixture(Kind::NpdrmFree, &kGameKlic);
+    w.shas[2].second = make_update(w.updates / "a-third.pkg", "01.04",
+                                   {{"USRDIR/EBOOT.BIN", eboot.self}, {"USRDIR/EMAIN.SELF", emain.self}});
+    w.write_edition("01.04");
+    CHECK_THROWS_WITH_AS(build_tree(w.opts()),
+                         doctest::Contains("dev_hdd0/game/BCES01977/USRDIR/EMAIN.SELF"), SelfError);
+    CHECK_FALSE(fs::exists(w.out));
     CHECK_FALSE(fs::exists(w.staging()));
 }

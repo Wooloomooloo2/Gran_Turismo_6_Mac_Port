@@ -2,6 +2,7 @@
 #include "build_tree.hpp"
 
 #include "crypto.hpp"
+#include "klic.hpp"
 #include "pkg.hpp"
 #include "self.hpp"
 #include "sfo.hpp"
@@ -180,15 +181,39 @@ struct Decrypted {
     std::string source, output, sha256;
     uint64_t size;
     SelfInfo info;
+    std::string klicensee_from;  // decrypted file the klicensee was found in; empty if none needed
 };
 struct Skipped {
     std::string path, reason;
 };
+struct Failed {
+    std::string path, reason;
+    bool npdrm_free = false;  // may open with the game's own klicensee
+};
+
+void write_file(const fs::path& out, std::span<const uint8_t> data) {
+    fs::create_directories(out.parent_path());
+    std::ofstream o(out, std::ios::binary | std::ios::trunc);
+    o.write(reinterpret_cast<const char*>(data.data()), std::streamsize(data.size()));
+    o.close();
+    if (!o) throw BuildError("write failed for " + out.string());
+}
 
 // Decrypts every SELF in staging/dev_bdvd and staging/dev_hdd0 into staging/decrypted.
+// Free-licence NPDRM SELFs that do not open with the public klicensee are retried with each
+// klicensee string found in the decrypted update EBOOT.BIN files (see klic.hpp).
 void decrypt_all(const fs::path& staging, std::vector<Decrypted>& done, std::vector<Skipped>& skipped,
                  const std::function<void(const std::string&)>& log) {
-    std::vector<Skipped> failed;
+    std::vector<Failed> failed;
+    auto store = [&](const std::string& rel, std::span<const uint8_t> elf, const SelfInfo& info,
+                     const std::string& klic_from) {
+        const fs::path out = staging / "decrypted" / (rel + ".elf");
+        write_file(out, elf);
+        done.push_back({rel, fs::relative(out, staging).generic_string(), hex(crypto::sha256(elf)), elf.size(), info,
+                        klic_from});
+        log("decrypted " + rel);
+    };
+
     for (const char* tree : {"dev_bdvd", "dev_hdd0"}) {
         for (const fs::path& file : files_under(staging / tree)) {
             const std::string rel = fs::relative(file, staging).generic_string();
@@ -224,23 +249,44 @@ void decrypt_all(const fs::path& staging, std::vector<Decrypted>& done, std::vec
                 }
                 continue;
             }
-            std::vector<uint8_t> elf;
             try {
-                elf = decrypt_self(data);
+                store(rel, decrypt_self(data), info, "");
             } catch (const SelfError& e) {
-                failed.push_back({rel, e.what()});
-                continue;
+                failed.push_back({rel, e.what(), info.npdrm && info.npdrm_license == 3});
             }
-            const fs::path out = staging / "decrypted" / (rel + ".elf");
-            fs::create_directories(out.parent_path());
-            std::ofstream o(out, std::ios::binary | std::ios::trunc);
-            o.write(reinterpret_cast<const char*>(elf.data()), std::streamsize(elf.size()));
-            o.close();
-            if (!o) throw BuildError("write failed for " + out.string());
-            done.push_back({rel, fs::relative(out, staging).generic_string(), hex(crypto::sha256(elf)), elf.size(), info});
-            log("decrypted " + rel);
         }
     }
+
+    if (std::any_of(failed.begin(), failed.end(), [](const Failed& f) { return f.npdrm_free; })) {
+        // Klicensee candidates from the decrypted update EBOOT.BIN files, in tree order.
+        std::vector<std::pair<KlicCandidate, std::string>> cands;
+        for (const Decrypted& d : done)
+            if (d.source.starts_with("dev_hdd0/") && fs::path(d.source).filename() == "EBOOT.BIN")
+                for (const KlicCandidate& c : klicensee_strings(slurp(staging / d.output))) cands.push_back({c, d.output});
+        std::vector<Failed> still;
+        for (const Failed& f : failed) {
+            bool opened = false;
+            if (f.npdrm_free) {
+                const std::vector<uint8_t> data = slurp(staging / f.path);
+                for (const auto& [c, from] : cands) {
+                    try {
+                        // decrypt_self accepts the key only if the metadata opens and every
+                        // program segment HMAC matches.
+                        store(f.path, decrypt_self(data, &c.key), inspect_self(data), from);
+                        opened = true;
+                        break;
+                    } catch (const SelfError&) {
+                    }
+                }
+            }
+            if (!opened)
+                still.push_back({f.path, f.reason + (f.npdrm_free ? "; no klicensee in the decrypted update "
+                                                                    "EBOOT.BIN opens it"
+                                                                  : "")});
+        }
+        failed = std::move(still);
+    }
+
     if (!failed.empty()) {
         std::string msg = std::to_string(failed.size()) + " SELF file(s) failed to decrypt:";
         for (const auto& f : failed) msg += "\n  " + f.path + ": " + f.reason;
@@ -292,7 +338,9 @@ void write_build_json(const fs::path& path, const BuildOptions& o, const Edition
         j << (i ? "," : "") << "\n    {\"source\": " << json_str(d.source) << ", \"output\": " << json_str(d.output)
           << ", \"size\": " << d.size << ", \"sha256\": " << json_str(d.sha256)
           << ", \"program_type\": " << d.info.program_type << ", \"npdrm\": " << (d.info.npdrm ? "true" : "false")
-          << ", \"key_revision\": " << d.info.key_revision << "}";
+          << ", \"key_revision\": " << d.info.key_revision;
+        if (!d.klicensee_from.empty()) j << ", \"klicensee_from\": " << json_str(d.klicensee_from);
+        j << "}";
     }
     j << "\n  ],\n";
     j << "  \"sce_skipped\": [";
