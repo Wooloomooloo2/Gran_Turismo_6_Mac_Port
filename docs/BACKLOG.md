@@ -22,6 +22,7 @@ Shortcuts taken, with the proper fix logged. Priority order: 1) Stability, 2) Pe
 - `g_sjlj_top` is not reset when the interrupt-handler loop re-enters after a thread-exit unwind (`runtime/syscalls/sys_ppu_thread.c` ~229-233 and ~647). Reset it there.
 - `port/CMakeLists.txt` runs the patch script with the caller's environment, so an exported `GT6_PS3RECOMP_DIR` or `GT6_PS3RECOMP_PATCHES` would patch a different checkout than the one being built while the hash check still passes. Run it through `cmake -E env` with those set explicitly.
 - `scripts/translate_game.py` still accepts a `translate.json` with no `tool` field (written before the milestone 2 final fixes) as its own output, so `-o` would replace a copied backup of `recomp/`. The owner's tree has been re-translated with `tool` set; drop the legacy rule.
+- Two upstream ps3recomp runners in `tests/scripts/test_ps3recomp_patches.py` are load-sensitive: `test_gcm_walker_prof` (1 s sampler timing) and `test_spu_context_registries` (`test_spu_lockline_peer`, 30 s timeout). On 2026-10-27, with another app using about 450% CPU, both failed on an unpatched `git archive` of 4e8f3ca8 too; they pass on an idle machine (172 passed). Skip or retry them when the load is high, and report the timing assumptions upstream.
 - ps3recomp's `cellKb` reports a keyboard always connected on port 0 and caps `CELL_KB_MAX_KEYBOARDS` at 2 (SDK: 127). Check what GT6 does with a keyboard present versus RPCS3's default null keyboard.
 
 ## 2) Performance
