@@ -4,7 +4,7 @@ target_compile_options(gt6crypto PRIVATE -Wall -Wextra)
 find_package(ZLIB REQUIRED)
 target_link_libraries(gt6crypto PUBLIC ZLIB::ZLIB)
 
-add_library(gt6build STATIC src/updates.cpp src/klic.cpp src/build_tree.cpp src/manifest.cpp)
+add_library(gt6build STATIC src/json_util.cpp src/updates.cpp src/klic.cpp src/build_tree.cpp src/manifest.cpp)
 target_include_directories(gt6build PUBLIC src)
 target_compile_options(gt6build PRIVATE -Wall -Wextra)
 target_link_libraries(gt6build PUBLIC gt6crypto)

@@ -1,6 +1,7 @@
 #include "manifest.hpp"
 
 #include "crypto.hpp"
+#include "json_util.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -51,23 +52,6 @@ std::vector<std::string> list_files(const fs::path& out) {
     }
     std::sort(v.begin(), v.end());
     return v;
-}
-
-std::string json_str(const std::string& s) {
-    std::string o = "\"";
-    for (unsigned char c : s) {
-        if (c == '"' || c == '\\') {
-            o += '\\';
-            o += char(c);
-        } else if (c < 0x20) {
-            char b[8];
-            std::snprintf(b, sizeof b, "\\u%04x", c);
-            o += b;
-        } else {
-            o += char(c);
-        }
-    }
-    return o + "\"";
 }
 
 // Minimal reader for the manifest's own JSON shape (objects, arrays, strings, unsigned numbers).

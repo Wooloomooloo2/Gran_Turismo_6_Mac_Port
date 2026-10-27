@@ -2,6 +2,7 @@
 #include "build_tree.hpp"
 
 #include "crypto.hpp"
+#include "json_util.hpp"
 #include "klic.hpp"
 #include "pkg.hpp"
 #include "self.hpp"
@@ -31,23 +32,6 @@ constexpr uint64_t kSpaceMargin = 1ull << 30;  // keep 1 GiB spare beyond the es
 
 double seconds_since(Clock::time_point t) {
     return std::chrono::duration<double>(Clock::now() - t).count();
-}
-
-std::string json_str(const std::string& s) {
-    std::string o = "\"";
-    for (unsigned char c : s) {
-        if (c == '"' || c == '\\') {
-            o += '\\';
-            o += char(c);
-        } else if (c < 0x20) {
-            char b[8];
-            std::snprintf(b, sizeof b, "\\u%04x", c);
-            o += b;
-        } else {
-            o += char(c);
-        }
-    }
-    return o + "\"";
 }
 
 std::vector<uint8_t> slurp(const fs::path& p) {
