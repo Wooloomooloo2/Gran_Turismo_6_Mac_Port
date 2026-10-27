@@ -35,3 +35,7 @@ Numbered, dated, with reasoning. Do not re-litigate D1-D12 without the owner.
 **D14 (2026-10-27).** Updates are installed as a separate `dev_hdd0` tree, as on a real PS3, not merged into the disc tree. Reason: matches how the game expects to find them, keeps the disc image untouched, and makes verification per layer.
 
 **D15 (2026-10-27, owner).** Public PS3 decryption keys live in source, following the RPCS3 and ps3recomp precedent. Reason: players need no key hunting; the keys are publicly documented. This is a legal-exposure call and was made by the owner. No console-unique or disc-specific keys are ever committed (`keys.local*` is git-ignored).
+
+**D16 (2026-10-27).** SELF decryption checks the section hash of every program segment and skips the hash of the section header table and SCE version sections. Reason: on the real disc executables the segment hashes match exactly, but the other two never match under any coverage tried (evidence in FINDINGS). Checking them would reject valid files. The decrypted ELFs are byte-identical to RPCS3's.
+
+**D17 (2026-10-27).** The SELF decrypter supports retail ELF64 application and free-licence NPDRM SELFs only. Debug/fake SELFs, ELF32 SELFs and paid NPDRM licences raise clear errors. Reason: GT6's executables and its update packages need nothing more; less code to get wrong.
