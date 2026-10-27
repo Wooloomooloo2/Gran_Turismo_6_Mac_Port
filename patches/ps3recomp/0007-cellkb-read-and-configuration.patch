@@ -1,0 +1,207 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] cellKb: cellKbRead and cellKbGetConfiguration
+
+Upstream: not yet submitted
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0006)
+
+What: adds cellKbRead (0xFF0A21B7), the SDK name for the read that
+cellKbGetData implements, and cellKbGetConfiguration (0x1F71ECBE), which
+writes CellKbConfig {arrange, read_mode, code_type} with RPCS3's checks
+(cellKb.cpp, GPL-2.0): uninitialised, port out of range, NO_DEVICE for an
+empty port (nothing written), then a null config. The layout reported is
+RPCS3's default, CELL_KB_MAPPING_101.
+
+Why: the HLE table registers by the hash of the function name, and
+"cellKbGetData" hashes to a NID no title imports. Both imports were
+unresolved and faked CELL_OK without writing their structs; Gran Turismo 6
+then walked an uninitialised keycode count (func_00A8BD40) off the top of
+its 16 KB thread stack into a guard page.
+
+Test: tools/test_kb_read.py (new; checks both NIDs and builds
+libs/input/tests/test_kb_read.c).
+
+--- a/libs/input/cellKb.c
++++ b/libs/input/cellKb.c
+@@ -278,4 +278,41 @@
+     memset(s_kb_ports[port_no].key_state, 0, sizeof(s_kb_ports[port_no].key_state));
+     s_kb_ports[port_no].event_count = 0;
+     return CELL_OK;
++}
++
++/* cellKbRead is the SDK's name for the read cellKbGetData above implements
++ * (titles import it as 0xFF0A21B7; "cellKbGetData" hashes to a NID nothing
++ * imports). Unregistered, the import faked CELL_OK without writing the
++ * CellKbData, and Gran Turismo 6 walked an uninitialised `len` worth of
++ * keycodes off the top of its 16 KB thread stack. */
++s32 cellKbRead(u32 port_no, CellKbData* data)
++{
++    return cellKbGetData(port_no, data);
+ }
++
++/* Guest CellKbConfig layout (big-endian): +0x00 arrange u32, +0x04 read_mode
++ * u32, +0x08 code_type u32. Checks in RPCS3's order (cellKb.cpp, GPL-2.0):
++ * not initialised, port out of range, no keyboard on the port (NO_DEVICE,
++ * nothing written), then a null config. The layout is the 101-key default
++ * RPCS3 reports. */
++s32 cellKbGetConfiguration(u32 port_no, CellKbConfig* config)
++{
++    unsigned long long ea = (unsigned int)(uintptr_t)config;
++
++    if (!s_kb_initialized)
++        return CELL_KB_ERROR_UNINITIALIZED;
++
++    if (port_no >= CELL_KB_MAX_KEYBOARDS)
++        return CELL_KB_ERROR_INVALID_PARAMETER;
++
++    if (port_no >= s_kb_max_connect || !s_kb_ports[port_no].connected)
++        return CELL_KB_ERROR_NO_DEVICE;
++
++    if (!config)
++        return CELL_KB_ERROR_INVALID_PARAMETER;
++
++    vm_write32(ea + 0x00, CELL_KB_MAPPING_101);
++    vm_write32(ea + 0x04, s_kb_ports[port_no].rmode);
++    vm_write32(ea + 0x08, s_kb_ports[port_no].codetype);
++    return CELL_OK;
++}
+--- a/libs/input/cellKb.h
++++ b/libs/input/cellKb.h
+@@ -141,6 +141,14 @@
+     u32 status[CELL_KB_MAX_KEYBOARDS];  /* Per-keyboard status */
+ } CellKbInfo;
+ 
++/* Keyboard configuration returned by cellKbGetConfiguration */
++#define CELL_KB_MAPPING_101             0
++typedef struct CellKbConfig {
++    u32 arrange;                        /* CELL_KB_MAPPING_* layout */
++    u32 read_mode;                      /* CELL_KB_RMODE_* */
++    u32 code_type;                      /* CELL_KB_CODETYPE_* */
++} CellKbConfig;
++
+ /* ---------------------------------------------------------------------------
+  * Functions
+  * -----------------------------------------------------------------------*/
+@@ -148,6 +156,8 @@
+ s32 cellKbInit(u32 max_connect);
+ s32 cellKbEnd(void);
+ s32 cellKbGetData(u32 port_no, CellKbData* data);
++s32 cellKbRead(u32 port_no, CellKbData* data);
++s32 cellKbGetConfiguration(u32 port_no, CellKbConfig* config);
+ s32 cellKbGetInfo(CellKbInfo* info);
+ s32 cellKbSetReadMode(u32 port_no, u32 rmode);
+ s32 cellKbSetCodeType(u32 port_no, u32 codetype);
+--- /dev/null
++++ b/libs/input/tests/test_kb_read.c
+@@ -0,0 +1,52 @@
++/* Actual cellKbRead / cellKbGetConfiguration over big-endian guest memory.
++ * Run by tools/test_kb_read.py, which also checks the two names hash to the
++ * NIDs titles import. */
++#include "../cellKb.c"
++#include <assert.h>
++
++static uint8_t mem[0x1000];
++void vm_write8 (unsigned long long a, unsigned char  v) { mem[a] = v; }
++void vm_write16(unsigned long long a, unsigned short v) { mem[a] = (uint8_t)(v >> 8); mem[a + 1] = (uint8_t)v; }
++void vm_write32(unsigned long long a, unsigned int   v) { for (int i = 0; i < 4; i++) mem[a + i] = (uint8_t)(v >> (24 - 8 * i)); }
++static uint32_t rd32(uint32_t a) { return (uint32_t)mem[a] << 24 | mem[a + 1] << 16 | mem[a + 2] << 8 | mem[a + 3]; }
++static uint16_t rd16(uint32_t a) { return (uint16_t)(mem[a] << 8 | mem[a + 1]); }
++
++static int fails = 0;
++#define CHECK(c, ...) do { const int ok_ = (c); printf(ok_ ? "[PASS] " : "[FAIL] "); printf(__VA_ARGS__); printf("\n"); if (!ok_) fails++; } while (0)
++#define GUEST(t, ea) ((t*)(uintptr_t)(ea))
++
++int main(void)
++{
++    setvbuf(stdout, NULL, _IONBF, 0);
++    CHECK(cellKbRead(0, GUEST(CellKbData, 0x100)) == (s32)CELL_KB_ERROR_UNINITIALIZED,
++          "cellKbRead before cellKbInit is UNINITIALIZED");
++    CHECK(cellKbGetConfiguration(0, GUEST(CellKbConfig, 0x200)) == (s32)CELL_KB_ERROR_UNINITIALIZED,
++          "cellKbGetConfiguration before cellKbInit is UNINITIALIZED");
++    assert(cellKbInit(2) == CELL_OK);
++    assert(cellKbSetReadMode(0, CELL_KB_RMODE_PACKET) == CELL_OK);
++    assert(cellKbSetCodeType(0, CELL_KB_CODETYPE_RAW) == CELL_OK);
++
++    memset(mem, 0xAA, sizeof mem);
++    cellKb_keyEvent(0, CELL_KEYC_A, 1);
++    CHECK(cellKbRead(0, GUEST(CellKbData, 0x100)) == CELL_OK, "cellKbRead on the connected keyboard is CELL_OK");
++    CHECK(rd32(0x108) == 1 && rd16(0x10C) == CELL_KEYC_A, "it writes len 1 and the key (len %u, key 0x%X)",
++          rd32(0x108), rd16(0x10C));
++    CHECK(cellKbRead(0, GUEST(CellKbData, 0x100)) == CELL_OK && rd32(0x108) == 0,
++          "a second read has len 0 (the packet was consumed)");
++    CHECK(cellKbRead(1, GUEST(CellKbData, 0x100)) == (s32)CELL_KB_ERROR_NO_DEVICE,
++          "cellKbRead on an empty port is NO_DEVICE");
++
++    memset(mem, 0xAA, sizeof mem);
++    CHECK(cellKbGetConfiguration(0, GUEST(CellKbConfig, 0x200)) == CELL_OK, "cellKbGetConfiguration is CELL_OK");
++    CHECK(rd32(0x200) == CELL_KB_MAPPING_101 && rd32(0x204) == CELL_KB_RMODE_PACKET &&
++          rd32(0x208) == CELL_KB_CODETYPE_RAW, "it reports layout 101, the read mode and code type set");
++    CHECK(rd32(0x20C) == 0xAAAAAAAAu, "and writes nothing past the 12-byte CellKbConfig");
++    CHECK(cellKbGetConfiguration(1, GUEST(CellKbConfig, 0x200)) == (s32)CELL_KB_ERROR_NO_DEVICE,
++          "an empty port is NO_DEVICE");
++    CHECK(cellKbGetConfiguration(CELL_KB_MAX_KEYBOARDS, GUEST(CellKbConfig, 0x200)) == (s32)CELL_KB_ERROR_INVALID_PARAMETER,
++          "a port out of range is INVALID_PARAMETER");
++    CHECK(cellKbGetConfiguration(0, NULL) == (s32)CELL_KB_ERROR_INVALID_PARAMETER,
++          "a null config on a connected port is INVALID_PARAMETER");
++    printf("%s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
++    return fails ? 1 : 0;
++}
+--- /dev/null
++++ b/tools/test_kb_read.py
+@@ -0,0 +1,57 @@
++#!/usr/bin/env python3
++"""cellKbRead and cellKbGetConfiguration (libs/input/cellKb.c).
++
++Titles import the keyboard read as cellKbRead (0xFF0A21B7) and the layout
++query as cellKbGetConfiguration (0x1F71ECBE). Neither was registered: the
++read existed only as "cellKbGetData", whose NID nothing imports, so both
++faked CELL_OK without writing their structs, and Gran Turismo 6 walked an
++uninitialised keycode count off the top of its thread stack.
++
++Checks that both names hash to those NIDs (the HLE table registers by the
++hash of the function name), then builds libs/input/tests/test_kb_read.c,
++which includes cellKb.c, and runs it.
++"""
++import hashlib
++import os
++import shutil
++import struct
++import subprocess
++import sys
++import tempfile
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++SUFFIX = b"\x67\x59\x65\x99\x04\x25\x04\x90\x56\x64\x27\x49\x94\x89\x74\x1A"
++
++
++def nid(name):
++    return struct.unpack('<I', hashlib.sha1(name.encode() + SUFFIX).digest()[:4])[0]
++
++
++def main():
++    fails = 0
++    for name, want in (('cellKbRead', 0xFF0A21B7), ('cellKbGetConfiguration', 0x1F71ECBE)):
++        got = nid(name)
++        ok = got == want
++        fails += not ok
++        print(f"[{'PASS' if ok else 'FAIL'}] {name} hashes to 0x{got:08X} (imported as 0x{want:08X})")
++    cc = os.environ.get('CC') or shutil.which('cc') or shutil.which('gcc') or shutil.which('clang')
++    if not cc:
++        print('SKIP: no C compiler')
++        return 1 if fails else 0
++    with tempfile.TemporaryDirectory() as tmp:
++        exe = Path(tmp) / 'test_kb_read'
++        r = subprocess.run([cc, '-std=gnu17', '-O1', '-w', '-I' + str(ROOT / 'include'),
++                            str(ROOT / 'libs/input/tests/test_kb_read.c'), '-o', str(exe)],
++                           capture_output=True, text=True)
++        if r.returncode:
++            print(r.stdout + r.stderr)
++            print('FAIL: fixture did not build')
++            return 1
++        r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=30)
++        sys.stdout.write(r.stdout)
++        return 1 if (fails or r.returncode) else 0
++
++
++if __name__ == '__main__':
++    sys.exit(main())
