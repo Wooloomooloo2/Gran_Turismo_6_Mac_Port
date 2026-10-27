@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 import json
 import os
+import shutil
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -139,11 +141,19 @@ def test_boot_records_itself_and_warns_on_a_used_play_folder(tree, tmp_path, cap
     assert "used by run 20000101-000000" in (Path(rep["run"]) / "summary.md").read_text()
 
 
-def test_default_environment(tree, tmp_path):
+def test_default_environment(tree, tmp_path, monkeypatch):
+    monkeypatch.delenv("PS3RECOMP_METAL_FRAME_DUMP", raising=False)
     env = boot_game.build_env(tree, Path(tmp_path / "run"), True, None)
     assert env["PS3RECOMP_METAL_HEADLESS"] == "1"
     assert env["PS3_MILESTONE_OUT"].endswith("milestones.log")
-    assert env["PS3RECOMP_METAL_FRAME_DUMP"].endswith("frames/frame.ppm")
+    # The numbered series replaces milestone 2's single overwritten dump.
+    assert env["PS3RECOMP_METAL_FRAME_DIR"] == str(tmp_path / "run" / "frames")
+    assert env["PS3RECOMP_METAL_FRAME_EVERY"] == "60"
+    assert env["PS3RECOMP_METAL_FRAME_MAX"] == "300"
+    assert env["PS3RECOMP_DRAW_STATS"] == str(tmp_path / "run" / "draw_stats.txt")
+    assert "PS3RECOMP_METAL_FRAME_DUMP" not in env
+    env = boot_game.build_env(tree, tmp_path, True, None, frame_every=7, frame_max=9)
+    assert env["PS3RECOMP_METAL_FRAME_EVERY"] == "7" and env["PS3RECOMP_METAL_FRAME_MAX"] == "9"
     assert boot_game.build_env(tree, tmp_path, False, {"A": "b"})["A"] == "b"
     assert "PS3RECOMP_METAL_HEADLESS" not in boot_game.build_env(tree, tmp_path, False, None)
 
@@ -159,6 +169,156 @@ def test_refuses_unprepared_play_folder(tree, tmp_path):
     with pytest.raises(SystemExit) as e:
         boot_game.boot(fake("hang", tmp_path), tree)
     assert "prepare_play.py" in str(e.value)
+
+
+@pytest.mark.parametrize("rc,to,keys,frames,want", [
+    (None, True, ["gcm:flip"], 3, "timeout"),     # ran to the end: frames kept, still timeout
+    (None, True, ["a"], 0, "timeout"),
+    (-11, False, ["gcm:flip"], 3, "crashed"),
+    (0, False, ["gcm:flip"], 3, "first_frame"),   # ended by itself after its first frame
+    (0, False, ["gcm:flip"], 0, "flip_no_frame"),
+])
+def test_classify_time_mode(rc, to, keys, frames, want):
+    assert boot_game.classify(rc, to, False, keys, frames, until="time") == want
+
+
+def test_until_time_ignores_flip(tree, tmp_path, monkeypatch):
+    monkeypatch.setattr(boot_game, "FLIP_GRACE", 0.5)
+    rep = boot_game.boot(fake("series", tmp_path), tree, seconds=4, idle=30, until="time",
+                         frame_every=10)
+    assert rep["outcome"] == "timeout"
+    assert 3.5 <= rep["seconds"] < 15
+    assert rep["frames"] >= 2                      # present 1, 10, 20, ...
+    assert rep["returncode"] is None
+    assert rep["dump_stopped"] is None
+    assert pid_gone(rep["pid"])
+    names = [f["file"] for f in rep["frames_list"]]
+    assert names[0] == "frame_000001.ppm" and names == sorted(names)
+    assert rep["frames_list"][0]["presented"] == 1
+
+
+def test_until_flip_keeps_stopping_early(tree, tmp_path, monkeypatch):
+    monkeypatch.setattr(boot_game, "FLIP_GRACE", 1.0)
+    rep = boot_game.boot(fake("series", tmp_path), tree, seconds=60, idle=30)
+    assert rep["outcome"] == "first_frame" and rep["seconds"] < 20
+
+
+def test_drawn_needs_draw_calls(tree, tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_NONZERO", "1")
+    monkeypatch.setenv("FAKE_DRAWS", "0")
+    rep = boot_game.boot(fake("series", tmp_path), tree, seconds=2, idle=30, until="time")
+    assert rep["frames"] >= 1
+    first = rep["frames_list"][0]
+    assert first["draws"] == 0 and first["clears"] == 1
+    assert first["nonzero_share"] == 1.0
+    assert rep["drawn_frames"] == 0 and rep["first_drawn"] is None
+
+
+def test_drawn_needs_non_black_pixels(tree, tmp_path, monkeypatch):
+    monkeypatch.delenv("FAKE_NONZERO", raising=False)
+    monkeypatch.setenv("FAKE_DRAWS", "12")
+    rep = boot_game.boot(fake("series", tmp_path), tree, seconds=2, idle=30, until="time")
+    assert rep["frames_list"][0]["nonzero_share"] == 0.0
+    assert rep["drawn_frames"] == 0 and rep["first_drawn"] is None
+
+
+def test_drawn_frame_counted(tree, tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_NONZERO", "1")
+    monkeypatch.setenv("FAKE_DRAWS", "12")
+    rep = boot_game.boot(fake("series", tmp_path), tree, seconds=2, idle=30, until="time")
+    assert rep["frames_list"][0]["draws"] == 12
+    assert rep["drawn_frames"] == rep["frames"] >= 1
+    assert rep["first_drawn"] == 1
+    assert "drawn" in (Path(rep["run"]) / "summary.md").read_text()
+
+
+def test_frame_stats_and_share():
+    stats = boot_game.parse_draw_stats("1 0 2\n2 12 3\nbad line\n3 4")
+    assert stats == {1: (0, 2), 2: (12, 3)}       # a last line without newline is ignored
+    assert boot_game.nonzero_share(b"P6\n2 2\n255\n" + b"\0\0\0" * 3 + b"\0\0\1") == 0.25
+    assert boot_game.nonzero_share(b"P6\n# comment\n1 1\n255\n\5\0\0") == 1.0
+    assert boot_game.nonzero_share(b"P6\n2 2\n255\n\0") is None   # truncated
+    assert boot_game.nonzero_share(b"not a ppm") is None
+
+
+def test_frame_bytes_cap_stops_dumping(tree, tmp_path):
+    rep = boot_game.boot(fake("series", tmp_path), tree, seconds=3, idle=30, until="time",
+                         frame_every=1, frame_bytes=200)
+    assert rep["dump_stopped"] == "bytes"
+    assert rep["outcome"] == "timeout" and rep["returncode"] is None   # not killed for it
+    assert rep["seconds"] >= 2.5
+    run = Path(rep["run"])
+    assert (run / "frames" / "STOP").is_file()
+    assert 1 <= rep["frames"] < 20                 # a present every 0.05 s, dumps stopped
+    stats = boot_game.parse_draw_stats((run / "draw_stats.txt").read_text())
+    assert len(stats) > rep["frames"]              # the stats go on
+    assert "bytes" in (run / "summary.md").read_text()
+
+
+def test_free_space_floor(tree, tmp_path, monkeypatch):
+    real = shutil.disk_usage
+    def low(path):
+        u = real(path)
+        return type(u)(u.total, u.total - 10 * 2**30, 10 * 2**30)
+    monkeypatch.setattr(boot_game.shutil, "disk_usage", low)
+    rep = boot_game.boot(fake("series", tmp_path), tree, seconds=2, idle=30, until="time",
+                         frame_every=1)
+    assert rep["dump_stopped"] == "disk"
+    assert rep["frames"] == 0                      # below the floor before it started
+    assert (Path(rep["run"]) / "frames" / "STOP").is_file()
+
+
+def test_prune_keeps_ten(tree):
+    runs = tree / "runs"
+    names = [f"202610{d:02d}-120000" for d in range(1, 14)]
+    for n in names:
+        (runs / n).mkdir(parents=True)
+        (runs / n / "report.json").write_text("{}")
+    (runs / "eboot-effects").mkdir()               # not a run: never touched
+    (runs / "notes.txt").write_text("x")
+    removed = boot_game.prune_runs(runs, keep=10)
+    assert sorted(p.name for p in removed) == names[:3]
+    left = sorted(p.name for p in runs.iterdir())
+    assert left == names[3:] + ["eboot-effects", "notes.txt"]
+    assert boot_game.prune_runs(runs, keep=10) == []
+
+
+def test_prune_flag_runs_after_the_boot(tree, tmp_path, monkeypatch):
+    monkeypatch.setattr(boot_game, "FLIP_GRACE", 0.5)
+    monkeypatch.setenv("FAKE_FRAME", "1")
+    for d in range(1, 13):
+        (tree / "runs" / f"200001{d:02d}-000000").mkdir(parents=True)
+    assert boot_game.main([str(tree), "--gt6", str(fake("flip", tmp_path)), "--prune"]) == 0
+    runs = sorted(p.name for p in (tree / "runs").iterdir())
+    assert len(runs) == 10 and not runs[-1].startswith("2000")   # the new run is kept
+
+
+def test_group_killed_on_timeout_in_time_mode(tree, tmp_path, monkeypatch):
+    pidfile = tmp_path / "child.pid"
+    monkeypatch.setenv("FAKE_CHILD_PID", str(pidfile))
+    rep = boot_game.boot(fake("series", tmp_path), tree, seconds=2, idle=30, until="time")
+    assert rep["outcome"] == "timeout"
+    child = int(pidfile.read_text())
+    assert pid_gone(rep["pid"])
+    for _ in range(50):                            # reparented to launchd, reaped soon
+        if pid_gone(child):
+            break
+        time.sleep(0.1)
+    assert pid_gone(child)
+
+
+@pytest.mark.skipif(shutil.which("sips") is None, reason="sips is macOS only")
+def test_png_flag_converts_frames(tree, tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_NONZERO", "1")
+    rc = boot_game.main([str(tree), "--gt6", str(fake("series", tmp_path)), "--until", "time",
+                         "--seconds", "2", "--frame-every", "5", "--frame-max", "3", "--png"])
+    run = sorted((tree / "runs").iterdir())[-1]
+    rep = json.loads((run / "report.json").read_text())
+    assert rc == 0                                 # time mode: a frame was presented and kept
+    assert rep["frames"] == 3                      # --frame-max reached the runtime
+    pngs = sorted(p.name for p in (run / "frames_png").iterdir())
+    assert pngs == [f["file"].replace(".ppm", ".png") for f in rep["frames_list"]]
+    assert (run / "frames_png" / pngs[0]).read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
 
 
 @pytest.mark.slow

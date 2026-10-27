@@ -86,6 +86,46 @@ the game, 5 s after the first one (runs of 6.8 s and 5.4 s). The process was sti
   (`_cellFiberPpuContextAttributeInitialize`, `cellFiberPpuContextInitialize`,
   `cellFiberPpuContextRun`), which fake CELL_OK. They are the likely next blocker.
 
+## Long runs (2026-10-27)
+
+**Answer to milestone 2's question: the black screen is drawn, not just left empty, but what
+is drawn comes out black.** Every frame GT6 presents after its first few has one clear and one
+draw call, and every pixel of every dumped frame is exactly zero.
+
+Run 20261027-234511, on a fresh play folder (`prepare_play.py --force`), after re-translating
+and rebuilding with patch 0010: `boot_game.py "$GT6_TREE" --until time --seconds 240 --png`.
+
+- Outcome `timeout` after 240.2 s: no crash, no exit, still running when the harness stopped
+  it. 14,851 frames presented (about 62 a second). 248 frames dumped (present 1 and every
+  60th), 1.3 GB; the dump caps were not reached (`dump_stopped` null).
+- `drawn_frames` **0**, `first_drawn` **null**. That is not because nothing was drawn: 247 of
+  the 248 dumped frames had a draw call (only present 1 had none). It is because no dumped frame
+  has a single non-black pixel (`nonzero_share` 0.0 in all 248).
+- Draw statistics over all 14,851 presents: 14,830 draw calls and 14,830 clears. 14,747
+  presents had exactly one draw and one clear (a few had two of each); 104 had no draw, all of
+  them in the first 20 or so presents.
+- Three frames viewed as PNG: present 1 (1280 x 720), present 7200 (1440 x 1080, two
+  minutes in) and present 14820 (1536 x 1408, the last dumped). All three are a plain black
+  rectangle, with no shape, text, gradient or noise anywhere.
+- The presented picture changes size during the run: 1280 x 720 for present 1, 1440 x 1080
+  from present 60, 1536 x 1408 from present 8040 (about 2 minutes in) to the end. 1536 x 1408
+  is the size of the surface the engine met at RSX offset 0x00CC0000, an odd size for a
+  display buffer. So the port may be presenting a surface other than the one the game flips.
+  This is a lead for the bring-up rounds, not checked yet.
+- What the one draw is. A 40 s diagnostic run (20261027-235022, with
+  `PS3RECOMP_METAL_SHADER_DUMP` into `$GT6_TREE/shader-dump`) shows GT6 uses one shader pair
+  the whole time. The vertex program multiplies the position by a 4 x 4 matrix from its
+  constants, and passes vertex attribute 3 through as texture coordinate 0. The fragment
+  program outputs that value as the colour, with no texture. So each frame is a clear plus one
+  flat-coloured shape whose colour comes from the vertex data: the shape of a full-screen fade
+  or loading cover. A black result fits a black fade during the first-run install. It also
+  fits wrong vertex data, a zero matrix (the shape then covers nothing, and the black clear
+  shows), or the size switch above. The RPCS3 capture of the same moment (milestone 3, task 2)
+  tells which.
+- The game's progress looks the same as in milestone 2: the last new calls are still the three
+  faked `cellFiberPpuContext*` imports, then `cellFsGetFreeSize` (12 unresolved imports, one
+  stubbed system call, 327).
+
 ## Where GT6's run-time SPU images come from (2026-10-27)
 
 The SPU images GT6 runs that the translate step did not find (D33) were dumped by the runtime on

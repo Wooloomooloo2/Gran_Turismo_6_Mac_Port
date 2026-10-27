@@ -104,10 +104,29 @@ cmake --build "$GT6_TREE/port-build" --target gt6
 # 5. Start it unattended. It stops 5 s after the first flip, when the process exits,
 #    when it hangs (--idle) or after --seconds. Options: --seconds N, --idle N, --window.
 .venv/bin/python scripts/boot_game.py "$GT6_TREE"
+
+# 5b. A long run: keep going after the first flip and keep a series of frames.
+.venv/bin/python scripts/boot_game.py "$GT6_TREE" --until time --seconds 240 --png
 ```
 
+Options for long runs (D35):
+
+- `--until time` runs to `--seconds` instead of stopping 5 s after the first flip; a run that
+  reaches the limit without crashing is `timeout`, with its frames kept (`--until flip`, the
+  default, is the old behaviour).
+- `--frame-every N` dumps presented frame 1 and every N-th after it (default 60).
+- `--frame-max N` dumps at most N frames per run (default 300). Dumps also stop by themselves
+  when `frames/` passes 2 GB or the disk has less than 20 GB free (`dump_stopped` in
+  `report.json`).
+- `--png` copies the dumped frames to `frames_png/` as PNG (with macOS `sips`) for viewing.
+- `--prune` deletes all but the newest 10 runs in `$GT6_TREE/runs` after this one.
+
 Each boot writes `$GT6_TREE/runs/<date-time>/` with `report.json` (outcome, frames, unresolved
-imports), `summary.md`, the logs and the latest dumped frame. The outcome is `first_frame` only
+imports), `summary.md`, the logs, the dumped frames (`frames/frame_<present>.ppm`) and
+`draw_stats.txt` (one `<present> <draw calls> <clears>` line per presented frame).
+`report.json` lists each dumped frame with its draw calls, clears and share of non-black pixels
+(`frames_list`), and counts the frames that were really drawn: at least one draw call and more
+than 1% non-black pixels (`drawn_frames`, `first_drawn`). The outcome is `first_frame` only
 when the game flipped a frame and at least one frame was dumped (`flip_no_frame` otherwise). A
 play folder that a run has used is not clean: run step 3 with `--force` before the next boot
 (`boot_game.py` warns when you have not). Re-run step 2 after changing anything under

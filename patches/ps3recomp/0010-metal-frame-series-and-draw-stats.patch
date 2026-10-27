@@ -1,0 +1,857 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] Metal: a capped series of numbered frame dumps, and draw/clear counts per present
+
+Upstream: not yet submitted; written to be upstreamed (generic, no title names)
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0009)
+
+What: on the draw-engine path (the Metal backend's default), every present
+can now be numbered, counted and dumped:
+  PS3RECOMP_METAL_FRAME_DIR=<dir>  frame_<presented, 6 digits>.ppm for
+                                   present 1 and every EVERY-th after it
+  PS3RECOMP_METAL_FRAME_EVERY=<n>  default 60
+  PS3RECOMP_METAL_FRAME_MAX=<n>    at most n dumps, default 300 (0 = none)
+  PS3RECOMP_DRAW_STATS=<file>      "<presented> <draw calls> <clears>\n" per
+                                   present, flushed line by line
+Presents are numbered from 1. A file named STOP in the folder stops the dumps
+for good (a harness that watches disk use creates it); the stats go on. Each
+dump goes to a hidden temporary name and is renamed into place, so a reader
+never sees half a frame. The draw engine counts, per frame, the BEGIN_END
+groups that held a draw command (drawn or not) and the CLEAR_SURFACE
+methods (any mask), and latches them before the backend's present callback
+(rsx_draw_engine_frame_counts); the engine presents once per guest flip, so
+these are the counts since the last flip. The policy and the PPM/stats
+writers are plain C in libs/video/rsx_frame_series.h; rsx_metal_backend.m
+shares one readback helper between them and the single-file
+PS3RECOMP_METAL_FRAME_DUMP, whose behaviour (every 120th frame, one file
+overwritten) is unchanged. The legacy vtable path is not covered.
+
+Why: one overwritten dump cannot show how a title's screen changes over a
+long unattended run, and a black frame cannot tell "cleared to black" from
+"nothing drawn". Gran Turismo 6's first frame under the port is all black;
+the counts beside each numbered frame answer which.
+
+Test: tools/test_frame_series.py (new; builds libs/video/tests/
+test_frame_series.c for the policy, names, caps, stop file and the PPM and
+stats writers, and on macOS libs/video/tests/test_metal_frame_series.m for
+the backend's present glue against a real Metal texture), and
+libs/video/tests/test_rsx_draw_engine.c gains test_frame_counts
+(tools/test_rsx_immediate_vertices.py).
+
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+index 8dff6011..fcf0c599 100644
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -197,6 +197,8 @@ static struct {
+     u64 texture_use_serial;
+     u32 guest_draws;
+     u32 last_guest_draws;
++    u32 frame_draws, frame_clears;            /* issued since the last present */
++    u32 last_frame_draws, last_frame_clears;  /* ... in the frame presented last */
+     u32 last_present_surface;
+     u32 last_flip_buffer;
+     u64 write_serial;       /* orders colour and depth writes to one address */
+@@ -3025,6 +3027,7 @@ static void eng_log_rect_clear(const char* what, const u32 rc[4], u32 w, u32 h)
+ static void sink_end(void* user, const rsx_dispatch* r)
+ {
+     (void)user; (void)r;
++    if (g.ready && dc.n_packets) g.frame_draws++;
+     if (!g.ready || !dc.n_packets || !dc.fetch_ok) return;
+     /* Mixed geometry sources have no defined concatenation here. Reject the
+      * whole group instead of drawing partial/misordered geometry. */
+@@ -3243,6 +3246,7 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
+ {
+     (void)user; (void)r;
+     if (!g.ready) return;
++    g.frame_clears++;
+     u32 targets[RSX_BE_MAX_COLOR_TARGETS];
+     const u32 n_targets = eng_current_target_set(targets);
+     if (!n_targets) return;
+@@ -3377,6 +3381,9 @@ static void eng_present(u32 buffer_id)
+     }
+     pd_present(target);
+     g.last_present_surface = target;
++    g.last_frame_draws  = g.frame_draws;
++    g.last_frame_clears = g.frame_clears;
++    g.frame_draws = g.frame_clears = 0;
+     g.be->present(g.be->user, g.surfaces[target].handle);
+     g.frames++;
+     g.last_guest_draws = g.guest_draws;
+@@ -3538,6 +3545,12 @@ void rsx_draw_engine_note_flip(u32 buffer_id)
+     g.last_flip_buffer = buffer_id & 7u;
+ }
+ 
++void rsx_draw_engine_frame_counts(u32* draws, u32* clears)
++{
++    if (draws)  *draws  = g.last_frame_draws;
++    if (clears) *clears = g.last_frame_clears;
++}
++
+ u32 rsx_draw_engine_guest_draws(void)
+ {
+     return g.last_guest_draws;
+diff --git a/libs/video/rsx_draw_engine.h b/libs/video/rsx_draw_engine.h
+index a25ecc29..478a9d1c 100644
+--- a/libs/video/rsx_draw_engine.h
++++ b/libs/video/rsx_draw_engine.h
+@@ -359,6 +359,14 @@ void rsx_draw_engine_note_flip(u32 buffer_id);
+ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 h);
+ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32 h);
+ 
++/* Draw calls and clears the guest issued in the frame being presented, i.e.
++ * since the engine's previous present (it presents once per guest flip).
++ * Latched before the backend's present callback runs, so the backend can read
++ * them there, and kept until the next present. A draw call is one BEGIN_END
++ * group that held at least one draw command, counted whether or not the
++ * engine could draw it; a clear is one CLEAR_SURFACE, whatever its mask. */
++void rsx_draw_engine_frame_counts(u32* draws, u32* clears);
++
+ /* --- test hooks ---------------------------------------------------------- */
+ 
+ /* Draws that ran the guest's OWN programs in the last presented frame. A draw
+diff --git a/libs/video/rsx_frame_series.h b/libs/video/rsx_frame_series.h
+new file mode 100644
+index 00000000..a6aac65f
+--- /dev/null
++++ b/libs/video/rsx_frame_series.h
+@@ -0,0 +1,182 @@
++/*
++ * ps3recomp - a capped series of presented frames, and draw statistics per frame
++ *
++ * For long unattended runs, where one overwritten frame dump cannot show how a
++ * title's screen changed over minutes, nor tell a frame that was drawn from one
++ * that was only cleared:
++ *
++ *   PS3RECOMP_METAL_FRAME_DIR=<dir>   dump presented frames there as
++ *                                     frame_<presented, 6 digits>.ppm: the first
++ *                                     present, then every EVERY-th (60, 120, ...)
++ *   PS3RECOMP_METAL_FRAME_EVERY=<n>   default 60
++ *   PS3RECOMP_METAL_FRAME_MAX=<n>     at most n dumps (default 300; 0 = none)
++ *   PS3RECOMP_DRAW_STATS=<file>       one line per present:
++ *                                     "<presented> <draw calls> <clears>\n"
++ *
++ * Presents are numbered from 1. A file named STOP in the folder stops the
++ * dumps for good (a harness watching disk use creates it); the stats go on.
++ * Each dump is written to a hidden temporary name and renamed into place, so a
++ * reader never sees half a frame, and each stats line is flushed as it is
++ * written, because a long run usually ends with the process killed.
++ *
++ * The policy and the writers are plain C with no backend in them, so a test
++ * can include this header alone (libs/video/tests/test_frame_series.c). A
++ * backend keeps one rsx_frame_series, calls rsx_fs_present once per present
++ * with the frame's counts, and reads its pixels back only when told to dump.
++ * The single-file PS3RECOMP_METAL_FRAME_DUMP is separate and unchanged.
++ */
++#ifndef RSX_FRAME_SERIES_H
++#define RSX_FRAME_SERIES_H
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++
++#define RSX_FS_PATH_MAX       1024
++#define RSX_FS_DEFAULT_EVERY  60u
++#define RSX_FS_DEFAULT_MAX    300u
++
++enum { RSX_FS_RUNNING = 0, RSX_FS_STOPPED_FILE = 1, RSX_FS_STOPPED_MAX = 2 };
++
++typedef struct rsx_frame_series {
++    char     dir[RSX_FS_PATH_MAX];   /* "" = no series */
++    unsigned every;                  /* dump every n-th present (>= 1) */
++    unsigned max;                    /* dumps allowed in all */
++    FILE*    stats;                  /* NULL = no statistics */
++    unsigned presented;              /* presents so far; the last one's number */
++    unsigned dumped;                 /* dumps written */
++    int      stopped;                /* RSX_FS_* */
++} rsx_frame_series;
++
++/* A count from the environment: a whole number >= min, or the default. */
++static unsigned rsx_fs_count(const char* text, unsigned dflt, unsigned min)
++{
++    if (!text || !*text) return dflt;
++    char* end = NULL;
++    long v = strtol(text, &end, 10);
++    if (*end || v < (long)min || v > 0x7FFFFFFFL) return dflt;
++    return (unsigned)v;
++}
++
++static void rsx_fs_init(rsx_frame_series* s, const char* dir, const char* every,
++                        const char* max, const char* stats_path)
++{
++    memset(s, 0, sizeof *s);
++    if (dir && *dir && strlen(dir) < RSX_FS_PATH_MAX - 32) {
++        strcpy(s->dir, dir);
++        size_t n = strlen(s->dir);
++        while (n > 1 && s->dir[n - 1] == '/') s->dir[--n] = 0;
++    }
++    s->every = rsx_fs_count(every, RSX_FS_DEFAULT_EVERY, 1);
++    s->max   = rsx_fs_count(max, RSX_FS_DEFAULT_MAX, 0);
++    if (stats_path && *stats_path) {
++        s->stats = fopen(stats_path, "w");
++        if (s->stats) setvbuf(s->stats, NULL, _IOLBF, 0);
++        else fprintf(stderr, "[frame series] cannot write draw stats to %s\n", stats_path);
++    }
++}
++
++static void rsx_fs_init_from_env(rsx_frame_series* s)
++{
++    rsx_fs_init(s, getenv("PS3RECOMP_METAL_FRAME_DIR"), getenv("PS3RECOMP_METAL_FRAME_EVERY"),
++                getenv("PS3RECOMP_METAL_FRAME_MAX"), getenv("PS3RECOMP_DRAW_STATS"));
++}
++
++static void rsx_fs_close(rsx_frame_series* s)
++{
++    if (s->stats) fclose(s->stats);
++    s->stats = NULL;
++}
++
++static int rsx_fs_stats_line(char* buf, size_t n, unsigned presented, unsigned draws,
++                             unsigned clears)
++{
++    return snprintf(buf, n, "%u %u %u\n", presented, draws, clears);
++}
++
++static int rsx_fs_frame_path(const rsx_frame_series* s, unsigned presented, char* out, size_t n)
++{
++    return snprintf(out, n, "%s/frame_%06u.ppm", s->dir, presented);
++}
++
++/* One present: number it, write its stats line, and say in *dump whether its
++ * pixels should be dumped (the caller then reads them back and calls
++ * rsx_fs_dump). Returns the present's number. */
++static unsigned rsx_fs_present(rsx_frame_series* s, unsigned draws, unsigned clears, int* dump)
++{
++    const unsigned n = ++s->presented;
++    if (s->stats) {
++        char line[48];
++        rsx_fs_stats_line(line, sizeof line, n, draws, clears);
++        fputs(line, s->stats);
++    }
++    *dump = 0;
++    if (!s->dir[0] || s->stopped) return n;
++    if (n != 1 && n % s->every != 0) return n;
++    if (s->dumped >= s->max) {
++        s->stopped = RSX_FS_STOPPED_MAX;
++        fprintf(stderr, "[frame series] %u frame(s) dumped, the PS3RECOMP_METAL_FRAME_MAX cap; "
++                        "no more dumps\n", s->dumped);
++        return n;
++    }
++    char stop[RSX_FS_PATH_MAX + 8];
++    snprintf(stop, sizeof stop, "%s/STOP", s->dir);
++    struct stat st;
++    if (stat(stop, &st) == 0) {
++        s->stopped = RSX_FS_STOPPED_FILE;
++        fprintf(stderr, "[frame series] %s exists; no more dumps (%u written)\n", stop,
++                s->dumped);
++        return n;
++    }
++    *dump = 1;
++    return n;
++}
++
++/* Write w x h pixels (4 bytes each, rows `pitch` bytes apart, BGRA when `bgra`
++ * else RGBA) as a binary PPM, through a temporary file renamed into place.
++ * 0 on success. */
++static int rsx_fs_write_ppm(const char* path, const unsigned char* px, size_t w, size_t h,
++                            size_t pitch, int bgra)
++{
++    if (!path || !px || !w || !h || pitch < w * 4) return -1;
++    char tmp[RSX_FS_PATH_MAX + 16];
++    const char* slash = strrchr(path, '/');
++    const size_t dlen = slash ? (size_t)(slash - path) + 1 : 0;
++    if (dlen + strlen(path + dlen) + 8 >= sizeof tmp) return -1;
++    snprintf(tmp, sizeof tmp, "%.*s.%s.tmp", (int)dlen, path, path + dlen);
++    FILE* f = fopen(tmp, "wb");
++    if (!f) return -1;
++    unsigned char* row = (unsigned char*)malloc(w * 3);
++    int bad = !row || fprintf(f, "P6\n%zu %zu\n255\n", w, h) < 0;
++    for (size_t y = 0; !bad && y < h; y++) {
++        const unsigned char* src = px + y * pitch;
++        for (size_t x = 0; x < w; x++) {
++            row[x * 3 + 0] = src[x * 4 + (bgra ? 2 : 0)];
++            row[x * 3 + 1] = src[x * 4 + 1];
++            row[x * 3 + 2] = src[x * 4 + (bgra ? 0 : 2)];
++        }
++        bad = fwrite(row, 1, w * 3, f) != w * 3;
++    }
++    free(row);
++    if (fclose(f) != 0) bad = 1;
++    if (!bad && rename(tmp, path) != 0) bad = 1;
++    if (bad) remove(tmp);
++    return bad ? -1 : 0;
++}
++
++/* Dump the pixels of present `presented` into the series; counts it. */
++static int rsx_fs_dump(rsx_frame_series* s, unsigned presented, const unsigned char* px,
++                       size_t w, size_t h, int bgra)
++{
++    char path[RSX_FS_PATH_MAX + 32];
++    rsx_fs_frame_path(s, presented, path, sizeof path);
++    if (rsx_fs_write_ppm(path, px, w, h, w * 4, bgra) != 0) {
++        fprintf(stderr, "[frame series] could not write %s\n", path);
++        return -1;
++    }
++    s->dumped++;
++    return 0;
++}
++
++#endif /* RSX_FRAME_SERIES_H */
+diff --git a/libs/video/rsx_metal_backend.m b/libs/video/rsx_metal_backend.m
+index ad8db0b5..a87fd871 100644
+--- a/libs/video/rsx_metal_backend.m
++++ b/libs/video/rsx_metal_backend.m
+@@ -78,6 +78,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include "ps3emu/log_first.h"
++#include "rsx_frame_series.h"   /* PS3RECOMP_METAL_FRAME_DIR, PS3RECOMP_DRAW_STATS */
+ 
+ /* ------------------------------------------------------------------------- */
+ 
+@@ -4344,20 +4345,18 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
+     }
+ }
+ 
+-/* Opt-in readback of the game surface, useful on a locked Mac or in CI.
+- * Headless submits have completed; windowed captures fence the same queue. */
+-static void eng_dump_frame(id<MTLTexture> src)
++/* The game surface's pixels as 4-byte rows (w * 4 apart), or NULL when its
++ * format is not 8-bit RGBA/BGRA or it cannot be read. Headless submits have
++ * completed; windowed captures fence the same queue. The caller frees it. */
++static unsigned char* eng_read_frame(id<MTLTexture> src, size_t* out_w, size_t* out_h,
++                                     int* out_bgra)
+ {
+-    const char* path = getenv("PS3RECOMP_METAL_FRAME_DUMP");
+-    if (!path || !*path) return;
+-    static unsigned frame;
+-    if ((++frame % 120) != 0) return;
+     if ([src pixelFormat] != MTLPixelFormatRGBA8Unorm &&
+-        [src pixelFormat] != MTLPixelFormatBGRA8Unorm) return;
++        [src pixelFormat] != MTLPixelFormatBGRA8Unorm) return NULL;
+     size_t w = [src width], h = [src height];
+-    if (!w || !h || w > 16384 || h > 16384) return;
++    if (!w || !h || w > 16384 || h > 16384) return NULL;
+     unsigned char* rgba = malloc(w * h * 4);
+-    if (!rgba) return;
++    if (!rgba) return NULL;
+     if (!s_headless) {
+         id<MTLCommandBuffer> fence = [s_queue commandBuffer];
+         [fence commit];
+@@ -4365,10 +4364,25 @@ static void eng_dump_frame(id<MTLTexture> src)
+     }
+     [src getBytes:rgba bytesPerRow:w * 4
+       fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
++    *out_w = w; *out_h = h;
++    *out_bgra = [src pixelFormat] == MTLPixelFormatBGRA8Unorm;
++    return rgba;
++}
++
++/* Opt-in readback of the game surface, useful on a locked Mac or in CI. */
++static void eng_dump_frame(id<MTLTexture> src)
++{
++    const char* path = getenv("PS3RECOMP_METAL_FRAME_DUMP");
++    if (!path || !*path) return;
++    static unsigned frame;
++    if ((++frame % 120) != 0) return;
++    size_t w, h;
++    int bgra;
++    unsigned char* rgba = eng_read_frame(src, &w, &h, &bgra);
++    if (!rgba) return;
+     FILE* f = fopen(path, "wb");
+     if (f) {
+         fprintf(f, "P6\n%zu %zu\n255\n", w, h);
+-        int bgra = [src pixelFormat] == MTLPixelFormatBGRA8Unorm;
+         for (size_t p = 0; p < w * h; ++p) {
+             unsigned char rgb[3] = {rgba[p*4 + (bgra ? 2 : 0)], rgba[p*4+1],
+                                     rgba[p*4 + (bgra ? 0 : 2)]};
+@@ -4380,6 +4394,30 @@ static void eng_dump_frame(id<MTLTexture> src)
+     free(rgba);
+ }
+ 
++/* PS3RECOMP_METAL_FRAME_DIR / _EVERY / _MAX and PS3RECOMP_DRAW_STATS: the
++ * numbered frame series and one statistics line per present
++ * (rsx_frame_series.h). The counts are the draw engine's for the frame being
++ * presented. With neither variable set this costs one test. */
++static rsx_frame_series s_series;
++static int s_series_ready;
++
++static void eng_series_present(id<MTLTexture> src)
++{
++    if (!s_series_ready) { rsx_fs_init_from_env(&s_series); s_series_ready = 1; }
++    if (!s_series.dir[0] && !s_series.stats) return;
++    u32 draws = 0, clears = 0;
++    rsx_draw_engine_frame_counts(&draws, &clears);
++    int dump = 0;
++    const unsigned n = rsx_fs_present(&s_series, draws, clears, &dump);
++    if (!dump || !src) return;
++    size_t w, h;
++    int bgra;
++    unsigned char* rgba = eng_read_frame(src, &w, &h, &bgra);
++    if (!rgba) return;
++    rsx_fs_dump(&s_series, n, rgba, w, h, bgra);
++    free(rgba);
++}
++
+ static void eng_present(void* user, u32 surface)
+ {
+     (void)user;
+@@ -4387,9 +4425,10 @@ static void eng_present(void* user, u32 surface)
+      * PS3RECOMP_METAL_FPS "guest" figure (and the launcher's title). */
+     rsx_metal_backend_note_guest_frame();
+     id<MTLTexture> src = eng_obj(surface);
+-    if (!src) { eng_encode_and_commit(nil); return; }
++    if (!src) { eng_encode_and_commit(nil); eng_series_present(nil); return; }
+     eng_encode_and_commit(src);
+     eng_dump_frame(src);
++    eng_series_present(src);
+ }
+ 
+ static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
+diff --git a/libs/video/tests/test_frame_series.c b/libs/video/tests/test_frame_series.c
+new file mode 100644
+index 00000000..9e1bf8b0
+--- /dev/null
++++ b/libs/video/tests/test_frame_series.c
+@@ -0,0 +1,200 @@
++/* The frame series and per-frame draw statistics (libs/video/rsx_frame_series.h):
++ * which presents are dumped, the file names, the PPM bytes, the stats lines,
++ * the PS3RECOMP_METAL_FRAME_MAX cap and the stop file. No Metal device needed.
++ * Run by tools/test_frame_series.py. */
++#include "../rsx_frame_series.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++static int fails = 0;
++#define CHECK(c, ...) do { const int ok_ = (c); printf(ok_ ? "[PASS] " : "[FAIL] "); \
++    printf(__VA_ARGS__); printf("\n"); if (!ok_) fails++; } while (0)
++
++static char tmpdir[512];
++
++static long file_size(const char* p)
++{
++    FILE* f = fopen(p, "rb");
++    if (!f) return -1;
++    fseek(f, 0, SEEK_END);
++    long n = ftell(f);
++    fclose(f);
++    return n;
++}
++
++static char* slurp(const char* p)
++{
++    FILE* f = fopen(p, "rb");
++    if (!f) return NULL;
++    static char buf[65536];
++    size_t n = fread(buf, 1, sizeof buf - 1, f);
++    buf[n] = 0;
++    fclose(f);
++    return buf;
++}
++
++static void test_stats_line(void)
++{
++    char b[64];
++    rsx_fs_stats_line(b, sizeof b, 1, 0, 2);
++    CHECK(strcmp(b, "1 0 2\n") == 0, "stats line is '<presented> <draws> <clears>'");
++    rsx_fs_stats_line(b, sizeof b, 4294967295u, 12, 0);
++    CHECK(strcmp(b, "4294967295 12 0\n") == 0, "stats line holds 32-bit values");
++}
++
++static void test_defaults(void)
++{
++    rsx_frame_series s;
++    rsx_fs_init(&s, NULL, NULL, NULL, NULL);
++    CHECK(s.dir[0] == 0 && !s.stats, "nothing set: no series, no stats");
++    int dump = 1;
++    unsigned n = rsx_fs_present(&s, 5, 1, &dump);
++    CHECK(n == 1 && !dump, "without a folder a present is counted but never dumped");
++    rsx_fs_init(&s, "/x", "", "junk", NULL);
++    CHECK(s.every == 60 && s.max == 300, "every defaults to 60, max to 300 (got %u, %u)",
++          s.every, s.max);
++    rsx_fs_init(&s, "/x", "0", "-4", NULL);
++    CHECK(s.every == 60 && s.max == 300, "every 0 and a negative max fall back to the defaults");
++    rsx_fs_init(&s, "/x", "7", "0", NULL);
++    CHECK(s.every == 7 && s.max == 0, "every 7, max 0 (no dumps) are taken as given");
++}
++
++static void test_which_presents(void)
++{
++    rsx_frame_series s;
++    rsx_fs_init(&s, tmpdir, "60", "300", NULL);
++    unsigned want[] = {1, 60, 120, 180};
++    unsigned got[8], ng = 0;
++    for (unsigned i = 0; i < 200; i++) {
++        int dump = 0;
++        unsigned n = rsx_fs_present(&s, 0, 0, &dump);
++        if (dump && ng < 8) { got[ng++] = n; s.dumped++; }
++    }
++    int same = ng == 4;
++    for (unsigned i = 0; same && i < 4; i++) same = got[i] == want[i];
++    CHECK(same, "every 60: presents 1, 60, 120 and 180 of 200 are dumped (%u dumped)", ng);
++    char p[1100];
++    rsx_fs_frame_path(&s, 60, p, sizeof p);
++    char w[1100];
++    snprintf(w, sizeof w, "%s/frame_000060.ppm", tmpdir);
++    CHECK(strcmp(p, w) == 0, "file name is frame_<presented, 6 digits>.ppm (%s)", p);
++}
++
++static void test_max_cap(void)
++{
++    rsx_frame_series s;
++    rsx_fs_init(&s, tmpdir, "1", "3", NULL);
++    unsigned dumps = 0;
++    unsigned char px[4] = {0, 0, 0, 0};
++    for (unsigned i = 0; i < 10; i++) {
++        int dump = 0;
++        unsigned n = rsx_fs_present(&s, 0, 0, &dump);
++        if (dump && rsx_fs_dump(&s, n, px, 1, 1, 0) == 0) dumps++;
++    }
++    CHECK(dumps == 3 && s.dumped == 3, "max 3: three dumps of ten presents (%u)", dumps);
++    CHECK(s.stopped == RSX_FS_STOPPED_MAX, "the series says it stopped at the cap");
++    for (unsigned i = 1; i <= 10; i++) {
++        char p[1100];
++        rsx_fs_frame_path(&s, i, p, sizeof p);
++        if (i <= 3) CHECK(file_size(p) > 0, "frame %u is on disk", i);
++        else if (file_size(p) >= 0) CHECK(0, "frame %u should not be on disk", i);
++        unlink(p);
++    }
++}
++
++static void test_stop_file(void)
++{
++    rsx_frame_series s;
++    rsx_fs_init(&s, tmpdir, "1", "300", NULL);
++    unsigned char px[4] = {0, 0, 0, 0};
++    int dump = 0;
++    unsigned n = rsx_fs_present(&s, 0, 0, &dump);
++    CHECK(dump && rsx_fs_dump(&s, n, px, 1, 1, 0) == 0, "first present dumped");
++    char stop[1100];
++    snprintf(stop, sizeof stop, "%s/STOP", tmpdir);
++    FILE* f = fopen(stop, "w");
++    fclose(f);
++    n = rsx_fs_present(&s, 0, 0, &dump);
++    CHECK(!dump && s.stopped == RSX_FS_STOPPED_FILE, "a STOP file in the folder stops dumping");
++    unlink(stop);
++    n = rsx_fs_present(&s, 0, 0, &dump);
++    CHECK(!dump, "and it stays stopped once the file is gone");
++    char p[1100];
++    rsx_fs_frame_path(&s, 1, p, sizeof p);
++    unlink(p);
++}
++
++static void test_ppm(void)
++{
++    /* 2x2, BGRA in a 12-byte pitch (one pad pixel per row). */
++    const unsigned char bgra[2 * 12] = {
++        0x01, 0x02, 0x03, 0xFF,  0x04, 0x05, 0x06, 0xFF,  0xEE, 0xEE, 0xEE, 0xEE,
++        0x07, 0x08, 0x09, 0xFF,  0x0A, 0x0B, 0x0C, 0xFF,  0xEE, 0xEE, 0xEE, 0xEE,
++    };
++    char p[1100];
++    snprintf(p, sizeof p, "%s/t.ppm", tmpdir);
++    CHECK(rsx_fs_write_ppm(p, bgra, 2, 2, 12, 1) == 0, "PPM written");
++    FILE* f = fopen(p, "rb");
++    unsigned char b[64] = {0};
++    size_t n = f ? fread(b, 1, sizeof b, f) : 0;
++    if (f) fclose(f);
++    const char hdr[] = "P6\n2 2\n255\n";
++    const unsigned char rgb[12] = {0x03, 0x02, 0x01, 0x06, 0x05, 0x04,
++                                   0x09, 0x08, 0x07, 0x0C, 0x0B, 0x0A};
++    CHECK(n == sizeof hdr - 1 + 12 && memcmp(b, hdr, sizeof hdr - 1) == 0 &&
++          memcmp(b + sizeof hdr - 1, rgb, 12) == 0,
++          "BGRA rows come out as RGB, pad bytes dropped (%zu bytes)", n);
++    const unsigned char rgba[8] = {0x10, 0x20, 0x30, 0xFF, 0x40, 0x50, 0x60, 0xFF};
++    CHECK(rsx_fs_write_ppm(p, rgba, 2, 1, 8, 0) == 0, "RGBA PPM written");
++    f = fopen(p, "rb");
++    n = f ? fread(b, 1, sizeof b, f) : 0;
++    if (f) fclose(f);
++    const unsigned char rgb2[6] = {0x10, 0x20, 0x30, 0x40, 0x50, 0x60};
++    CHECK(n == 11 + 6 && memcmp(b + 11, rgb2, 6) == 0, "RGBA rows keep their order");
++    char tmp[1200];
++    snprintf(tmp, sizeof tmp, "%s/.t.ppm.tmp", tmpdir);
++    CHECK(file_size(tmp) < 0, "no temporary file is left behind");
++    unlink(p);
++    CHECK(rsx_fs_write_ppm("/nonexistent-dir/x.ppm", rgba, 2, 1, 8, 0) != 0,
++          "an unwritable path is an error, not a crash");
++}
++
++static void test_stats_file(void)
++{
++    char sp[1100];
++    snprintf(sp, sizeof sp, "%s/draw_stats.txt", tmpdir);
++    rsx_frame_series s;
++    rsx_fs_init(&s, NULL, NULL, NULL, sp);
++    CHECK(s.stats != NULL, "the stats file opens");
++    int dump;
++    rsx_fs_present(&s, 0, 1, &dump);
++    rsx_fs_present(&s, 12, 3, &dump);
++    /* Read it before closing: a run is killed, never shut down, so every line
++     * must be on disk as soon as it is written. */
++    char* t = slurp(sp);
++    CHECK(t && strcmp(t, "1 0 1\n2 12 3\n") == 0, "one line per present, on disk at once ('%s')",
++          t ? t : "(none)");
++    rsx_fs_close(&s);
++    unlink(sp);
++}
++
++int main(void)
++{
++    setvbuf(stdout, NULL, _IONBF, 0);
++    snprintf(tmpdir, sizeof tmpdir, "%s/test_frame_series.XXXXXX",
++             getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
++    if (!mkdtemp(tmpdir)) { printf("[FAIL] mkdtemp\n"); return 1; }
++    test_stats_line();
++    test_defaults();
++    test_which_presents();
++    test_max_cap();
++    test_stop_file();
++    test_ppm();
++    test_stats_file();
++    rmdir(tmpdir);
++    printf(fails ? "\n%d check(s) FAILED\n" : "\nall checks passed\n", fails);
++    return fails ? 1 : 0;
++}
+diff --git a/libs/video/tests/test_metal_frame_series.m b/libs/video/tests/test_metal_frame_series.m
+new file mode 100644
+index 00000000..abb37c50
+--- /dev/null
++++ b/libs/video/tests/test_metal_frame_series.m
+@@ -0,0 +1,89 @@
++/* The Metal backend's frame series glue (eng_series_present): a present reads
++ * the draw engine's counts into PS3RECOMP_DRAW_STATS and dumps the surface into
++ * PS3RECOMP_METAL_FRAME_DIR as RGB. Needs a Metal device; no window. Run by
++ * tools/test_frame_series.py, or by hand:
++ *
++ *   clang -fobjc-arc -I include -I libs/video libs/video/tests/test_metal_frame_series.m \
++ *     -Wl,-dead_strip -framework Metal -framework Cocoa -framework QuartzCore \
++ *     -framework IOSurface -o /tmp/test_metal_frame_series && \
++ *     TMPDIR=/tmp /tmp/test_metal_frame_series
++ */
++#include "../rsx_metal_backend.m"
++
++float cellAvconfExt_display_gamma(void) { return 1.0f; }
++
++/* The draw engine is not linked: these are the counts of the frame "presented". */
++static u32 s_fake_draws, s_fake_clears;
++void rsx_draw_engine_frame_counts(u32* draws, u32* clears)
++{
++    *draws = s_fake_draws;
++    *clears = s_fake_clears;
++}
++
++static int fails;
++#define CHECK(c, ...) do { const int ok_ = (c); printf(ok_ ? "[PASS] " : "[FAIL] "); \
++    printf(__VA_ARGS__); printf("\n"); if (!ok_) fails++; } while (0)
++
++int main(void)
++{
++    setvbuf(stdout, NULL, _IONBF, 0);
++    @autoreleasepool {
++        s_dev = MTLCreateSystemDefaultDevice();
++        if (!s_dev) { printf("SKIP: no Metal device\n"); return 0; }
++        s_queue = [s_dev newCommandQueue];
++        s_headless = 1;
++
++        char dir[512];
++        snprintf(dir, sizeof dir, "%s/test_metal_frame_series.XXXXXX",
++                 getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
++        if (!mkdtemp(dir)) { printf("[FAIL] mkdtemp\n"); return 1; }
++        char stats[600];
++        snprintf(stats, sizeof stats, "%s/draw_stats.txt", dir);
++        setenv("PS3RECOMP_METAL_FRAME_DIR", dir, 1);
++        setenv("PS3RECOMP_METAL_FRAME_EVERY", "2", 1);
++        setenv("PS3RECOMP_DRAW_STATS", stats, 1);
++
++        MTLTextureDescriptor* d = [MTLTextureDescriptor
++            texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:2 height:1
++                                     mipmapped:NO];
++        d.storageMode = MTLStorageModeShared;
++        id<MTLTexture> t = [s_dev newTextureWithDescriptor:d];
++        const unsigned char bgra[8] = {0x30, 0x20, 0x10, 0xFF, 0x00, 0x00, 0x00, 0xFF};
++        [t replaceRegion:MTLRegionMake2D(0, 0, 2, 1) mipmapLevel:0 withBytes:bgra
++             bytesPerRow:8];
++
++        s_fake_draws = 0; s_fake_clears = 1;
++        eng_series_present(t);          /* 1: dumped */
++        s_fake_draws = 12; s_fake_clears = 2;
++        eng_series_present(t);          /* 2: dumped (every 2) */
++        s_fake_draws = 3; s_fake_clears = 0;
++        eng_series_present(nil);        /* 3: a present with no surface still counts */
++
++        char p[700];
++        snprintf(p, sizeof p, "%s/frame_000001.ppm", dir);
++        FILE* f = fopen(p, "rb");
++        unsigned char b[64] = {0};
++        size_t n = f ? fread(b, 1, sizeof b, f) : 0;
++        if (f) fclose(f);
++        const unsigned char want[] = "P6\n2 1\n255\n\x10\x20\x30\x00\x00\x00";
++        CHECK(n == sizeof want - 1 && memcmp(b, want, n) == 0,
++              "present 1 is dumped as RGB (%zu bytes)", n);
++        snprintf(p, sizeof p, "%s/frame_000002.ppm", dir);
++        CHECK(access(p, F_OK) == 0, "present 2 is dumped (every 2)");
++        snprintf(p, sizeof p, "%s/frame_000003.ppm", dir);
++        CHECK(access(p, F_OK) != 0, "present 3 is not");
++
++        char text[256] = {0};
++        f = fopen(stats, "rb");
++        n = f ? fread(text, 1, sizeof text - 1, f) : 0;
++        if (f) fclose(f);
++        CHECK(strcmp(text, "1 0 1\n2 12 2\n3 3 0\n") == 0,
++              "one stats line per present with the engine's counts ('%s')", text);
++
++        char cmd[700];
++        snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
++        system(cmd);
++    }
++    printf(fails ? "\n%d check(s) FAILED\n" : "\nall checks passed\n", fails);
++    return fails ? 1 : 0;
++}
+diff --git a/libs/video/tests/test_rsx_draw_engine.c b/libs/video/tests/test_rsx_draw_engine.c
+index 8099901a..c734a340 100644
+--- a/libs/video/tests/test_rsx_draw_engine.c
++++ b/libs/video/tests/test_rsx_draw_engine.c
+@@ -100,6 +100,7 @@ typedef struct {
+     int n_depth_readback;
+     u32 color_w, color_h;         /* size of the last colour surface created */
+     float vp_xf[8];               /* viewport epilogue after the VS constants */
++    u32 present_draws, present_clears; /* the frame counts the present saw */
+ } StubState;
+ 
+ static StubState stub;
+@@ -265,7 +266,11 @@ static void stub_clear_ds(void* u, u32 d, u32 f, float z, u8 s)
+ { (void)u; (void)d; (void)f; (void)s; stub.n_clear_ds++; stub.last_clear_depth = z; }
+ 
+ static u32 presented_surface;
+-static void stub_present(void* u, u32 s) { (void)u; presented_surface = s; stub.n_present++; }
++static void stub_present(void* u, u32 s)
++{
++    (void)u; presented_surface = s; stub.n_present++;
++    rsx_draw_engine_frame_counts(&stub.present_draws, &stub.present_clears);
++}
+ 
+ /* One pixel of a surface, in the R,G,B,A order rsx_texture_decode produces:
+  * the readback hook has to put those back into the guest's A8R8G8B8. */
+@@ -2438,6 +2443,39 @@ static void test_clear_rect(void)
+     engine_down();
+ }
+ 
++/* ---- per-frame draw and clear counts (the frame series' statistics) ------ */
++
++static void test_frame_counts(void)
++{
++    printf("-- draw and clear counts per presented frame\n");
++    engine_up();
++    u32 d = 99, c = 99;
++    rsx_draw_engine_frame_counts(&d, &c);
++    CHECK(d == 0 && c == 0, "nothing presented yet: 0 draws, 0 clears (%u, %u)", d, c);
++
++    m(M_CLEAR_BUFFERS, 0xF0u);
++    draw_triangle();
++    draw_triangle();
++    /* An empty group is not a draw call. */
++    m(M_BEGIN_END, RSX_PRIMITIVE_TRIANGLES);
++    m(M_BEGIN_END, 0u);
++    rsx_draw_engine_present();
++    CHECK(stub.present_draws == 2 && stub.present_clears == 1,
++          "the backend's present sees this frame's counts: 2 draws, 1 clear (%u, %u)",
++          stub.present_draws, stub.present_clears);
++    rsx_draw_engine_frame_counts(&d, &c);
++    CHECK(d == 2 && c == 1, "and they stay readable after it (%u, %u)", d, c);
++
++    /* A depth/stencil-only clear is a clear too. */
++    m(M_CLEAR_BUFFERS, 0xF0u);
++    m(M_CLEAR_BUFFERS, 0x03u);
++    rsx_draw_engine_present();
++    CHECK(stub.present_draws == 0 && stub.present_clears == 2,
++          "the next frame starts from zero: 0 draws, 2 clears (%u, %u)",
++          stub.present_draws, stub.present_clears);
++    engine_down();
++}
++
+ int main(void)
+ {
+     vm_base = (u8*)calloc(1, GUEST_BYTES);
+@@ -2483,6 +2521,7 @@ int main(void)
+     test_immediate_compositor();
+     test_immediate_packed_zero_and_inline();
+     test_clear_rect();
++    test_frame_counts();
+ 
+     free(vm_base);
+     printf(g_failures ? "\n%d check(s) FAILED\n" : "\nall checks passed\n",
+diff --git a/tools/test_frame_series.py b/tools/test_frame_series.py
+new file mode 100644
+index 00000000..36ab1850
+--- /dev/null
++++ b/tools/test_frame_series.py
+@@ -0,0 +1,67 @@
++#!/usr/bin/env python3
++"""The Metal backend's frame series and draw statistics (libs/video/rsx_frame_series.h).
++
++PS3RECOMP_METAL_FRAME_DIR keeps numbered dumps (frame_<presented>.ppm, the first present
++and every PS3RECOMP_METAL_FRAME_EVERY-th after it, at most PS3RECOMP_METAL_FRAME_MAX, until
++a STOP file appears in the folder), and PS3RECOMP_DRAW_STATS writes one
++"<presented> <draws> <clears>" line per present. The policy and the writers are plain C,
++so this builds libs/video/tests/test_frame_series.c, which includes the header, and runs
++it. On macOS it also builds libs/video/tests/test_metal_frame_series.m, which includes
++rsx_metal_backend.m and checks its present glue against a real Metal texture (it prints
++SKIP and passes without a Metal device). The draw engine's per-frame counts are checked by
++tests/test_rsx_draw_engine.c (tools/test_rsx_immediate_vertices.py).
++"""
++import os
++import shutil
++import subprocess
++import sys
++import tempfile
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++def main():
++    if os.name == 'nt':
++        print('SKIP: the fixture uses POSIX file calls; run on macOS/Linux')
++        return 0
++    cc = os.environ.get('CC') or shutil.which('cc') or shutil.which('gcc') or shutil.which('clang')
++    if not cc:
++        print('SKIP: no C compiler')
++        return 0
++    with tempfile.TemporaryDirectory() as tmp:
++        exe = Path(tmp) / 'test_frame_series'
++        r = subprocess.run([cc, '-std=gnu17', '-O1', '-Wall', '-Werror', '-Wno-unused-function',
++                            '-I' + str(ROOT / 'include'),
++                            str(ROOT / 'libs/video/tests/test_frame_series.c'), '-o', str(exe)],
++                           capture_output=True, text=True)
++        if r.returncode:
++            print(r.stdout + r.stderr)
++            print('FAIL: fixture did not build')
++            return 1
++        r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=60,
++                           env={**os.environ, 'TMPDIR': tmp})
++        sys.stdout.write(r.stdout + r.stderr)
++        if r.returncode:
++            return 1
++        if sys.platform != 'darwin':
++            return 0
++        exe = Path(tmp) / 'test_metal_frame_series'
++        r = subprocess.run([cc, '-fobjc-arc', '-I' + str(ROOT / 'include'),
++                            '-I' + str(ROOT / 'libs/video'),
++                            str(ROOT / 'libs/video/tests/test_metal_frame_series.m'),
++                            '-Wl,-dead_strip', '-framework', 'Metal', '-framework', 'Cocoa',
++                            '-framework', 'QuartzCore', '-framework', 'IOSurface',
++                            '-o', str(exe)], capture_output=True, text=True)
++        if r.returncode:
++            print(r.stdout + r.stderr)
++            print('FAIL: Metal fixture did not build')
++            return 1
++        r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=120,
++                           env={**os.environ, 'TMPDIR': tmp})
++        sys.stdout.write(r.stdout + r.stderr)
++        return 1 if r.returncode else 0
++
++
++if __name__ == '__main__':
++    sys.exit(main())
