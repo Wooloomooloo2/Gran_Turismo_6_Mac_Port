@@ -20,6 +20,8 @@ Shortcuts taken, with the proper fix logged. Priority order: 1) Stability, 2) Pe
 - Patch 0008: neither SPURS job path checks the `spu_run_spurs_job` stage result. The interpreted path (`runtime/spu/spu_workload.c` ~1168) ignores it, and the lifted path (~1189) only logs it under `SPU_JOBPROF`. Make both treat a negative (error) stage result as a failed job.
 - Guest `setjmp`/`longjmp` (patch 0009): a frame re-armed after a newer site is dropped by a longjmp to that newer site. Not seen in GT6's 22 call sites; fix if a title needs it.
 - `g_sjlj_top` is not reset when the interrupt-handler loop re-enters after a thread-exit unwind (`runtime/syscalls/sys_ppu_thread.c` ~229-233 and ~647). Reset it there.
+- `port/CMakeLists.txt` runs the patch script with the caller's environment, so an exported `GT6_PS3RECOMP_DIR` or `GT6_PS3RECOMP_PATCHES` would patch a different checkout than the one being built while the hash check still passes. Run it through `cmake -E env` with those set explicitly.
+- `scripts/translate_game.py` still accepts a `translate.json` with no `tool` field (written before the milestone 2 final fixes) as its own output, so `-o` would replace a copied backup of `recomp/`. The owner's tree has been re-translated with `tool` set; drop the legacy rule.
 - ps3recomp's `cellKb` reports a keyboard always connected on port 0 and caps `CELL_KB_MAX_KEYBOARDS` at 2 (SDK: 127). Check what GT6 does with a keyboard present versus RPCS3's default null keyboard.
 
 ## 2) Performance
