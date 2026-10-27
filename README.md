@@ -77,8 +77,8 @@ committed.
 This translates the game's code, builds the Mac program and starts it for a few seconds. It is
 a developer tool; it does not play the game. It needs the verified game folder from the step
 above (called `$GT6_TREE` here), Python with the dev packages, CMake, Ninja, Apple's command
-line tools, and two Homebrew packages: `brew install sdl2 spirv-cross` (glslang is also
-used). Everything generated goes into `$GT6_TREE`, never into this repository.
+line tools, and three Homebrew packages: `brew install sdl2 glslang spirv-cross`. Everything
+generated goes into `$GT6_TREE`, never into this repository.
 
 ```sh
 export GT6_TREE="/path/to/build/BCES01977-v1.22"
@@ -86,28 +86,33 @@ export GT6_TREE="/path/to/build/BCES01977-v1.22"
 # 1. Once: Python environment.
 python3 -m venv .venv && .venv/bin/pip install -r scripts/requirements-dev.txt
 
-# 2. Translate the game's code to C/C++ (about a minute, plus compile time below).
+# 2. Translate the game's code to C/C++ (58 s on an M4 Max, FINDINGS). It first applies
+#    patches/ps3recomp to third_party/ps3recomp and refuses unless every patch is in.
 .venv/bin/python scripts/translate_game.py "$GT6_TREE"
 
 # 3. Make the play folder the game runs on (a clone of the tree's dev_hdd0 with the
 #    launcher's on-disk changes applied). --force replaces one an earlier run used.
 .venv/bin/python scripts/prepare_play.py "$GT6_TREE" --force
 
-# 4. Build the Mac program (about 80 s on an M4 Max). The build folder must be outside this
-#    repository; the binary is $GT6_TREE/port-build/port/gt6.
+# 4. Build the Mac program (78 s on an M4 Max, FINDINGS; the lifted code is built at -O1,
+#    D30). The build folder must be outside this repository and any git work tree; the
+#    binary is $GT6_TREE/port-build/port/gt6.
 cmake -S . -B "$GT6_TREE/port-build" -G Ninja -DGT6_BUILD_PORT=ON \
       -DGT6_TREE="$GT6_TREE" -DCMAKE_BUILD_TYPE=Release
 cmake --build "$GT6_TREE/port-build" --target gt6
 
-# 5. Start it unattended. It stops 5 s after the first frame, when the process exits,
+# 5. Start it unattended. It stops 5 s after the first flip, when the process exits,
 #    when it hangs (--idle) or after --seconds. Options: --seconds N, --idle N, --window.
 .venv/bin/python scripts/boot_game.py "$GT6_TREE"
 ```
 
 Each boot writes `$GT6_TREE/runs/<date-time>/` with `report.json` (outcome, frames, unresolved
-imports), `summary.md`, the logs and the latest dumped frame. A play folder that a run has
-used is not clean: run step 3 with `--force` before the next boot. Re-run step 2 after changing
-anything under `patches/`.
+imports), `summary.md`, the logs and the latest dumped frame. The outcome is `first_frame` only
+when the game flipped a frame and at least one frame was dumped (`flip_no_frame` otherwise). A
+play folder that a run has used is not clean: run step 3 with `--force` before the next boot
+(`boot_game.py` warns when you have not). Re-run step 2 after changing anything under
+`patches/`. To take the patches back out of the submodule:
+`git -C third_party/ps3recomp checkout . && git -C third_party/ps3recomp clean -fd`.
 
 ## Guard against game files
 
