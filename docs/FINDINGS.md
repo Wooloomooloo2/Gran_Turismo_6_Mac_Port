@@ -27,6 +27,26 @@ Full suite with the real disc and all updates (re-run after the final review fix
 - `gt6unpack verify ~/Gran\ Turismo\ 6/build/BCES01977-v1.22 --manifest manifests/BCES01977-v1.22.json`: `16568 files checked: 0 mismatched, 0 missing, 0 extra` (now also checks the tree's PARAM.SFO is BCES01977 01.22).
 - `scripts/check_no_game_files.py $(git ls-files)`: clean.
 
+## Translating EMAIN (2026-10-27)
+
+Measured with `ppu_lifter` on the v1.22 `USRDIR/EMAIN.SELF.elf` (M4 Max):
+
+| Run | Time | Peak memory | Functions | Output |
+|---|---|---|---|---|
+| Without `--code-end` | 224 s | 12.9 GB | 87,498 | 4.1 GB of C++ |
+| With `--code-end 0x101BEA0` (spike) | 21 s | 3.2 GB | 70,028 | 333 MB, 64 chunks + `ppu_recomp_table.cpp` |
+| Same, via `scripts/translate_game.py` | 21.1 s (loader 0.6 s + lifter 20.4 s) | 3.2 GB | 70,028 | 333 MB in `ppu/` (66 files incl. header and table) |
+
+- About 3.7 GB of the unbounded output comes from call targets promoted inside read-only
+  data and the embedded SPU programs, from va 0x101BEA0 upward.
+- The code end 0x101BEA0 is the end of the last executable section (section 4,
+  0x1011CC0 + 0xA1E0), read from the ELF section headers.
+- Compiling all 65 chunks with Apple clang 21, `-std=c++20 -O1 -w -fwrapv
+  -fno-strict-aliasing -ffp-contract=off`, 12 in parallel: 72 s wall, 774 s CPU, largest
+  chunk 16 s, peak 1.2 GB per compiler, 242 MB of objects. Include paths: the lift folder,
+  `ps3recomp/runtime/ppu` (`ppu_vmx.h`), `ps3recomp/include`, `ps3recomp/runtime`.
+- EMAIN SHA-256 `7b4f37bd...c373d1`, ps3recomp commit `4e8f3ca`.
+
 ## Code map of v1.22 (2026-10-27)
 
 **Risks found** (technical detail; the plain-language version is the owner summary above):
