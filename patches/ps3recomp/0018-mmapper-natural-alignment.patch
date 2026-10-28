@@ -1,0 +1,89 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] sys_mmapper: place a power-of-two reservation on its own size
+
+Upstream: not yet submitted; written to be upstreamed (generic, no title names)
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0017)
+
+What: sys_mmapper_allocate_address (lv2 330) now places a reservation whose
+size is a power of two larger than its alignment on its own size (natural
+alignment), and falls back to the requested alignment only when no such span
+is left. Other reservations are placed as before.
+
+lv2 hands out address space first-fit from the bottom of user space (RPCS3's
+vm::find_map searches upward from 0x10000000 in alignment steps), so a
+title's few early reservations land on large boundaries. This runtime keeps
+its own windows at 0x50000000-0x6FFFFFFF, so with a 256 MB reservation at
+0x40000000 a 512 MB one with 256 MB alignment went to 0x70000000, across
+0x80000000. Under RPCS3 the same sequence gives 0x30000000 and 0x40000000:
+the 512 MB lands on a 512 MB boundary. A naturally aligned reservation never
+crosses a boundary of its own size, which keeps that property here.
+
+Why: a title heap that numbers its 8 KB pages with 16 bits of the address
+((address >> 13) & 0xFFFF over a 512 MB reservation) saw its page numbers
+wrap at 0x80000000. Its page lookup then found none of its blocks, so every
+realloc returned NULL. The C library's atexit grows its table with realloc
+and, on that failure, returns without releasing its lock, so the lock leaked.
+The next thread to register a destructor (a static initialiser) blocked on it
+for good.
+
+Test: tests/test_mmapper_hle_heap.c (run by tools/test_mmapper_hle_heap.py)
+gains the reservation sequence above: a 512 MB reservation after a 256 MB one
+is 512 MB aligned, outside the runtime's windows, and its 16-bit page numbers
+do not wrap. A small or non-power-of-two reservation keeps the requested
+alignment. The new checks fail without the change, and the existing ones
+still pass.
+
+diff --git a/runtime/syscalls/sys_memory.c b/runtime/syscalls/sys_memory.c
+index 66eef25c..4b530718 100644
+--- a/runtime/syscalls/sys_memory.c
++++ b/runtime/syscalls/sys_memory.c
+@@ -344,7 +344,22 @@ int64_t sys_mmapper_allocate_address(ppu_context* ctx)
+     int slot = -1;
+     for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; ++i)
+         if (!s_mapper_reservations[i].start) { slot = i; break; }
+-    uint32_t addr = slot < 0 ? 0 : mapper_address(size, alignment);
++    /* A power-of-two reservation larger than its alignment is placed on its
++     * own size first (falling back to the requested alignment if no such
++     * span is left). lv2 hands out address space first-fit from the bottom
++     * of user space, so a title's few early reservations land on large
++     * boundaries; this runtime keeps its own windows at 0x50000000-0x6FFFFFFF
++     * and would otherwise put a 512 MB reservation at 0x70000000, across
++     * 0x80000000. A title allocator that numbers its pages within the
++     * reservation by address bits (seen: (address >> 13) & 0xFFFF over a
++     * 512 MB heap) then sees its page numbers wrap, finds none of its blocks
++     * again and fails every realloc. A naturally aligned
++     * reservation never crosses a boundary of its own size. */
++    uint32_t addr = 0;
++    if (slot >= 0) {
++        if (size > alignment && !(size & (size - 1u))) addr = mapper_address(size, size);
++        if (!addr) addr = mapper_address(size, alignment);
++    }
+     if (addr) {
+         mapper_reservation* r = &s_mapper_reservations[slot];
+         r->start = r->next = addr; r->end = s_mapper_bump_ptr;
+diff --git a/tests/test_mmapper_hle_heap.c b/tests/test_mmapper_hle_heap.c
+index db21e675..dbea4b9f 100644
+--- a/tests/test_mmapper_hle_heap.c
++++ b/tests/test_mmapper_hle_heap.c
+@@ -86,6 +86,20 @@ int main(void) {
+     CHECK(vm_read32(virtual_memory)==0x11223344);
+     for (uint32_t i=0;i<VM_AUDIO_SIZE/VM_AUDIO_PORT_SIZE;++i)
+         CHECK(vm_read32(VM_AUDIO_BASE+i*VM_AUDIO_PORT_SIZE)==0xABCDEF00u+i);
++    /* A power-of-two reservation larger than its alignment is naturally
++     * aligned, so it never crosses a boundary of its own size: after a 256 MB
++     * reservation at 0x40000000, a 512 MB one with 256 MB alignment would
++     * otherwise land at 0x70000000, across 0x80000000, and a title heap that
++     * numbers 8 KB pages with 16 bits would see them wrap. */
++    reset();CHECK(reserve(0x10000000,0x10000000)==CELL_OK);CHECK(out()==0x40000000u);
++    CHECK(reserve(0x20000000,0x10000000)==CELL_OK);uint32_t heap512=out();
++    CHECK((heap512&0x1FFFFFFFu)==0);CHECK(disjoint(heap512,0x20000000u));
++    CHECK(((heap512>>13)&0xFFFFu)<(((heap512+0x20000000u-1u)>>13)&0xFFFFu));
++    CHECK(reserve(0x10000000,0x10000000)==CELL_OK);CHECK(out()==heap512+0x20000000u);
++    /* Sizes that are not a power of two, or no larger than their alignment,
++     * keep the requested alignment. */
++    reset();CHECK(reserve(0x100000,0x10000)==CELL_OK);CHECK(out()==0x40000000u);
++    CHECK(reserve(0x300000,0x100000)==CELL_OK);CHECK(out()==0x40100000u);
+     /* Failure must neither publish an output nor consume the safe gap. */
+     reset();vm_write32(0x10000,0xAABBCCDDu);
+     CHECK(reserve(0x80000000,0x10000000)!=(int64_t)CELL_OK);CHECK(out()==0xAABBCCDDu);
