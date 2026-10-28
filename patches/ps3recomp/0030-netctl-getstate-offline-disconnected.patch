@@ -1,0 +1,167 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] cellNetCtlGetState offline: CELL_OK with state Disconnected after Init
+
+Upstream: not yet submitted; written to be upstreamed (generic, no title names)
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0029)
+
+What: offline, cellNetCtlGetState answered CELL_NET_CTL_ERROR_NOT_INITIALIZED
+even after cellNetCtlInit (it did write state Disconnected). The SDK, and
+RPCS3 (cellNetCtl.cpp), answer NOT_INITIALIZED only before Init; after it an
+offline console answers CELL_OK with CELL_NET_CTL_STATE_Disconnected. That is
+now the answer. The old one was kept for one title whose connect job polls
+GetState until it fails; PS3_NETCTL_OFFLINE_FAIL=1 restores it.
+
+Why: a title that checks the return value sees the network library as not
+initialised although it initialised it, and can take an error path a console
+never takes.
+
+Test: tools/test_netctl_getstate.py (new) builds tests/test_netctl_getstate.c
+with the real cellNetCtl.c: NOT_INITIALIZED before Init and after Term,
+CELL_OK with Disconnected after Init, INVALID_ADDR for a NULL state, and the
+old answer under PS3_NETCTL_OFFLINE_FAIL=1.
+
+diff --git a/libs/network/cellNetCtl.c b/libs/network/cellNetCtl.c
+index 8b002ffe..33c00b8f 100644
+--- a/libs/network/cellNetCtl.c
++++ b/libs/network/cellNetCtl.c
+@@ -158,15 +158,20 @@ s32 cellNetCtlGetState(s32* state)
+         return CELL_NET_CTL_ERROR_INVALID_ADDR;
+ 
+     if (!netctl_online()) {
+-        /* Offline: FAIL the query rather than report state=Disconnected.
+-         * LBP's connect job (sub_F433C(0)) polls GetState forever until
+-         * IPObtained and only exits on ret<0 -- and the working RPCS3 boot
+-         * shows exactly one GetState call failing with NOT_INITIALIZED,
+-         * after which the game proceeds offline. Still write a sane state
+-         * for callers that ignore the return value. */
++        /* Offline: CELL_OK with state Disconnected, as the SDK documents and
++         * RPCS3 answers (cellNetCtl.cpp: NOT_INITIALIZED only before Init).
++         * PS3_NETCTL_OFFLINE_FAIL=1 restores the old answer, NOT_INITIALIZED
++         * after Init, for a title whose connect job polls GetState until it
++         * fails (LBP's sub_F433C; its RPCS3 boot showed one failing call). */
++        static int fail = -1;
++        if (fail < 0) fail = getenv("PS3_NETCTL_OFFLINE_FAIL") ? 1 : 0;
+         vm_write32((uint32_t)(uintptr_t)state, CELL_NET_CTL_STATE_Disconnected);
+-        printf("[cellNetCtl] GetState() -> error NOT_INITIALIZED (offline mode)\n");
+-        return CELL_NET_CTL_ERROR_NOT_INITIALIZED;
++        if (fail) {
++            printf("[cellNetCtl] GetState() -> error NOT_INITIALIZED (offline, PS3_NETCTL_OFFLINE_FAIL)\n");
++            return CELL_NET_CTL_ERROR_NOT_INITIALIZED;
++        }
++        printf("[cellNetCtl] GetState() -> Disconnected (offline)\n");
++        return CELL_OK;
+     }
+ 
+     vm_write32((uint32_t)(uintptr_t)state, CELL_NET_CTL_STATE_IPObtained);
+diff --git a/tests/test_netctl_getstate.c b/tests/test_netctl_getstate.c
+new file mode 100644
+index 00000000..0e2aa86b
+--- /dev/null
++++ b/tests/test_netctl_getstate.c
+@@ -0,0 +1,49 @@
++/* cellNetCtlGetState offline through the real libs/network/cellNetCtl.c:
++ * NOT_INITIALIZED before Init, then CELL_OK with state Disconnected, as the
++ * SDK and RPCS3 answer; PS3_NETCTL_OFFLINE_FAIL=1 keeps the old failing
++ * answer. Run by tools/test_netctl_getstate.py. */
++#include "../libs/network/cellNetCtl.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/mman.h>
++
++uint8_t* vm_base;
++uint32_t ppu_vm_size;
++int g_resv_store_active;          /* ppu_memory.h store hooks; none armed here */
++uint32_t g_ww_lo, g_ww_hi;
++
++static int fails;
++#define CHECK(c, ...) do { const int ok_ = (c); printf(ok_ ? "[PASS] " : "[FAIL] "); printf(__VA_ARGS__); \
++                           printf("\n"); if (!ok_) fails++; } while (0)
++
++static uint32_t rd32(uint32_t a)
++{
++    const uint8_t* p = vm_base + a;
++    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
++}
++
++int main(int argc, char** argv)
++{
++    setvbuf(stdout, NULL, _IONBF, 0);
++    vm_base = (uint8_t*)mmap(NULL, 0x100000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
++    s32* state = (s32*)(uintptr_t)0x1000;   /* a guest address, as the HLE adapter passes it */
++    const int legacy = argc > 1 && strcmp(argv[1], "legacy") == 0;
++
++    CHECK((uint32_t)cellNetCtlGetState(state) == CELL_NET_CTL_ERROR_NOT_INITIALIZED, "before Init: NOT_INITIALIZED");
++    CHECK(cellNetCtlInit() == CELL_OK, "Init");
++    memset(vm_base + 0x1000, 0xAA, 4);
++    s32 rc = cellNetCtlGetState(state);
++    if (legacy)
++        CHECK((uint32_t)rc == CELL_NET_CTL_ERROR_NOT_INITIALIZED, "PS3_NETCTL_OFFLINE_FAIL=1: still NOT_INITIALIZED after Init");
++    else
++        CHECK(rc == CELL_OK, "after Init, offline: CELL_OK (0x%08X)", (uint32_t)rc);
++    CHECK(rd32(0x1000) == CELL_NET_CTL_STATE_Disconnected, "state is Disconnected (%u)", rd32(0x1000));
++    CHECK((uint32_t)cellNetCtlGetState(NULL) == CELL_NET_CTL_ERROR_INVALID_ADDR, "a NULL state is INVALID_ADDR");
++    cellNetCtlTerm();
++    CHECK((uint32_t)cellNetCtlGetState(state) == CELL_NET_CTL_ERROR_NOT_INITIALIZED, "after Term: NOT_INITIALIZED");
++
++    if (fails) { printf("%d check(s) failed\n", fails); return 1; }
++    puts(legacy ? "test_netctl_getstate (legacy): OK" : "test_netctl_getstate: OK");
++    return 0;
++}
+diff --git a/tools/test_netctl_getstate.py b/tools/test_netctl_getstate.py
+new file mode 100644
+index 00000000..0dfc04b7
+--- /dev/null
++++ b/tools/test_netctl_getstate.py
+@@ -0,0 +1,50 @@
++#!/usr/bin/env python3
++"""cellNetCtlGetState offline through the real libs/network/cellNetCtl.c.
++
++The SDK, and RPCS3, answer NOT_INITIALIZED only before cellNetCtlInit; after it
++an offline console answers CELL_OK with state Disconnected. The runtime
++answered NOT_INITIALIZED after Init too (for one title's connect job), which
++a title's start-up sees as the library failing. PS3_NETCTL_OFFLINE_FAIL=1
++keeps that answer for the title that needs it. Builds
++tests/test_netctl_getstate.c with cellNetCtl.c and runs it both ways.
++"""
++import os
++import platform
++import subprocess
++import sys
++import tempfile
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++def main():
++    if os.name == 'nt':
++        print('SKIP: the fixture is POSIX; run on macOS/Linux')
++        return 0
++    with tempfile.TemporaryDirectory(prefix='netctl-getstate-') as tmp:
++        exe = Path(tmp) / 'test_netctl_getstate'
++        link = ['-Wl,-undefined,dynamic_lookup'] if platform.system() == 'Darwin' else ['-Wl,--unresolved-symbols=ignore-all']
++        r = subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-w',
++                            '-I' + str(ROOT / 'include'), '-I' + str(ROOT / 'runtime'),
++                            '-I' + str(ROOT / 'libs/network'), '-I' + str(ROOT / 'libs/system'),
++                            '-I' + str(ROOT / 'libs'),
++                            str(ROOT / 'tests/test_netctl_getstate.c'), str(ROOT / 'libs/network/cellNetCtl.c'),
++                            *link, '-o', str(exe)],
++                           capture_output=True, text=True)
++        if r.returncode:
++            print(r.stdout + r.stderr)
++            print('FAIL: fixture did not build')
++            return 1
++        rc = 0
++        for args, extra in (([], {}), (['legacy'], {'PS3_NETCTL_OFFLINE_FAIL': '1'})):
++            env = {k: v for k, v in os.environ.items() if k not in ('PS3_NET_ONLINE', 'PS3_NETCTL_OFFLINE_FAIL')}
++            env.update(extra)
++            r = subprocess.run([str(exe), *args], capture_output=True, text=True, timeout=30, env=env)
++            sys.stdout.write(r.stdout + r.stderr)
++            rc |= r.returncode
++        return rc
++
++
++if __name__ == '__main__':
++    sys.exit(main())
