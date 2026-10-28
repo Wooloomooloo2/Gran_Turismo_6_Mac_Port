@@ -1,0 +1,182 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] cellAvconfExt: cellVideoOutGetScreenSize answers VALUE_IS_NOT_SET
+
+Upstream: not yet submitted; written to be upstreamed (generic, no title names)
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0011)
+
+What: cellVideoOutGetScreenSize (cellSysutilAvconfExt, NID 0xFAA275A4) had no
+handler, so it took the unresolved path and faked CELL_OK with *screenSize
+unwritten. It reports the screen size the user set for a stereoscopic (3D)
+display. The emulated video out is a 2D HDMI display (what
+cellVideoOutGetState reports), for which no size is set, so it now returns
+CELL_VIDEO_OUT_ERROR_VALUE_IS_NOT_SET (0x8002b228) and leaves *screenSize
+alone; a NULL pointer is ILLEGAL_PARAMETER (0x8002b222) and a video out other
+than the primary one UNSUPPORTED_VIDEO_OUT (0x8002b225). Behaviour follows
+RPCS3 with stereo output disabled.
+
+The codes are defined locally with the SDK's values: libs/video/cellVideoOut.h
+builds its CELL_VIDEO_OUT_ERROR_* from CELL_ERROR_BASE_VIDEO (0x8002B100), so
+they read 0x8002B10x instead of 0x8002b22x; that is left for its own change.
+
+Why: a caller that trusts the success reads an uninitialised float as the
+display size.
+
+Test: tools/test_avconf_screen_size.py (new) checks the name hashes to the
+imported NID, then builds libs/misc/tests/test_avconf_screen_size.c with
+cellAvconfExt.c: the three answers, and the out-parameter untouched.
+
+diff --git a/libs/misc/cellAvconfExt.c b/libs/misc/cellAvconfExt.c
+index 2ab88b8e..4ff4dc74 100644
+--- a/libs/misc/cellAvconfExt.c
++++ b/libs/misc/cellAvconfExt.c
+@@ -188,6 +188,24 @@ s32 cellVideoOutSetGamma(u32 videoOut, float gamma)
+     return CELL_OK;
+ }
+ 
++/* The SDK's video out error codes (0x8002b22x). */
++#define AVCONF_VIDEO_OUT_ERROR_ILLEGAL_PARAMETER    ((s32)0x8002b222)
++#define AVCONF_VIDEO_OUT_ERROR_UNSUPPORTED_VIDEO_OUT ((s32)0x8002b225)
++#define AVCONF_VIDEO_OUT_ERROR_VALUE_IS_NOT_SET     ((s32)0x8002b228)
++
++/* cellVideoOutGetScreenSize(videoOut, screenSize): the screen size, in inches,
++ * the user set for a stereoscopic (3D) display in the system's 3D display
++ * settings. The video out is a 2D HDMI display (the one cellVideoOutGetState
++ * reports), for which no size is set: the answer is VALUE_IS_NOT_SET and
++ * *screenSize is left alone. Behaviour follows RPCS3 (3D disabled), including
++ * its argument checks. NID 0xFAA275A4. */
++s32 cellVideoOutGetScreenSize(u32 videoOut, float* screenSize)
++{
++    if (!screenSize) return AVCONF_VIDEO_OUT_ERROR_ILLEGAL_PARAMETER;
++    if (videoOut != 0) return AVCONF_VIDEO_OUT_ERROR_UNSUPPORTED_VIDEO_OUT;   /* CELL_VIDEO_OUT_PRIMARY only */
++    return AVCONF_VIDEO_OUT_ERROR_VALUE_IS_NOT_SET;
++}
++
+ /* The gamma is a float, which the PPU ABI passes in f1, not r4: registered
+  * through a plain C prototype it arrived as garbage (inFAMOUS 2 logged 0.00)
+  * and the game's brightness setting never reached the screen. The context
+diff --git a/libs/misc/cellAvconfExt.h b/libs/misc/cellAvconfExt.h
+index 9ab90ee1..70f04c02 100644
+--- a/libs/misc/cellAvconfExt.h
++++ b/libs/misc/cellAvconfExt.h
+@@ -87,6 +87,8 @@ s32 cellAudioOutGetNumberOfDevice(u32 audioOut);
+ /* Video output extended queries */
+ s32 cellVideoOutGetGamma(u32 videoOut, float* gamma);
+ s32 cellVideoOutSetGamma(u32 videoOut, float gamma);
++/* The screen size of a stereoscopic (3D) display, in inches. */
++s32 cellVideoOutGetScreenSize(u32 videoOut, float* screenSize);
+ void avconf_register_ctx(void);
+ float cellAvconfExt_display_gamma(void);
+ 
+diff --git a/libs/misc/tests/test_avconf_screen_size.c b/libs/misc/tests/test_avconf_screen_size.c
+new file mode 100644
+index 00000000..13ec2759
+--- /dev/null
++++ b/libs/misc/tests/test_avconf_screen_size.c
+@@ -0,0 +1,49 @@
++/*
++ * test_avconf_screen_size - cellVideoOutGetScreenSize (libs/misc/cellAvconfExt.c).
++ *
++ * The call reports the screen size of a stereoscopic (3D) display, which the
++ * user sets in the system's 3D display settings. With a 2D HDMI display (the
++ * 720p/1080p one cellVideoOutGetState reports) none is set: the answer is
++ * CELL_VIDEO_OUT_ERROR_VALUE_IS_NOT_SET and the out-parameter is untouched.
++ * Behaviour follows RPCS3 (its 3D-disabled path), argument checks included.
++ * Run by tools/test_avconf_screen_size.py.
++ */
++
++#include "../cellAvconfExt.c"
++
++/* ppu_memory.h hooks the runtime supplies; inert here. */
++uint8_t* vm_base;
++int g_resv_store_active = 0;
++uint32_t g_ww_lo = 0, g_ww_hi = 0;
++void ppu_resv_break_store(uint64_t ea) { (void)ea; }
++int  spu_coh_is_reserved(uint32_t addr) { (void)addr; return 0; }
++void spu_lockline_lock(void) {}
++void spu_lockline_unlock(void) {}
++void spu_coh_notify_write(uint32_t addr) { (void)addr; }
++void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width) { (void)addr; (void)val; (void)width; }
++void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*)) { (void)nid; (void)name; (void)fn; }
++
++static int fails = 0;
++#define CHECK(c, ...) do { const int ok_ = (c); printf(ok_ ? "[PASS] " : "[FAIL] "); printf(__VA_ARGS__); \
++                           printf("\n"); if (!ok_) fails++; } while (0)
++
++int main(void)
++{
++    static uint8_t arena[64];
++    vm_base = arena;
++    memset(arena, 0xAA, sizeof arena);
++    float* out = (float*)(uintptr_t)16;   /* a guest address */
++
++    s32 rc = cellVideoOutGetScreenSize(0, out);
++    CHECK(rc == (s32)0x8002b228, "primary 2D display: VALUE_IS_NOT_SET (got 0x%08X)", (unsigned)rc);
++    int untouched = 1;
++    for (int i = 0; i < 64; i++) untouched &= arena[i] == 0xAA;
++    CHECK(untouched, "the screen size is not written");
++    rc = cellVideoOutGetScreenSize(0, NULL);
++    CHECK(rc == (s32)0x8002b222, "NULL screenSize: ILLEGAL_PARAMETER (got 0x%08X)", (unsigned)rc);
++    rc = cellVideoOutGetScreenSize(1, out);
++    CHECK(rc == (s32)0x8002b225, "secondary video out: UNSUPPORTED_VIDEO_OUT (got 0x%08X)", (unsigned)rc);
++    if (fails) { printf("%d check(s) failed\n", fails); return 1; }
++    puts("test_avconf_screen_size: OK");
++    return 0;
++}
+diff --git a/tools/test_avconf_screen_size.py b/tools/test_avconf_screen_size.py
+new file mode 100644
+index 00000000..6f6d875a
+--- /dev/null
++++ b/tools/test_avconf_screen_size.py
+@@ -0,0 +1,51 @@
++#!/usr/bin/env python3
++"""cellVideoOutGetScreenSize (libs/misc/cellAvconfExt.c).
++
++Titles import it as 0xFAA275A4 (cellSysutilAvconfExt). It had no handler, so it
++took the unresolved path and faked CELL_OK with the size unwritten. Checks that
++the name hashes to that NID (the HLE table registers by the hash of the name),
++then builds libs/misc/tests/test_avconf_screen_size.c, which includes
++cellAvconfExt.c, and runs it.
++"""
++import hashlib
++import os
++import shutil
++import struct
++import subprocess
++import sys
++import tempfile
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++SUFFIX = b"\x67\x59\x65\x99\x04\x25\x04\x90\x56\x64\x27\x49\x94\x89\x74\x1A"
++
++
++def nid(name):
++    return struct.unpack('<I', hashlib.sha1(name.encode() + SUFFIX).digest()[:4])[0]
++
++
++def main():
++    got = nid('cellVideoOutGetScreenSize')
++    fails = got != 0xFAA275A4
++    print(f"[{'FAIL' if fails else 'PASS'}] cellVideoOutGetScreenSize hashes to 0x{got:08X} "
++          "(imported as 0xFAA275A4)")
++    cc = os.environ.get('CC') or shutil.which('cc') or shutil.which('gcc') or shutil.which('clang')
++    if not cc:
++        print('SKIP: no C compiler')
++        return 1 if fails else 0
++    with tempfile.TemporaryDirectory() as tmp:
++        exe = Path(tmp) / 'test_avconf_screen_size'
++        r = subprocess.run([cc, '-std=gnu17', '-O1', '-w', '-I' + str(ROOT / 'include'),
++                            str(ROOT / 'libs/misc/tests/test_avconf_screen_size.c'), '-o', str(exe)],
++                           capture_output=True, text=True)
++        if r.returncode:
++            print(r.stdout + r.stderr)
++            print('FAIL: fixture did not build')
++            return 1
++        r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=30)
++        sys.stdout.write(r.stdout + r.stderr)
++        return 1 if (fails or r.returncode) else 0
++
++
++if __name__ == '__main__':
++    sys.exit(main())

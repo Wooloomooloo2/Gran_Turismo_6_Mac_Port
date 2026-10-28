@@ -78,6 +78,7 @@ def test_runners_found():
                 assert f in found
     assert "tools/test_lwcond_wakeup.py" in found
     assert "tools/test_cellfiber_ppu.py" in found   # patch 0011, PPU fiber contexts (D36)
+    assert "tools/test_avconf_screen_size.py" in found   # patch 0012
 
 
 @pytest.mark.parametrize("runner", runners())
