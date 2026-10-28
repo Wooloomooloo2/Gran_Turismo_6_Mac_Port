@@ -1,0 +1,181 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] SPU interpreter takes enabled, pending SPU interrupts
+
+Upstream: not yet submitted; written to be upstreamed (generic, no title names)
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0036)
+
+What: the SPU interrupt facility in the interpreter. With interrupts enabled
+(bie/irete and the other E-bit branches already set int_enable), a pending
+event in the event mask is now taken at the next instruction boundary, as on
+hardware: srr0 <- the interrupted pc, interrupts off, execution goes to the
+target of the br/bra the guest planted at LS 0; the handler returns with iret.
+The lifted path already does this at every trampoline transfer (SPU_DRAIN,
+spu_take_interrupt); the interpreter only honoured the E/D bits and iret, so
+an interpreted image that waits with interrupts enabled for its handler (a
+SPURS policy module's DMA-list stall-and-notify interrupt) never woke. The
+guest's handler saves its own registers, as on hardware; interpreted, the
+save code it plants in local store runs too, so no host-side snapshot is
+taken. LS 0 holding no branch is reported (4 lines at most) and not taken, as
+spu_take_interrupt does.
+Behaviour reference: Cell Broadband Engine Architecture and SPU ISA (the SPU
+interrupt facility); RPCS3's SPU interpreter and spu_thread.cpp (GPL-2.0,
+read only, no code from them).
+Tests: runtime/spu/tests/test_spu_interp_takes_interrupt.c through
+tools/test_spu_interp_takes_interrupt.py (br and bra vectors, srr0, iret E,
+the handler's event ack; disabled, masked and no-branch cases not taken).
+
+diff --git a/runtime/spu/spu_interp.c b/runtime/spu/spu_interp.c
+--- a/runtime/spu/spu_interp.c
++++ b/runtime/spu/spu_interp.c
+@@ -513,6 +513,34 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
+                 fflush(stderr); _g1--;
+             }
+         }
++        /* The SPU interrupt facility (CBEA 18.6, SPU ISA "SPU interrupt
++         * facility"): with interrupts enabled, a pending enabled event is taken
++         * at this instruction boundary -- srr0 <- the next pc, interrupts off,
++         * execution goes to LS 0. The lifted path takes it at every trampoline
++         * transfer (SPU_DRAIN, spu_take_interrupt); the interpreter never did,
++         * so an interpreted image that sleeps with interrupts enabled waiting
++         * for its handler (a SPURS policy module's DMA-list stall-and-notify)
++         * never woke. As on hardware the guest's handler saves its own
++         * registers: interpreted, the save code it plants runs too. LS 0 not
++         * holding a branch (br/bra) is reported once and not taken, as
++         * spu_take_interrupt does. */
++        if (__builtin_expect(ctx->int_enable != 0, 0) &&
++            (__atomic_load_n(&ctx->event_status, __ATOMIC_ACQUIRE) & ctx->event_mask) != 0) {
++            const uint32_t w = ((uint32_t)ctx->ls[0] << 24) | ((uint32_t)ctx->ls[1] << 16) |
++                               ((uint32_t)ctx->ls[2] << 8) | ctx->ls[3];
++            const uint32_t op9 = w >> 23;
++            if (op9 == 0x060 || op9 == 0x064) {   /* bra / br (relative to LS 0): the same target */
++                ctx->srr0 = ctx->pc & SPU_LS_MASK;
++                ctx->int_enable = 0;
++                ctx->pc = (((w >> 7) & 0xFFFFu) << 2) & SPU_LS_MASK;
++                continue;   /* the vector may be lifted code: rejoin there */
++            } else {
++                static int s_nv = 0;
++                if (s_nv++ < 4)
++                    fprintf(stderr, "[spu_interp] interrupt pending (st=0x%X mask=0x%X) but LS 0 word 0x%08X "
++                            "is no branch -- not taken\n", ctx->event_status, ctx->event_mask, w);
++            }
++        }
+         if (_tr>0) { ring[rc&63]=ctx->pc; rc++; if(rn<64)rn++; }
+         steps++;
+         if (interp_stats_on()) interp_stats_step(ctx);
+diff --git a/runtime/spu/tests/test_spu_interp_takes_interrupt.c b/runtime/spu/tests/test_spu_interp_takes_interrupt.c
+new file mode 100644
+--- /dev/null
++++ b/runtime/spu/tests/test_spu_interp_takes_interrupt.c
+@@ -0,0 +1,82 @@
++/* The interpreter takes SPU interrupts (CBEA, SPU ISA "SPU interrupt
++ * facility"): with interrupts enabled, a pending enabled event sends execution
++ * to the branch at LS 0 with srr0 holding the interrupted pc and interrupts
++ * off; the handler's iret (E) returns there. Disabled, or with no branch at
++ * LS 0, nothing is taken. Real interpreter bytes; no title assets. */
++#include "../spu_helpers.h"
++#include "../spu_interp.h"
++#include <assert.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++/* SPU_WrEventAck (channel 2) clears the acknowledged events; nothing else is used. */
++u128 spu_rdch(spu_context* c, uint32_t ch) { (void)c; (void)ch; abort(); }
++void spu_wrch(spu_context* c, uint32_t ch, u128 v) { if (ch != 2) abort(); c->event_status &= ~v._u32[0]; }
++uint32_t spu_rchcnt(spu_context* c, uint32_t ch) { (void)c; (void)ch; abort(); }
++int g_spu_ls_watch_n, g_spu_ls_probe, g_wws_read_probe, g_wws_code_probe, g_spu_smc_watch;
++spu_lifted_fn spu_lifted_lookup(const spu_context* c, uint32_t a) { (void)c; (void)a; abort(); }
++void spu_spurs_taskset_syscall(spu_context* c) { (void)c; abort(); }
++void spu_ls_watch_slow(uint32_t l, int w, const uint8_t* p, uint32_t pc, uint32_t lr) {
++    (void)l; (void)w; (void)p; (void)pc; (void)lr; abort();
++}
++
++static void be32(uint8_t* p, uint32_t v) { p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v; }
++static uint32_t il(unsigned rt, int16_t imm) { return (0x081u << 23) | ((uint32_t)(uint16_t)imm << 7) | rt; }
++static uint32_t wrch(unsigned ch, unsigned rt) { return (0x10Du << 21) | (ch << 7) | rt; }
++#define IRET_E   0x35440000u   /* iret, interrupts enabled on return (the WWS handler's own word) */
++#define STOP     0x00000000u
++static uint32_t br_to(uint32_t target) { return (0x064u << 23) | (((target >> 2) & 0xFFFFu) << 7); }
++static uint32_t bra_to(uint32_t target) { return (0x060u << 23) | (((target >> 2) & 0xFFFFu) << 7); }
++
++static spu_context ctx;
++static int fails;
++#define CHECK(c, ...) do { int ok_ = (c); printf(ok_ ? "[PASS] " : "[FAIL] "); printf(__VA_ARGS__); printf("\n"); if (!ok_) fails++; } while (0)
++
++/* Main code at 0x1000: il r3,1 ; stop. Handler at 0x200: il r4,7 ; il r5,2 ;
++ * wrch SPU_WrEventAck,r5 ; iret (E). */
++static void setup(uint32_t vector_word, int enabled, uint32_t status, uint32_t mask)
++{
++    memset(&ctx, 0, sizeof ctx);
++    spu_context_init(&ctx, 0);
++    ctx.image_id = -1;            /* pure interpretation */
++    be32(ctx.ls + 0, vector_word);
++    be32(ctx.ls + 0x200, il(4, 7));
++    be32(ctx.ls + 0x204, il(5, 2));
++    be32(ctx.ls + 0x208, wrch(2, 5));
++    be32(ctx.ls + 0x20C, IRET_E);
++    be32(ctx.ls + 0x1000, il(3, 1));
++    be32(ctx.ls + 0x1004, STOP);
++    ctx.int_enable = enabled; ctx.event_status = status; ctx.event_mask = mask;
++}
++
++int main(void)
++{
++    setvbuf(stdout, NULL, _IONBF, 0);
++    setup(br_to(0x200), 1, 0x2, 0x2);
++    spu_interp_run(&ctx, 0x1000);
++    CHECK(ctx.status == SPU_STATUS_STOPPED_BY_STOP && ctx.gpr[4]._u32[0] == 7, "enabled + pending Sn: the handler at the br vector ran (r4=%u)", ctx.gpr[4]._u32[0]);
++    CHECK(ctx.srr0 == 0x1000, "srr0 holds the interrupted pc (0x%X)", ctx.srr0);
++    CHECK(ctx.gpr[3]._u32[0] == 1 && ctx.pc == 0x1008, "iret resumed the interrupted code, which ran to its stop (r3=%u pc=0x%X)", ctx.gpr[3]._u32[0], ctx.pc);
++    CHECK(ctx.event_status == 0 && ctx.int_enable == 1, "the handler acknowledged the event, iret re-enabled interrupts");
++
++    setup(bra_to(0x200), 1, 0x2, 0x2);
++    spu_interp_run(&ctx, 0x1000);
++    CHECK(ctx.gpr[4]._u32[0] == 7 && ctx.gpr[3]._u32[0] == 1, "a bra vector is taken the same way");
++
++    setup(br_to(0x200), 0, 0x2, 0x2);
++    spu_interp_run(&ctx, 0x1000);
++    CHECK(ctx.gpr[4]._u32[0] == 0 && ctx.gpr[3]._u32[0] == 1 && ctx.event_status == 2, "interrupts disabled: not taken, the event stays pending");
++
++    setup(br_to(0x200), 1, 0x2, 0x400);
++    spu_interp_run(&ctx, 0x1000);
++    CHECK(ctx.gpr[4]._u32[0] == 0 && ctx.gpr[3]._u32[0] == 1, "a pending event outside the mask is not taken");
++
++    setup(0, 1, 0x2, 0x2);          /* LS 0 holds no branch */
++    spu_interp_run(&ctx, 0x1000);
++    CHECK(ctx.gpr[4]._u32[0] == 0 && ctx.gpr[3]._u32[0] == 1, "no branch at LS 0: not taken");
++
++    if (fails) { printf("%d check(s) failed\n", fails); return 1; }
++    puts("test_spu_interp_takes_interrupt: OK");
++    return 0;
++}
+diff --git a/tools/test_spu_interp_takes_interrupt.py b/tools/test_spu_interp_takes_interrupt.py
+new file mode 100644
+--- /dev/null
++++ b/tools/test_spu_interp_takes_interrupt.py
+@@ -0,0 +1,24 @@
++#!/usr/bin/env python3
++"""The SPU interpreter takes an enabled, pending SPU interrupt: execution goes
++to the branch at LS 0 with srr0 = the interrupted pc, and iret returns there.
++Builds runtime/spu/tests/test_spu_interp_takes_interrupt.c with the real
++runtime/spu/spu_interp.c and runs it."""
++import os
++import subprocess
++import tempfile
++from pathlib import Path
++
++if os.name == 'nt':
++    print('SKIP: fixture currently requires a POSIX C compiler')
++    raise SystemExit(0)
++root = Path(__file__).resolve().parents[1]
++spu = root / 'runtime/spu'
++env = {k: v for k, v in os.environ.items()
++       if not k.startswith(('SPU_', 'SPURS_', 'YDKJ_', 'LBP_', 'GH3_'))}
++with tempfile.TemporaryDirectory(prefix='spu-interp-irq-') as tmp:
++    binary = Path(tmp) / 'test_spu_interp_takes_interrupt'
++    subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG',
++                    '-I' + str(root / 'include'), '-I' + str(spu),
++                    str(spu / 'tests' / 'test_spu_interp_takes_interrupt.c'), str(spu / 'spu_interp.c'),
++                    '-lm', '-o', str(binary)], check=True)
++    subprocess.run([str(binary)], check=True, timeout=5, env=env, cwd=tmp)
