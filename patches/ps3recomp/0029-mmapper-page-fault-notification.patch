@@ -1,0 +1,861 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] lv2 page-fault notification (327, 57) and real memory objects
+
+Upstream: not yet submitted; written to be upstreamed (generic, no title names)
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0028)
+
+What: sys_mmapper_enable_page_fault_notification (lv2 327) was an
+unimplemented syscall that answered CELL_OK, and sys_mmapper_map_memory /
+unmap_memory / free_memory answered CELL_OK and did nothing. Now:
+- 327 registers a page-fault queue for a reserved area (EINVAL unless the
+  address is the area's start, ESRCH for an unknown queue, EBUSY for a
+  second registration, as RPCS3 models lv2). The area's pages with no memory
+  object mapped become inaccessible on the host.
+- A guest PPU thread that touches such a page is suspended in the fault
+  handler and lv2's event goes to the queue: source
+  SYS_MEMORY_PAGE_FAULT_EVENT_KEY, data1 the address, data2
+  (SYS_MEMORY_PAGE_FAULT_TYPE_PPU_THREAD << 32) | thread id, data3
+  SYS_MEMORY_PAGE_FAULT_CAUSE_NON_MAPPED. sys_ppu_thread_recover_page_fault
+  (lv2 57) resumes it and the access re-runs (EINVAL for a thread that is not
+  suspended). sys_spu_thread_recover_page_fault (lv2 198) is EINVAL: SPU
+  faults are not delivered (below).
+- Memory objects (runtime/syscalls/sys_mmapper_pf.c) keep their contents
+  while unmapped: in a page-fault area unmap copies the object out and map
+  copies it back. unmap answers the object's id (EINVAL with nothing mapped
+  there), map is ESRCH / EALIGN / EBUSY as lv2, free is EBUSY while mapped.
+  Outside page-fault areas the flat VM is unchanged.
+Not covered: an SPU or host (RSX, audio) thread touching an unmapped page is
+not suspended; the page is committed empty and reported on stderr.
+
+Why: a title's pager reserves an area, enables notification and maps file
+contents in only when a thread faults on a page. Nothing ever faulted, so
+the area read as zeros: a database file paged in that way read as an empty
+file, SQLite answered SQLITE_NOTADB to every query on it, and the title's
+script failed on the missing rows and restarted its whole start-up.
+
+Test: tools/test_mmapper_page_fault.py (new) builds
+tests/test_mmapper_page_fault.c with the real sys_event.c, sys_memory.c and
+sys_mmapper_pf.c: 327's error answers, a thread faulting on an unmapped page,
+the event's four words, the pager's map and 57, the thread seeing the
+pager's data, unmap's id, contents kept across unmap and map, and the map,
+unmap and free errors.
+
+diff --git a/runtime/ppu/ppu_sysprx.cpp b/runtime/ppu/ppu_sysprx.cpp
+index 007bf49a..963c1d21 100644
+--- a/runtime/ppu/ppu_sysprx.cpp
++++ b/runtime/ppu/ppu_sysprx.cpp
+@@ -564,36 +564,38 @@ static void sys_ppu_thread_get_id(ppu_context* ctx)
+     ctx->gpr[3] = 0;
+ }
+ 
+-/* sys_mmapper_allocate_memory(u32 size, u64 flags, vm::ptr<u32> mem_id) ->
+- * hand back a unique opaque id; the backing is the flat VM, so the later
+- * search_and_map just needs a non-zero id to track. */
+-/* id -> size so sys_mmapper_search_and_map (lv2 337) can lay blocks out
+- * without overlap. Ids are dense from 0x1000. */
+-static uint32_t s_mm_sizes[256];
+-static uint32_t s_mmapper_next_id = 0x1000;
++/* sys_mmapper_allocate_memory(u32 size, u64 flags, vm::ptr<u32> mem_id) and
++ * the rest of the memory-object calls are the lv2 memory objects of
++ * runtime/syscalls/sys_mmapper_pf.c: an object keeps its contents while
++ * unmapped, map/unmap move it in and out of a page-fault area, and unmap
++ * answers the id it unmapped. Ids are dense from 0x1000; sys_mmapper_search_and_map
++ * (lv2 337) sizes its blocks from them. */
++extern "C" uint32_t ps3_mm_object_create(uint32_t size);
++extern "C" uint32_t ps3_mm_object_size(uint32_t mem_id);
++extern "C" int32_t  ps3_mm_map(uint32_t addr, uint32_t mem_id);
++extern "C" int32_t  ps3_mm_unmap(uint32_t addr, uint32_t* mem_id_out);
++extern "C" int32_t  ps3_mm_free(uint32_t mem_id);
+ extern "C" uint32_t ps3_mmapper_block_size(uint32_t mem_id)
+ {
+-    uint32_t i = mem_id - 0x1000u;
+-    return (i < 256) ? s_mm_sizes[i] : 0;
++    return ps3_mm_object_size(mem_id);
+ }
+ 
+-static uint32_t mmapper_new_id(uint32_t size)
++static void mm_answer_id(ppu_context* ctx, uint32_t size, uint32_t mem_id_ptr)
+ {
+-    uint32_t id = s_mmapper_next_id++;
+-    if (id - 0x1000u < 256) s_mm_sizes[id - 0x1000u] = size;
+-    return id;
++    uint32_t id = ps3_mm_object_create(size);
++    if (!id) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)(size ? CELL_ENOMEM : CELL_EALIGN); return; }
++    if (mem_id_ptr) vm_write32(mem_id_ptr, id);
++    ctx->gpr[3] = 0;
+ }
+ 
+ static void sys_mmapper_allocate_memory(ppu_context* ctx)
+ {
+     uint32_t size       = (uint32_t)ctx->gpr[3];
+     uint32_t mem_id_ptr = (uint32_t)ctx->gpr[5];
+-    uint32_t id         = mmapper_new_id(size);
+     if (getenv("PS3_MEMTRACE"))
+-        fprintf(stderr, "[mmapper] allocate_memory(size=0x%X flags=0x%llX id_ptr=0x%X) -> id 0x%X\n",
+-                size, (unsigned long long)ctx->gpr[4], mem_id_ptr, id);
+-    if (mem_id_ptr) vm_write32(mem_id_ptr, id);
+-    ctx->gpr[3] = 0;
++        fprintf(stderr, "[mmapper] allocate_memory(size=0x%X flags=0x%llX id_ptr=0x%X)\n",
++                size, (unsigned long long)ctx->gpr[4], mem_id_ptr);
++    mm_answer_id(ctx, size, mem_id_ptr);
+ }
+ /* sys_mmapper_allocate_memory_from_container(u32 size, u32 container, u64 flags,
+  * vm::ptr<u32> mem_id) -> id in *r6. flОw's CRT uses this for its heap/mutex pool;
+@@ -602,12 +604,31 @@ static void sys_mmapper_allocate_memory_from_container(ppu_context* ctx)
+ {
+     uint32_t size = (uint32_t)ctx->gpr[3];
+     uint32_t mem_id_ptr = (uint32_t)ctx->gpr[6];
+-    uint32_t id = mmapper_new_id(size);
+     if (getenv("PS3_MEMTRACE"))
+-        fprintf(stderr, "[mmapper] alloc_from_container(size=0x%X cid=0x%X flags=0x%llX id_ptr=0x%X) -> id 0x%X\n",
+-                size, (uint32_t)ctx->gpr[4], (unsigned long long)ctx->gpr[5], mem_id_ptr, id);
+-    if (mem_id_ptr) vm_write32(mem_id_ptr, id);
+-    ctx->gpr[3] = 0;
++        fprintf(stderr, "[mmapper] alloc_from_container(size=0x%X cid=0x%X flags=0x%llX id_ptr=0x%X)\n",
++                size, (uint32_t)ctx->gpr[4], (unsigned long long)ctx->gpr[5], mem_id_ptr);
++    mm_answer_id(ctx, size, mem_id_ptr);
++}
++
++/* sys_mmapper_map_memory(u32 addr, u32 mem_id, u64 flags) */
++static void sys_mmapper_map_memory(ppu_context* ctx)
++{
++    ctx->gpr[3] = (uint64_t)(int64_t)ps3_mm_map((uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4]);
++}
++
++/* sys_mmapper_unmap_memory(u32 addr, vm::ptr<u32> mem_id) */
++static void sys_mmapper_unmap_memory(ppu_context* ctx)
++{
++    uint32_t id = 0, out = (uint32_t)ctx->gpr[4];
++    int32_t rc = ps3_mm_unmap((uint32_t)ctx->gpr[3], &id);
++    if (rc == 0 && out) vm_write32(out, id);
++    ctx->gpr[3] = (uint64_t)(int64_t)rc;
++}
++
++/* sys_mmapper_free_memory(u32 mem_id) */
++static void sys_mmapper_free_memory(ppu_context* ctx)
++{
++    ctx->gpr[3] = (uint64_t)(int64_t)ps3_mm_free((uint32_t)ctx->gpr[3]);
+ }
+ 
+ /* A handful of CRT helpers the early boot tends to hit; accept and continue. */
+@@ -1108,14 +1129,14 @@ extern "C" void ppu_sysprx_register(void)
+     ps3_hle_register_ctx(ps3_compute_nid("sys_lwcond_signal_to"),  "sys_lwcond_signal_to",  sys_lwcond_signal_to);
+     ps3_hle_register_ctx(ps3_compute_nid("sys_lwcond_wait"),       "sys_lwcond_wait",       sys_lwcond_wait);
+ 
+-    /* Thread id + memory manager (high-frequency boot imports). The flat VM
+-     * means map/unmap/free are no-ops: the memory already exists everywhere. */
++    /* Thread id + memory manager (high-frequency boot imports). The memory
++     * objects are runtime/syscalls/sys_mmapper_pf.c's. */
+     ps3_hle_register_ctx(ps3_compute_nid("sys_ppu_thread_get_id"),      "sys_ppu_thread_get_id",      sys_ppu_thread_get_id);
+     ps3_hle_register_ctx(ps3_compute_nid("sys_ppu_thread_create"),      "sys_ppu_thread_create",      hle_ppu_thread_create);
+     ps3_hle_register_ctx(ps3_compute_nid("sys_ppu_thread_exit"),        "sys_ppu_thread_exit",        hle_ppu_thread_exit);
+     ps3_hle_register_ctx(ps3_compute_nid("sys_mmapper_allocate_memory"), "sys_mmapper_allocate_memory", sys_mmapper_allocate_memory);
+     ps3_hle_register_ctx(ps3_compute_nid("sys_mmapper_allocate_memory_from_container"), "sys_mmapper_allocate_memory_from_container", sys_mmapper_allocate_memory_from_container);
+-    ps3_hle_register_ctx(ps3_compute_nid("sys_mmapper_map_memory"),     "sys_mmapper_map_memory",     crt_ok);
+-    ps3_hle_register_ctx(ps3_compute_nid("sys_mmapper_unmap_memory"),   "sys_mmapper_unmap_memory",   crt_ok);
+-    ps3_hle_register_ctx(ps3_compute_nid("sys_mmapper_free_memory"),    "sys_mmapper_free_memory",    crt_ok);
++    ps3_hle_register_ctx(ps3_compute_nid("sys_mmapper_map_memory"),     "sys_mmapper_map_memory",     sys_mmapper_map_memory);
++    ps3_hle_register_ctx(ps3_compute_nid("sys_mmapper_unmap_memory"),   "sys_mmapper_unmap_memory",   sys_mmapper_unmap_memory);
++    ps3_hle_register_ctx(ps3_compute_nid("sys_mmapper_free_memory"),    "sys_mmapper_free_memory",    sys_mmapper_free_memory);
+ }
+diff --git a/runtime/syscalls/sys_memory.c b/runtime/syscalls/sys_memory.c
+index d8225889..bb580648 100644
+--- a/runtime/syscalls/sys_memory.c
++++ b/runtime/syscalls/sys_memory.c
+@@ -3,6 +3,7 @@
+  */
+ 
+ #include "sys_memory.h"
++#include "sys_mmapper_pf.h"
+ #include <stdio.h>
+ #include <string.h>
+ #include "../../include/ps3emu/log_first.h"   /* relative: tools/test_*memory*.py compile this file alone */
+@@ -400,6 +401,24 @@ int64_t sys_mmapper_search_map_address(uint32_t start, uint32_t size, uint32_t*
+     bump_unlock(); return CELL_OK;
+ }
+ 
++/* The reserved area (sys_mmapper_allocate_address) holding addr: 1 and its
++ * bounds, or 0. sys_mmapper_enable_page_fault_notification needs the start. */
++int sys_mmapper_reservation_bounds(uint32_t addr, uint32_t* start, uint32_t* end)
++{
++    int found = 0;
++    bump_lock();
++    for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; ++i) {
++        mapper_reservation* r = &s_mapper_reservations[i];
++        if (r->start && addr >= r->start && addr < r->end) {
++            if (start) *start = r->start;
++            if (end) *end = r->end;
++            found = 1; break;
++        }
++    }
++    bump_unlock();
++    return found;
++}
++
+ /* ---------------------------------------------------------------------------
+  * sys_mmapper_free_address
+  *
+@@ -566,4 +585,5 @@ void sys_memory_init(lv2_syscall_table* tbl)
+     lv2_syscall_register(tbl, SYS_MMAPPER_MAP_SHARED_MEMORY,  sys_mmapper_map_shared_memory);
+     lv2_syscall_register(tbl, 341, sys_mmapper_allocate_memory);
+     lv2_syscall_register(tbl, 342, sys_mmapper_allocate_memory_from_container);
++    sys_mmapper_pf_init(tbl);   /* lv2 327, 57, 198 */
+ }
+diff --git a/runtime/syscalls/sys_memory.h b/runtime/syscalls/sys_memory.h
+index a20806ad..8cb15735 100644
+--- a/runtime/syscalls/sys_memory.h
++++ b/runtime/syscalls/sys_memory.h
+@@ -68,6 +68,7 @@ int64_t sys_mmapper_search_map_address(uint32_t start, uint32_t size, uint32_t*
+ int64_t sys_mmapper_free_address(ppu_context* ctx);
+ int64_t sys_mmapper_allocate_shared_memory(ppu_context* ctx);
+ int64_t sys_mmapper_map_shared_memory(ppu_context* ctx);
++int sys_mmapper_reservation_bounds(uint32_t addr, uint32_t* start, uint32_t* end);
+ 
+ /* Optional loader-owned image query: return addr unchanged when [addr, end)
+  * is clear, otherwise the greatest exclusive end of an overlapping PT_LOAD.
+diff --git a/runtime/syscalls/sys_mmapper_pf.c b/runtime/syscalls/sys_mmapper_pf.c
+new file mode 100644
+index 00000000..4b384540
+--- /dev/null
++++ b/runtime/syscalls/sys_mmapper_pf.c
+@@ -0,0 +1,359 @@
++/*
++ * ps3recomp - lv2 memory objects and page-fault notification
++ *
++ * lv2 lets a process ask to be told when one of its threads touches a page of
++ * a reserved area that has no memory mapped at it
++ * (sys_mmapper_enable_page_fault_notification, lv2 327). The faulting thread
++ * is suspended and an event is sent to the queue the process named:
++ *   source = SYS_MEMORY_PAGE_FAULT_EVENT_KEY
++ *   data1  = the faulting address
++ *   data2  = (SYS_MEMORY_PAGE_FAULT_TYPE_PPU_THREAD << 32) | thread id
++ *   data3  = SYS_MEMORY_PAGE_FAULT_CAUSE_NON_MAPPED
++ * The process's pager maps a memory object there, fills it, and resumes the
++ * thread with sys_ppu_thread_recover_page_fault (lv2 57), which re-runs the
++ * access. A title can build a demand-paged file view or a swap space on it.
++ *
++ * The flat VM has every guest address backed, so a page with nothing mapped
++ * read as zeros and no fault ever reached the pager. Here an area that has
++ * page-fault notification is made inaccessible on the host except where a
++ * memory object is mapped, and a host fault there on a guest PPU thread is
++ * turned into the lv2 event; the thread waits in the fault handler until it is
++ * recovered, then the host re-runs the faulting instruction.
++ *
++ * Memory objects (sys_mmapper_allocate_memory / map / unmap / free) keep their
++ * contents while unmapped, as lv2's do: inside a page-fault area an unmap
++ * copies the page out to the object's own backing and a map copies it back in.
++ * Outside such areas the flat VM is left as it was (the area is already
++ * backed; map and unmap only keep the bookkeeping that unmap's mem_id answer
++ * needs).
++ *
++ * Behaviour follows lv2 as RPCS3 models it (sys_mmapper.cpp, Thread.cpp;
++ * read as a reference, no code taken): 327 is EINVAL unless start_addr is the
++ * start of a reserved area, ESRCH for an unknown queue, EBUSY when the area
++ * already has a notification; 57 is EINVAL for a thread that is not
++ * suspended on a page fault.
++ *
++ * Not covered: faults from SPU threads (DMA) and from host threads (RSX, audio)
++ * are not turned into events; such an access commits the page empty and is
++ * reported once on stderr.
++ */
++#include "sys_mmapper_pf.h"
++#include "sys_memory.h"
++#include "sys_event.h"
++#include "../memory/vm.h"
++#include "../platform/win32_compat.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++#ifndef _WIN32
++#include <pthread.h>
++#include <sys/mman.h>
++#endif
++
++#define MM_PAGE        0x10000u          /* lv2's 64 KB page */
++#define MM_OBJ_BASE    0x1000u
++#define MM_OBJ_MAX     16384u
++#define PF_AREA_MAX    8
++#define PF_FAULT_MAX   64
++
++typedef struct mm_object {
++    uint32_t size;        /* 0 = free slot */
++    uint32_t mapped_at;   /* 0 = not mapped */
++    uint8_t* backing;     /* contents while unmapped (page-fault areas only) */
++} mm_object;
++
++typedef struct pf_area {
++    uint32_t start, end;  /* 0 = free slot */
++    uint32_t queue_id;
++    uint8_t* mapped;      /* one byte per 64 KB page: 1 = an object is mapped */
++} pf_area;
++
++typedef struct pf_fault {
++    volatile uint64_t tid;        /* 0 = free slot */
++    volatile uint32_t addr;
++    volatile int      recovered;
++} pf_fault;
++
++static mm_object s_obj[MM_OBJ_MAX];
++static uint32_t  s_obj_next;              /* next index to try */
++static pf_area   s_area[PF_AREA_MAX];
++static pf_fault  s_fault[PF_FAULT_MAX];
++static int       s_veh_installed;
++
++#ifdef _WIN32
++static SRWLOCK s_lock = SRWLOCK_INIT;
++static void mm_lock(void)   { AcquireSRWLockExclusive(&s_lock); }
++static void mm_unlock(void) { ReleaseSRWLockExclusive(&s_lock); }
++#else
++static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
++static void mm_lock(void)   { pthread_mutex_lock(&s_lock); }
++static void mm_unlock(void) { pthread_mutex_unlock(&s_lock); }
++#endif
++
++extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
++
++static mm_object* obj_of(uint32_t id)
++{
++    uint32_t i = id - MM_OBJ_BASE;
++    if (i >= MM_OBJ_MAX || !s_obj[i].size) return NULL;
++    return &s_obj[i];
++}
++
++/* The area holding [addr, addr+size), or NULL. Read without the lock by the
++ * fault handler: a slot's fields are written before its `end` publishes it. */
++static pf_area* area_of(uint32_t addr, uint32_t size)
++{
++    for (int i = 0; i < PF_AREA_MAX; i++) {
++        pf_area* a = &s_area[i];
++        uint32_t end = __atomic_load_n(&a->end, __ATOMIC_ACQUIRE);
++        if (end && addr >= a->start && (uint64_t)addr + size <= end) return a;
++    }
++    return NULL;
++}
++
++static void host_protect(uint32_t addr, uint32_t size, int rw)
++{
++#ifdef _WIN32
++    DWORD old;
++    if (rw) VirtualAlloc(vm_base + addr, size, MEM_COMMIT, PAGE_READWRITE);
++    else    VirtualProtect(vm_base + addr, size, PAGE_NOACCESS, &old);
++#else
++    mprotect(vm_base + addr, size, rw ? (PROT_READ | PROT_WRITE) : PROT_NONE);
++#endif
++}
++
++static void mark(pf_area* a, uint32_t addr, uint32_t size, uint8_t v)
++{
++    for (uint32_t p = (addr - a->start) / MM_PAGE; p < (addr - a->start + size + MM_PAGE - 1) / MM_PAGE; p++)
++        __atomic_store_n(&a->mapped[p], v, __ATOMIC_RELEASE);
++}
++
++/* ---------------------------------------------------------------------------
++ * Memory objects
++ * -----------------------------------------------------------------------*/
++uint32_t ps3_mm_object_create(uint32_t size)
++{
++    if (!size) return 0;
++    uint32_t id = 0;
++    mm_lock();
++    for (uint32_t n = 0; n < MM_OBJ_MAX; n++) {
++        uint32_t i = (s_obj_next + n) % MM_OBJ_MAX;
++        if (!s_obj[i].size) {
++            s_obj[i].size = (size + MM_PAGE - 1) & ~(MM_PAGE - 1);
++            s_obj[i].mapped_at = 0;
++            s_obj[i].backing = NULL;
++            s_obj_next = i + 1;
++            id = MM_OBJ_BASE + i;
++            break;
++        }
++    }
++    mm_unlock();
++    return id;
++}
++
++uint32_t ps3_mm_object_size(uint32_t mem_id)
++{
++    mm_lock();
++    mm_object* o = obj_of(mem_id);
++    uint32_t size = o ? o->size : 0;
++    mm_unlock();
++    return size;
++}
++
++int32_t ps3_mm_map(uint32_t addr, uint32_t mem_id)
++{
++    mm_lock();
++    mm_object* o = obj_of(mem_id);
++    if (!o) { mm_unlock(); return (int32_t)CELL_ESRCH; }
++    if (addr & (MM_PAGE - 1)) { mm_unlock(); return (int32_t)CELL_EALIGN; }
++    pf_area* a = area_of(addr, o->size);
++    if (a) {
++        /* One mapping at a time inside a page-fault area: its contents move with it. */
++        if (o->mapped_at) { mm_unlock(); return (int32_t)CELL_EBUSY; }
++        for (uint32_t p = 0; p < o->size; p += MM_PAGE)
++            if (a->mapped[(addr - a->start + p) / MM_PAGE]) { mm_unlock(); return (int32_t)CELL_EBUSY; }
++        host_protect(addr, o->size, 1);
++        if (o->backing) memcpy(vm_base + addr, o->backing, o->size);
++        else            memset(vm_base + addr, 0, o->size);
++        mark(a, addr, o->size, 1);
++    }
++    o->mapped_at = addr;
++    mm_unlock();
++    return CELL_OK;
++}
++
++int32_t ps3_mm_unmap(uint32_t addr, uint32_t* mem_id_out)
++{
++    mm_lock();
++    mm_object* o = NULL;
++    uint32_t id = 0;
++    for (uint32_t i = 0; i < MM_OBJ_MAX; i++)
++        if (s_obj[i].size && s_obj[i].mapped_at == addr && addr) { o = &s_obj[i]; id = MM_OBJ_BASE + i; break; }
++    if (!o) { mm_unlock(); return (int32_t)CELL_EINVAL; }
++    pf_area* a = area_of(addr, o->size);
++    if (a) {
++        if (!o->backing) o->backing = (uint8_t*)malloc(o->size);
++        if (o->backing) memcpy(o->backing, vm_base + addr, o->size);
++        mark(a, addr, o->size, 0);
++        host_protect(addr, o->size, 0);
++    }
++    o->mapped_at = 0;
++    mm_unlock();
++    if (mem_id_out) *mem_id_out = id;
++    return CELL_OK;
++}
++
++int32_t ps3_mm_free(uint32_t mem_id)
++{
++    mm_lock();
++    mm_object* o = obj_of(mem_id);
++    if (!o) { mm_unlock(); return (int32_t)CELL_ESRCH; }
++    if (o->mapped_at) { mm_unlock(); return (int32_t)CELL_EBUSY; }
++    free(o->backing);
++    memset(o, 0, sizeof *o);
++    mm_unlock();
++    return CELL_OK;
++}
++
++int ps3_pf_page_unmapped(uint32_t addr)
++{
++    pf_area* a = area_of(addr, 1);
++    return a && !__atomic_load_n(&a->mapped[(addr - a->start) / MM_PAGE], __ATOMIC_ACQUIRE);
++}
++
++/* ---------------------------------------------------------------------------
++ * The fault
++ * -----------------------------------------------------------------------*/
++static void pf_nap(void)
++{
++#ifdef _WIN32
++    Sleep(0);
++#else
++    struct timespec ts = { 0, 20000 };
++    nanosleep(&ts, NULL);
++#endif
++}
++
++static LONG WINAPI pf_veh(EXCEPTION_POINTERS* ep)
++{
++    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || !vm_base)
++        return EXCEPTION_CONTINUE_SEARCH;
++    uintptr_t fault = (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
++    uintptr_t base  = (uintptr_t)vm_base;
++    if (fault < base || fault - base > 0xFFFFFFFFull) return EXCEPTION_CONTINUE_SEARCH;
++    uint32_t addr = (uint32_t)(fault - base);
++    pf_area* a = area_of(addr, 1);
++    if (!a) return EXCEPTION_CONTINUE_SEARCH;
++    uint32_t page = addr & ~(MM_PAGE - 1);
++    if (__atomic_load_n(&a->mapped[(page - a->start) / MM_PAGE], __ATOMIC_ACQUIRE))
++        return EXCEPTION_CONTINUE_EXECUTION;   /* mapped meanwhile: re-run */
++
++    ppu_context* ctx = g_active_ctx;
++    uint64_t tid = ctx ? ctx->thread_id : 0;
++    if (!tid) {
++        /* Not a guest PPU thread: nothing in lv2 to suspend. Give it an empty page. */
++        static int n = 0;
++        if (n++ < 4)
++            fprintf(stderr, "[pf] a host thread touched unmapped page 0x%08X of page-fault area 0x%08X; committed empty\n",
++                    page, a->start);
++        host_protect(page, MM_PAGE, 1);
++        return EXCEPTION_CONTINUE_EXECUTION;
++    }
++
++    pf_fault* f = NULL;
++    for (;;) {
++        for (int i = 0; i < PF_FAULT_MAX && !f; i++) {
++            uint64_t z = 0;
++            if (__atomic_compare_exchange_n(&s_fault[i].tid, &z, tid, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
++                f = &s_fault[i];
++        }
++        if (f) break;
++        pf_nap();
++    }
++    f->addr = addr;
++    __atomic_store_n(&f->recovered, 0, __ATOMIC_RELEASE);
++    if (sys_event_queue_push_by_id(a->queue_id, SYS_MEMORY_PAGE_FAULT_EVENT_KEY, addr,
++                                   (SYS_MEMORY_PAGE_FAULT_TYPE_PPU_THREAD << 32) | (tid & 0xFFFFFFFFull),
++                                   SYS_MEMORY_PAGE_FAULT_CAUSE_NON_MAPPED) != 0) {
++        static int n = 0;
++        if (n++ < 4)
++            fprintf(stderr, "[pf] page fault at 0x%08X (tid %llu): queue %u refused the event; committed empty\n",
++                    addr, (unsigned long long)tid, a->queue_id);
++        __atomic_store_n(&f->tid, 0, __ATOMIC_RELEASE);
++        host_protect(page, MM_PAGE, 1);
++        return EXCEPTION_CONTINUE_EXECUTION;
++    }
++    if (getenv("PS3_PFLOG"))
++        fprintf(stderr, "[pf] tid %llu faulted at 0x%08X -> queue %u\n", (unsigned long long)tid, addr, a->queue_id);
++    while (!__atomic_load_n(&f->recovered, __ATOMIC_ACQUIRE)) pf_nap();
++    __atomic_store_n(&f->tid, 0, __ATOMIC_RELEASE);
++    return EXCEPTION_CONTINUE_EXECUTION;       /* re-run the access */
++}
++
++/* ---------------------------------------------------------------------------
++ * lv2 327: sys_mmapper_enable_page_fault_notification(u32 start_addr, u32 event_queue_id)
++ * -----------------------------------------------------------------------*/
++int64_t sys_mmapper_enable_page_fault_notification(ppu_context* ctx)
++{
++    uint32_t start = LV2_ARG_U32(ctx, 0);
++    uint32_t qid   = LV2_ARG_U32(ctx, 1);
++    uint32_t rs = 0, re = 0;
++    if (!sys_mmapper_reservation_bounds(start, &rs, &re) || rs != start)
++        return (int64_t)(int32_t)CELL_EINVAL;
++    if (qid == 0 || qid > SYS_EVENT_QUEUE_MAX || !g_sys_event_queues[qid - 1].active)
++        return (int64_t)(int32_t)CELL_ESRCH;
++    mm_lock();
++    pf_area* slot = NULL;
++    for (int i = 0; i < PF_AREA_MAX; i++) {
++        if (s_area[i].end && s_area[i].start == start) { mm_unlock(); return (int64_t)(int32_t)CELL_EBUSY; }
++        if (!s_area[i].end && !slot) slot = &s_area[i];
++    }
++    if (!slot) { mm_unlock(); return (int64_t)(int32_t)CELL_EAGAIN; }
++    uint32_t pages = (re - rs + MM_PAGE - 1) / MM_PAGE;
++    slot->mapped = (uint8_t*)calloc(pages, 1);
++    if (!slot->mapped) { mm_unlock(); return (int64_t)(int32_t)CELL_ENOMEM; }
++    slot->start = rs;
++    slot->queue_id = qid;
++    /* Objects already mapped in the area stay reachable; everything else faults. */
++    for (uint32_t i = 0; i < MM_OBJ_MAX; i++) {
++        mm_object* o = &s_obj[i];
++        if (o->size && o->mapped_at >= rs && o->mapped_at < re)
++            for (uint32_t p = 0; p < o->size; p += MM_PAGE) slot->mapped[(o->mapped_at - rs + p) / MM_PAGE] = 1;
++    }
++    for (uint32_t p = 0; p < pages; p++)
++        if (!slot->mapped[p]) host_protect(rs + p * MM_PAGE, MM_PAGE, 0);
++    if (!s_veh_installed) { s_veh_installed = 1; AddVectoredExceptionHandler(1, pf_veh); }
++    __atomic_store_n(&slot->end, re, __ATOMIC_RELEASE);
++    mm_unlock();
++    fprintf(stderr, "[pf] page-fault notification for 0x%08X-0x%08X -> queue %u\n", rs, re, qid);
++    return CELL_OK;
++}
++
++/* lv2 57: sys_ppu_thread_recover_page_fault(u64 thread_id) */
++int64_t sys_ppu_thread_recover_page_fault(ppu_context* ctx)
++{
++    uint64_t tid = LV2_ARG_U64(ctx, 0) & 0xFFFFFFFFull;
++    for (int i = 0; i < PF_FAULT_MAX; i++)
++        if (tid && (__atomic_load_n(&s_fault[i].tid, __ATOMIC_ACQUIRE) & 0xFFFFFFFFull) == tid &&
++            !__atomic_load_n(&s_fault[i].recovered, __ATOMIC_ACQUIRE)) {
++            __atomic_store_n(&s_fault[i].recovered, 1, __ATOMIC_RELEASE);
++            return CELL_OK;
++        }
++    return (int64_t)(int32_t)CELL_EINVAL;
++}
++
++/* lv2 198: sys_spu_thread_recover_page_fault(u32 id). No SPU thread is ever
++ * suspended on a page fault here (see the header comment). */
++int64_t sys_spu_thread_recover_page_fault(ppu_context* ctx)
++{
++    (void)ctx;
++    return (int64_t)(int32_t)CELL_EINVAL;
++}
++
++void sys_mmapper_pf_init(lv2_syscall_table* tbl)
++{
++    lv2_syscall_register(tbl, 327, sys_mmapper_enable_page_fault_notification);
++    lv2_syscall_register(tbl, 57,  sys_ppu_thread_recover_page_fault);
++    lv2_syscall_register(tbl, 198, sys_spu_thread_recover_page_fault);
++}
+diff --git a/runtime/syscalls/sys_mmapper_pf.h b/runtime/syscalls/sys_mmapper_pf.h
+new file mode 100644
+index 00000000..9608a05b
+--- /dev/null
++++ b/runtime/syscalls/sys_mmapper_pf.h
+@@ -0,0 +1,47 @@
++/*
++ * ps3recomp - lv2 memory objects and page-fault notification
++ *
++ * sys_mmapper_allocate_memory / map / unmap / free over real memory objects,
++ * and sys_mmapper_enable_page_fault_notification (lv2 327) with the PPU
++ * thread's recovery (lv2 57). See sys_mmapper_pf.c.
++ */
++#ifndef SYS_MMAPPER_PF_H
++#define SYS_MMAPPER_PF_H
++
++#include <stdint.h>
++#include "lv2_syscall_table.h"
++#include "../ppu/ppu_context.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* The event lv2 sends for a page fault (sys_memory.h in the SDK). */
++#define SYS_MEMORY_PAGE_FAULT_EVENT_KEY        0xFFFE000000000000ULL
++#define SYS_MEMORY_PAGE_FAULT_TYPE_PPU_THREAD  0x0ULL
++#define SYS_MEMORY_PAGE_FAULT_TYPE_SPU_THREAD  0x1ULL
++#define SYS_MEMORY_PAGE_FAULT_TYPE_RAW_SPU     0x2ULL
++#define SYS_MEMORY_PAGE_FAULT_CAUSE_NON_MAPPED 0x2ULL
++#define SYS_MEMORY_PAGE_FAULT_CAUSE_READ_ONLY  0x1ULL
++
++/* Memory objects (sys_memory_t ids, dense from 0x1000). 0 if none is left. */
++uint32_t ps3_mm_object_create(uint32_t size);
++uint32_t ps3_mm_object_size(uint32_t mem_id);     /* 0 for an unknown id */
++int32_t  ps3_mm_map(uint32_t addr, uint32_t mem_id);
++int32_t  ps3_mm_unmap(uint32_t addr, uint32_t* mem_id_out);
++int32_t  ps3_mm_free(uint32_t mem_id);
++
++/* lv2 327, 57 and 198. */
++int64_t sys_mmapper_enable_page_fault_notification(ppu_context* ctx);
++int64_t sys_ppu_thread_recover_page_fault(ppu_context* ctx);
++int64_t sys_spu_thread_recover_page_fault(ppu_context* ctx);
++
++/* Is the guest page holding addr inside a page-fault area and not mapped? */
++int ps3_pf_page_unmapped(uint32_t addr);
++
++void sys_mmapper_pf_init(lv2_syscall_table* tbl);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/tests/test_mmapper_page_fault.c b/tests/test_mmapper_page_fault.c
+new file mode 100644
+index 00000000..f709d27c
+--- /dev/null
++++ b/tests/test_mmapper_page_fault.c
+@@ -0,0 +1,171 @@
++/* lv2 page-fault notification and memory objects through the real
++ * runtime/syscalls/sys_mmapper_pf.c (with sys_memory.c and sys_event.c):
++ * a guest thread touching an unmapped page of an area with notification is
++ * suspended, its pager gets the lv2 event, maps an object and recovers it, and
++ * the access then sees the pager's data. Objects keep their contents while
++ * unmapped. Built with the three files by tools/test_mmapper_page_fault.py. */
++#include "../runtime/syscalls/sys_event.h"
++#include "../runtime/syscalls/sys_memory.h"
++#include "../runtime/syscalls/sys_mmapper_pf.h"
++#include "../runtime/platform/win32_compat.h"
++#include <assert.h>
++#include <pthread.h>
++#include <stdio.h>
++#include <string.h>
++#include <signal.h>
++#include <unistd.h>
++
++/* Runtime data and hooks the three files refer to; inert here. */
++uint8_t* vm_base;
++uint32_t ppu_vm_size;
++uint32_t ppu_hle_inject_base = 0x20000000u;
++uint32_t g_spu_pending_evt[3];
++int      g_spu_pending_evt_valid;
++PPU_THREAD_LOCAL ppu_context* g_active_ctx;
++size_t spu_elf_image_size(const uint8_t* e, size_t m) { (void)e; (void)m; return 0; }
++int spu_workload_dispatch_async(const uint8_t* a, uint32_t b, uint32_t c) { (void)a; (void)b; (void)c; return 0; }
++void ydkj_release_pending_threads(void) {}
++void ppu_thread_note_block(uint64_t tid) { (void)tid; }
++int spu_dispatch_frame_by_queue(uint32_t q, uint32_t f) { (void)q; (void)f; return 0; }
++void ppu_dump_guest_stack(ppu_context* c, const char* t) { (void)c; (void)t; }
++
++/* The port's vectored-handler shim, reduced to the one handler under test. */
++static PVECTORED_EXCEPTION_HANDLER s_handler;
++static void on_fault(int sig, siginfo_t* si, void* uc)
++{
++    (void)uc;
++    EXCEPTION_RECORD er; memset(&er, 0, sizeof er);
++    er.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
++    er.NumberParameters = 2;
++    er.ExceptionInformation[1] = (ULONG_PTR)(uintptr_t)si->si_addr;
++    EXCEPTION_POINTERS ep; memset(&ep, 0, sizeof ep); ep.ExceptionRecord = &er;
++    if (s_handler && s_handler(&ep) == EXCEPTION_CONTINUE_EXECUTION) return;
++    signal(sig, SIG_DFL);
++}
++PVOID AddVectoredExceptionHandler(ULONG first, PVECTORED_EXCEPTION_HANDLER h)
++{
++    (void)first; s_handler = h;
++    struct sigaction sa; memset(&sa, 0, sizeof sa);
++    sa.sa_sigaction = on_fault; sa.sa_flags = SA_SIGINFO;
++    sigaction(SIGSEGV, &sa, NULL); sigaction(SIGBUS, &sa, NULL);
++    return (PVOID)h;
++}
++
++static int fails;
++#define CHECK(c, ...) do { const int ok_ = (c); printf(ok_ ? "[PASS] " : "[FAIL] "); printf(__VA_ARGS__); \
++                           printf("\n"); if (!ok_) fails++; } while (0)
++
++static uint32_t rd32(uint32_t a)
++{
++    const uint8_t* p = (const uint8_t*)vm_to_host(a);
++    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
++}
++static uint64_t rd64(uint32_t a) { return ((uint64_t)rd32(a) << 32) | rd32(a + 4); }
++
++#define SCRATCH 0x10000000u
++static uint32_t g_area, g_q;
++
++static int64_t enable(uint32_t start, uint32_t q)
++{
++    ppu_context c; memset(&c, 0, sizeof c);
++    c.gpr[3] = start; c.gpr[4] = q;
++    return sys_mmapper_enable_page_fault_notification(&c);
++}
++static int64_t recover(uint64_t tid)
++{
++    ppu_context c; memset(&c, 0, sizeof c);
++    c.gpr[3] = tid;
++    return sys_ppu_thread_recover_page_fault(&c);
++}
++
++/* The guest thread: thread id 7, reads a word in the area's third page. */
++static volatile uint32_t g_seen = 0xFFFFFFFFu;
++static volatile int g_read_done;
++static void* guest(void* arg)
++{
++    (void)arg;
++    ppu_context self; memset(&self, 0, sizeof self);
++    self.thread_id = 7;
++    g_active_ctx = &self;
++    __asm__ volatile("" ::: "memory");   /* the store must precede the faulting load */
++    g_seen = *(volatile uint32_t*)vm_to_host(g_area + 0x20010);
++    g_read_done = 1;
++    return NULL;
++}
++
++/* The pager: one event, then map an object holding a pattern and recover. */
++static uint64_t g_evt[4];
++static uint32_t g_obj;
++static volatile int64_t g_recover_rc = 1;
++static void* pager(void* arg)
++{
++    (void)arg;
++    ppu_context c; memset(&c, 0, sizeof c);
++    c.gpr[3] = g_q; c.gpr[4] = SCRATCH + 0x100; c.gpr[5] = 0;
++    if (sys_event_queue_receive(&c) != CELL_OK) return NULL;
++    for (int i = 0; i < 4; i++) g_evt[i] = rd64(SCRATCH + 0x100 + 8 * i);
++    uint32_t page = (uint32_t)g_evt[1] & ~0xFFFFu;
++    g_obj = ps3_mm_object_create(0x10000);
++    if (ps3_mm_map(page, g_obj) != CELL_OK) return NULL;
++    *(volatile uint32_t*)vm_to_host(page + 0x10) = 0xC0FFEE11u;
++    g_recover_rc = recover(g_evt[2] & 0xFFFFFFFFu);
++    return NULL;
++}
++
++int main(void)
++{
++    setvbuf(stdout, NULL, _IONBF, 0);
++    assert(vm_init() == CELL_OK);
++    assert(vm_commit(SCRATCH, 0x10000) == CELL_OK);
++
++    {   /* sys_mmapper_allocate_address(0x1000000, 0, 0x10000000, out) */
++        ppu_context c; memset(&c, 0, sizeof c);
++        c.gpr[3] = 0x1000000; c.gpr[4] = 0; c.gpr[5] = 0x10000000; c.gpr[6] = SCRATCH;
++        assert(sys_mmapper_allocate_address(&c) == CELL_OK);
++        g_area = rd32(SCRATCH);
++    }
++    {   ppu_context c; memset(&c, 0, sizeof c);
++        c.gpr[3] = SCRATCH + 8; c.gpr[4] = 0; c.gpr[5] = 0x7777; c.gpr[6] = 16;
++        assert(sys_event_queue_create(&c) == CELL_OK);
++        g_q = rd32(SCRATCH + 8);
++    }
++    CHECK(*(volatile uint32_t*)vm_to_host(g_area + 0x20010) == 0, "before notification the area reads as the flat VM (zero)");
++
++    CHECK((uint32_t)enable(g_area + 0x10000, g_q) == CELL_EINVAL, "327 inside the area, not at its start, is EINVAL");
++    CHECK((uint32_t)enable(SCRATCH, g_q) == CELL_EINVAL, "327 outside any reserved area is EINVAL");
++    CHECK((uint32_t)enable(g_area, 0x3FF) == CELL_ESRCH, "327 with an unknown queue is ESRCH");
++    CHECK(enable(g_area, g_q) == CELL_OK, "327 at the area's start with a live queue");
++    CHECK((uint32_t)enable(g_area, g_q) == CELL_EBUSY, "327 a second time for the area is EBUSY");
++    CHECK(ps3_pf_page_unmapped(g_area + 0x20000), "the area's pages are now unmapped");
++    CHECK((uint32_t)recover(7) == CELL_EINVAL, "57 for a thread not on a page fault is EINVAL");
++
++    pthread_t tp, tg;
++    pthread_create(&tp, NULL, pager, NULL);
++    pthread_create(&tg, NULL, guest, NULL);
++    for (int i = 0; i < 400 && !g_read_done; i++) usleep(5000);
++    pthread_join(tg, NULL);
++    pthread_join(tp, NULL);
++    CHECK(g_evt[0] == SYS_MEMORY_PAGE_FAULT_EVENT_KEY, "event source is SYS_MEMORY_PAGE_FAULT_EVENT_KEY (0x%016llX)", (unsigned long long)g_evt[0]);
++    CHECK(g_evt[1] == g_area + 0x20010, "data1 is the faulting address (0x%llX)", (unsigned long long)g_evt[1]);
++    CHECK(g_evt[2] == ((SYS_MEMORY_PAGE_FAULT_TYPE_PPU_THREAD << 32) | 7), "data2 is PPU thread type and thread id 7 (0x%llX)", (unsigned long long)g_evt[2]);
++    CHECK(g_evt[3] == SYS_MEMORY_PAGE_FAULT_CAUSE_NON_MAPPED, "data3 is CAUSE_NON_MAPPED (%llu)", (unsigned long long)g_evt[3]);
++    CHECK(g_recover_rc == CELL_OK, "57 recovers the suspended thread");
++    CHECK(g_seen == 0x11EEFFC0u || g_seen == 0xC0FFEE11u, "the re-run access sees the pager's data (0x%08X)", g_seen);
++
++    uint32_t id = 0;
++    CHECK(ps3_mm_free(g_obj) == (int32_t)CELL_EBUSY, "freeing a mapped object is EBUSY");
++    CHECK(ps3_mm_unmap(g_area + 0x20000, &id) == CELL_OK && id == g_obj, "unmap answers the object it unmapped (0x%X)", id);
++    CHECK(ps3_pf_page_unmapped(g_area + 0x20000), "the page is unmapped again");
++    CHECK(ps3_mm_unmap(g_area + 0x20000, &id) == (int32_t)CELL_EINVAL, "unmapping an address with nothing mapped is EINVAL");
++    CHECK(ps3_mm_map(g_area + 0x50000, g_obj) == CELL_OK, "the object maps again at another page");
++    CHECK(*(volatile uint32_t*)vm_to_host(g_area + 0x50010) == 0xC0FFEE11u, "it kept its contents while unmapped");
++    CHECK(ps3_mm_map(g_area + 0x60000, g_obj) == (int32_t)CELL_EBUSY, "a second mapping inside the area is EBUSY");
++    CHECK(ps3_mm_map(g_area + 0x60008, ps3_mm_object_create(0x10000)) == (int32_t)CELL_EALIGN, "an unaligned address is EALIGN");
++    CHECK(ps3_mm_map(g_area + 0x60000, 0xFFFF) == (int32_t)CELL_ESRCH, "an unknown object is ESRCH");
++    CHECK(ps3_mm_unmap(g_area + 0x50000, &id) == CELL_OK && ps3_mm_free(g_obj) == CELL_OK, "unmapped, it frees");
++    CHECK(ps3_mm_free(g_obj) == (int32_t)CELL_ESRCH, "a freed object is ESRCH");
++
++    if (fails) { printf("%d check(s) failed\n", fails); return 1; }
++    puts("test_mmapper_page_fault: OK");
++    return 0;
++}
+diff --git a/tools/test_mmapper_page_fault.py b/tools/test_mmapper_page_fault.py
+new file mode 100644
+index 00000000..6bb2a923
+--- /dev/null
++++ b/tools/test_mmapper_page_fault.py
+@@ -0,0 +1,44 @@
++#!/usr/bin/env python3
++"""lv2 page-fault notification (327, 57) and memory objects through the real
++runtime/syscalls/sys_mmapper_pf.c, with sys_memory.c and sys_event.c.
++
++A title can ask lv2 to tell it, by an event on a queue, when one of its
++threads touches an unmapped page of a reserved area; its pager maps memory
++there and resumes the thread. The flat VM backed every page, so the pager was
++never told and the title read zeros. Builds tests/test_mmapper_page_fault.c
++with the three files and runs it.
++"""
++import os
++import platform
++import subprocess
++import sys
++import tempfile
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++def main():
++    if os.name == 'nt':
++        print('SKIP: the fixture is POSIX; run on macOS/Linux')
++        return 0
++    with tempfile.TemporaryDirectory(prefix='mmapper-page-fault-') as tmp:
++        exe = Path(tmp) / 'test_mmapper_page_fault'
++        link = ['-Wl,-undefined,dynamic_lookup'] if platform.system() == 'Darwin' else ['-Wl,--unresolved-symbols=ignore-all']
++        r = subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-w', '-pthread',
++                            '-I' + str(ROOT / 'include'), '-I' + str(ROOT / 'runtime'),
++                            str(ROOT / 'tests/test_mmapper_page_fault.c'),
++                            *(str(ROOT / 'runtime/syscalls' / f) for f in ('sys_event.c', 'sys_memory.c', 'sys_mmapper_pf.c')),
++                            *link, '-o', str(exe)],
++                           capture_output=True, text=True)
++        if r.returncode:
++            print(r.stdout + r.stderr)
++            print('FAIL: fixture did not build')
++            return 1
++        r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=30)
++        sys.stdout.write(r.stdout + r.stderr)
++        return r.returncode
++
++
++if __name__ == '__main__':
++    sys.exit(main())
