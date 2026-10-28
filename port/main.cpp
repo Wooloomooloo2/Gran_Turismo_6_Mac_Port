@@ -108,6 +108,7 @@ void     gt6_configure_spurs(void);           /* gt6_spurs.cpp: the SPU fallback
 extern const char* ppu_vfs_root;              /* host dir the PS3 mount points map into */
 void     cellfs_add_path_mapping(const char* ps3_prefix, const char* host_path); /* cellFs.c */
 void     ps3_host_quit(const char* why);      /* cellSysutil.c: REQUEST_EXITGAME, then exit 0 */
+void     cellGame_init_from_paramsfo(const char* sfo_path); /* cellGame.c: the booted PARAM.SFO */
 
 /* sys_ppu_thread.c: the main thread's stack, as sys_ppu_thread_get_stack_information
  * reports it. Left at 0 it names VM_STACK_BASE, the first created thread's stack. */
@@ -589,6 +590,24 @@ static void gt6_exitspawn(const char* path, const char* const* argv, const char*
     fprintf(stderr, "[exitspawn] exec %s failed: %s\n", s_self_exe, strerror(errno));
 }
 
+/* GT6: the PARAM.SFO cellGame answers from (D43). A PS3 with the disc in the drive and the
+ * 1.22 update installed boots the update: /dev_hdd0/game/BCES01977/USRDIR/EBOOT.BIN, under
+ * the update's PARAM.SFO (CATEGORY "GD", APP_VER 01.22), and so does the EMAIN.SELF it
+ * spawns. cellGameBootCheck then reports a disc game with the PATCH attribute, and
+ * cellGameGetParamString the update's TITLE_ID / VERSION / APP_VER (RPCS3 does the same for
+ * the GD category). Without this cellGame kept its placeholders (title id BLES00000, app
+ * version 01.00). Falls back to the disc's PARAM.SFO when the play folder has no update. */
+static void configure_game_params(void)
+{
+    char sfo[1200];
+    struct stat st;
+    snprintf(sfo, sizeof sfo, "%sgame/BCES01977/PARAM.SFO", s_hdd0_mapping);
+    if (stat(sfo, &st) != 0 || !S_ISREG(st.st_mode))
+        snprintf(sfo, sizeof sfo, "%s/PS3_GAME/PARAM.SFO", ppu_vfs_root);
+    printf("[boot] PARAM.SFO: %s\n", sfo);
+    cellGame_init_from_paramsfo(sfo);
+}
+
 int main(int argc, char** argv)
 {
     if (argc < 2) {
@@ -618,6 +637,7 @@ int main(int argc, char** argv)
 
     if (!configure_vfs_roots())
         return 1;
+    configure_game_params();
     configure_guest_argv();
     gt6_configure_spurs();
 
