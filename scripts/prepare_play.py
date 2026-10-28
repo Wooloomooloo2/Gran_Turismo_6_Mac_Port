@@ -224,7 +224,13 @@ def prepare(tree, out=None, force=False):
     EBOOT's effects. Only a folder holding this tool's prepare.json is ever replaced, and
     never the tree itself or a folder that contains it."""
     tree = Path(tree).resolve()
-    out = Path(out).resolve() if out else tree / "play"
+    out = Path(out).absolute() if out else tree / "play"
+    # A symlink is refused, never followed: --force would delete and replace the link's
+    # target, which can be another tree's play folder (review M-5).
+    if out.is_symlink():
+        raise SystemExit(f"error: {out} is a symlink; refusing (a play folder must be a "
+                         "real folder inside the tree)")
+    out = out.resolve()
     if out == tree or out in tree.parents:
         raise SystemExit(f"error: {out} is the verified tree or contains it; refusing")
     if in_git_work_tree(out):

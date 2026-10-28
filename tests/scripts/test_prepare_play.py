@@ -136,6 +136,26 @@ def test_force_refuses_a_folder_this_tool_did_not_make(tmp_path):
     assert (tree / "play" / "keep.txt").read_text() == "not ours"
 
 
+def test_force_refuses_a_play_folder_that_is_a_symlink(tmp_path):
+    """A symlinked play folder is refused, not followed (review M-5): --force would
+    otherwise delete and replace the link's target, a play folder of another tree."""
+    tree = tmp_path / "tree"
+    make_tree(tree)
+    other = tmp_path / "other"
+    make_tree(other)
+    prepare_play.prepare(other)
+    target = other / "play"
+    marker = target / GAME / "TPPS-01.07" / "update.txt"
+    marker.write_text("another tree's first run")
+    (tree / "play-x").symlink_to(target)
+    with pytest.raises(SystemExit, match="symlink"):
+        prepare_play.prepare(tree, out=tree / "play-x", force=True)
+    with pytest.raises(SystemExit, match="symlink"):
+        prepare_play.main([str(tree), "--force", "--name", "play-x"])
+    assert (tree / "play-x").is_symlink()
+    assert marker.read_text() == "another tree's first run"
+
+
 def test_force_never_deletes_the_tree_or_its_ancestors(tmp_path):
     tree = tmp_path / "tree"
     make_tree(tree)
