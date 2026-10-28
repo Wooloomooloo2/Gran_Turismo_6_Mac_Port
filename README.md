@@ -103,11 +103,18 @@ cmake --build "$GT6_TREE/port-build" --target gt6
 
 # 4b. The first-run install replaces USRDIR/EMAIN.SELF with a newer program (D44), so
 #     translate and build that one too; the port starts whichever the play folder holds.
+#     Repeat steps 2, 4 and 4b for every image after any change to patches/ps3recomp or the
+#     submodule: boot_game.py refuses to run while a build is from another patch set (D47).
 .venv/bin/python scripts/translate_game.py "$GT6_TREE" -o "$GT6_TREE/recomp-tpps122" \
       --elf decrypted/dev_hdd0/game/BCES01977/USRDIR/TPPS-01.22/EMAIN.SELF.elf
 cmake -S . -B "$GT6_TREE/port-build-tpps122" -G Ninja -DGT6_BUILD_PORT=ON \
       -DGT6_TREE="$GT6_TREE" -DGT6_RECOMP="$GT6_TREE/recomp-tpps122" -DCMAKE_BUILD_TYPE=Release
 cmake --build "$GT6_TREE/port-build-tpps122" --target gt6
+
+# 4c. Once, after a passing `gt6unpack verify`: make the verified disc layer read-only, so
+#     nothing can change it (D46; boot_game.py refuses while it is writable). Undo with
+#     chmod -R u+w before anything that must write there.
+chmod -R a-w "$GT6_TREE/dev_bdvd"
 
 # 5. Start it unattended. It stops 5 s after the first flip, when the process exits,
 #    when it hangs (--idle) or after --seconds. Options: --seconds N, --idle N, --window.

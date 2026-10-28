@@ -24,6 +24,7 @@ built beside it and renamed into place once complete, so an interrupted run leav
 no half-prepared play folder. It must be outside any git work tree.
 """
 import argparse
+import os
 import datetime
 import hashlib
 import json
@@ -267,12 +268,31 @@ def prepare(tree, out=None, force=False):
     return record
 
 
+
+def disc_layer_writable(tree):
+    """None when <tree>/dev_bdvd, the verified disc layer, is read-only on the host (D46);
+    otherwise what is writable there (the folder itself or the first writable entry)."""
+    root = Path(tree).expanduser() / "dev_bdvd"
+    if not root.is_dir():
+        return None
+    for d, dirs, files in os.walk(root):
+        for name in [d] + [os.path.join(d, f) for f in dirs + files]:
+            if not os.path.islink(name) and os.stat(name).st_mode & 0o222:
+                return f"{name} is writable; the verified disc layer must be read-only"
+    return None
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("tree", type=Path, help="verified gt6unpack build tree")
     ap.add_argument("--force", action="store_true", help="delete an existing play folder first")
     args = ap.parse_args(argv)
     rec = prepare(args.tree, force=args.force)
+    guard = disc_layer_writable(args.tree)
+    if guard:
+        print(f"WARNING: {guard} (D46). The game's file calls cannot write there, but a stray "
+              f"host write could change the verified copy. Run: chmod -R a-w "
+              f"\"{Path(args.tree).expanduser() / 'dev_bdvd'}\" (boot_game.py refuses until then)",
+              file=sys.stderr)
     for a in rec["applied"]:
         print(f"applied {a['path']}: {a['change']}")
     return 0

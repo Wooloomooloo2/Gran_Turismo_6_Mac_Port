@@ -185,6 +185,12 @@ def press_env(presses):
 
 
 IMAGE_NAME = "gt6.image"   # written by port/CMakeLists.txt beside each binary (D44)
+# The port's lines when the play folder's EMAIN.SELF has no build, or only a stale one (D47).
+NO_BUILD_RE = re.compile(r"\[image\] no-matching-build sha256=([0-9a-f]{64})")
+STALE_RE = re.compile(r"\[image\] stale-build (\S+)")
+
+
+from prepare_play import disc_layer_writable   # noqa: E402  (D46)
 
 
 def image_info(gt6):
@@ -195,17 +201,59 @@ def image_info(gt6):
         return None
 
 
-def images_env(tree):
-    """GT6_IMAGES for the port (D44): every build under <tree>/port-build*/port with its
-    gt6.image, as "<self sha256>=<binary>|<elf>;...", so the port can start the build of
-    whichever EMAIN.SELF the play folder holds (the first-run install replaces it)."""
-    items = []
+REPO = Path(__file__).resolve().parents[1]
+PATCHES = REPO / "patches" / "ps3recomp"
+PS3RECOMP = REPO / "third_party" / "ps3recomp"
+
+
+def current_patch_set():
+    """(ps3recomp commit, patch-set SHA-256) of this checkout, as translate_game.py and
+    port/CMakeLists.txt compute them (D28)."""
+    from translate_game import patches_hash
+    try:
+        commit = subprocess.run(["git", "-C", str(PS3RECOMP), "rev-parse", "HEAD"],
+                                capture_output=True, text=True, check=True).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        commit = None
+    return commit, patches_hash(PATCHES)
+
+
+def check_images(tree, commit=None, patches=None):
+    """Every build under <tree>/port-build*/port with a gt6.image: (current, problems).
+    current is [(sha, binary, elf)] for the builds made from this checkout's ps3recomp commit
+    and patch set; problems names each build that is not (stale: it would silently lack the
+    current fixes) and each SELF more than one build claims (D47)."""
+    if commit is None and patches is None:
+        commit, patches = current_patch_set()
+    current, problems, seen = [], [], {}
     for img in sorted(Path(tree).glob("port-build*/port/" + IMAGE_NAME)):
         info = image_info(img)
         gt6 = img.parent / "gt6"
-        if info and gt6.is_file() and "self_sha256" in info and "elf" in info:
-            items.append(f"{info['self_sha256']}={gt6}|{Path(tree) / info['elf']}")
-    return ";".join(items)
+        if not (info and gt6.is_file() and "self_sha256" in info and "elf" in info):
+            continue
+        if info.get("ps3recomp_patches") != patches or info.get("ps3recomp_commit") != commit:
+            problems.append(f"{gt6} was built from ps3recomp {info.get('ps3recomp_commit')} with "
+                            f"patch set {info.get('ps3recomp_patches')}; this checkout is {commit} "
+                            f"with {patches}")
+            continue
+        sha = info["self_sha256"]
+        if sha in seen:
+            problems.append(f"{gt6} and {seen[sha]} are both builds of the SELF {sha}")
+            continue
+        seen[sha] = gt6
+        current.append((sha, gt6, Path(tree) / info["elf"]))
+    return current, problems
+
+
+def images_env(tree, commit=None, patches=None):
+    """GT6_IMAGES for the port (D44): every current build under <tree>/port-build*/port, as
+    "<self sha256>=<binary>|<elf>|<patch set>;...", so the port can start the build of whichever
+    EMAIN.SELF the play folder holds (the first-run install replaces it). Stale builds are left
+    out (boot() refuses to run while there is one)."""
+    if commit is None and patches is None:
+        commit, patches = current_patch_set()
+    current, _ = check_images(tree, commit, patches)
+    return ";".join(f"{sha}={gt6}|{elf}|{patches}" for sha, gt6, elf in current)
 
 
 def build_env(tree, run, headless, env, frame_every=60, frame_max=300):
@@ -444,6 +492,11 @@ def _summary(rep, tree):
              f"- SPU images run in the interpreter (lift them: translate_game.py): "
              f"{len(rep['spu_interpreted'])}",
              f"- Run folder: {rep['run']}"]
+    for sha in rep.get("no_matching_build", []):
+        lines.append(f"- **No build for the play folder's EMAIN.SELF** (sha256 {sha[:16]}...): "
+                     f"the image ran another executable's translation (D44)")
+    for b in rep.get("stale_build", []):
+        lines.append(f"- **Refused a stale build**: {b} (another patch set, D47)")
     if rep.get("dump_stopped"):
         lines.append(f"- Frame dumps stopped before the end ({rep['dump_stopped']}: "
                      + {"bytes": "frames/ reached its size cap",
@@ -475,6 +528,16 @@ def boot(gt6, tree, seconds=300, idle=60, headless=True, env=None, until="flip",
         raise SystemExit(f"error: {tree}/play/prepare.json is missing: "
                          f"run scripts/prepare_play.py first")
     info = image_info(gt6)
+    _, problems = check_images(tree)
+    if problems:
+        raise SystemExit("error: a port build does not match this checkout's ps3recomp patches, "
+                         "so it would run without the current fixes (D47). Re-translate and "
+                         "rebuild every image (README steps 2, 4 and 4b):\n  "
+                         + "\n  ".join(problems))
+    guard = disc_layer_writable(tree)
+    if guard:
+        raise SystemExit(f"error: {guard} (D46). Make it read-only first: "
+                         f"chmod -R a-w \"{tree / 'dev_bdvd'}\"")
     elf = tree / (info["elf"] if info and "elf" in info else ELF_REL)
     if not elf.is_file():
         raise SystemExit(f"error: ELF not found: {elf}")
@@ -564,6 +627,8 @@ def boot(gt6, tree, seconds=300, idle=60, headless=True, env=None, until="flip",
         "pid": proc.pid,
         "run": str(run),
     }
+    rep["no_matching_build"] = sorted(set(NO_BUILD_RE.findall(err)))
+    rep["stale_build"] = sorted(set(STALE_RE.findall(err)))
     rep["spawns"] = []
     for d in spawn_dirs(frames_dir):
         n = d.name[5:]

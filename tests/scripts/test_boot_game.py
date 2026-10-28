@@ -443,18 +443,76 @@ def test_stop_file_reaches_spawned_images(tmp_path):
     assert (frames / boot_game.STOP_NAME).is_file() and (frames / "spawn10" / boot_game.STOP_NAME).is_file()
 
 
-def test_images_env_lists_every_build(tree, tmp_path):
-    """D44: each <tree>/port-build*/port with gt6 and gt6.image becomes "<sha>=<bin>|<elf>"."""
-    for d, sha, elf in (("port-build", "aa", "decrypted/a.elf"), ("port-build-tpps122", "bb", "decrypted/b.elf")):
-        p = tree / d / "port"
-        p.mkdir(parents=True)
-        (p / "gt6").write_text("")
-        (p / "gt6.image").write_text(json.dumps({"self": "x", "self_sha256": sha, "elf": elf}))
+def _image(tree, d, sha, elf, commit="c1", patches="p1"):
+    p = tree / d / "port"
+    p.mkdir(parents=True)
+    (p / "gt6").write_text("")
+    (p / "gt6.image").write_text(json.dumps({"self": "x", "self_sha256": sha, "elf": elf,
+                                             "ps3recomp_commit": commit,
+                                             "ps3recomp_patches": patches}))
+    return p / "gt6"
+
+
+def test_images_env_lists_every_build(tree, tmp_path, monkeypatch):
+    """D44, D47: each current <tree>/port-build*/port becomes "<sha>=<bin>|<elf>|<patches>"."""
+    _image(tree, "port-build", "aa", "decrypted/a.elf")
+    _image(tree, "port-build-tpps122", "bb", "decrypted/b.elf")
     (tree / "port-build-junk" / "port").mkdir(parents=True)   # no image: ignored
-    env = boot_game.images_env(tree)
-    assert env == (f"aa={tree / 'port-build/port/gt6'}|{tree / 'decrypted/a.elf'};"
-                   f"bb={tree / 'port-build-tpps122/port/gt6'}|{tree / 'decrypted/b.elf'}")
+    env = boot_game.images_env(tree, "c1", "p1")
+    assert env == (f"aa={tree / 'port-build/port/gt6'}|{tree / 'decrypted/a.elf'}|p1;"
+                   f"bb={tree / 'port-build-tpps122/port/gt6'}|{tree / 'decrypted/b.elf'}|p1")
     assert boot_game.image_info(tree / "port-build-tpps122/port/gt6")["elf"] == "decrypted/b.elf"
     assert boot_game.image_info(tree / "port-build-junk/port/gt6") is None
+    monkeypatch.setattr(boot_game, "current_patch_set", lambda: ("c1", "p1"))
     e = boot_game.build_env(tree, tmp_path, True, None)
     assert e["GT6_IMAGES"] == env
+
+
+def test_stale_and_duplicate_builds_are_problems(tree):
+    """D47: a build from another patch set or ps3recomp commit, or a second build of one SELF,
+    is reported, and left out of GT6_IMAGES."""
+    _image(tree, "port-build", "aa", "decrypted/a.elf")
+    _image(tree, "port-build-old", "bb", "decrypted/b.elf", patches="p0")
+    _image(tree, "port-build-oldcommit", "cc", "decrypted/c.elf", commit="c0")
+    _image(tree, "port-build-twin", "aa", "decrypted/a.elf")
+    current, problems = boot_game.check_images(tree, "c1", "p1")
+    assert [c[0] for c in current] == ["aa"]
+    assert len(problems) == 3
+    assert any("port-build-old/" in p and "p0" in p for p in problems)
+    assert any("port-build-oldcommit/" in p and "c0" in p for p in problems)
+    assert any("both builds of the SELF aa" in p for p in problems)
+    assert "bb=" not in boot_game.images_env(tree, "c1", "p1")
+
+
+def test_boot_refuses_a_stale_build(tree, tmp_path, monkeypatch):
+    """D47: boot() stops before launching while any build is stale."""
+    gt6 = _image(tree, "port-build", "aa", str(boot_game.ELF_REL), patches="p0")
+    monkeypatch.setattr(boot_game, "current_patch_set", lambda: ("c1", "p1"))
+    with pytest.raises(SystemExit, match="does not match this checkout's ps3recomp patches"):
+        boot_game.boot(gt6, tree, seconds=1)
+    assert not (tree / "runs").exists()
+
+
+def test_boot_refuses_a_writable_disc_layer(tree, tmp_path, monkeypatch):
+    """D46: boot() stops while <tree>/dev_bdvd is writable on the host."""
+    (tree / "dev_bdvd" / "PS3_GAME").mkdir(parents=True)
+    (tree / "dev_bdvd" / "PS3_GAME" / "f").write_text("x")
+    monkeypatch.setattr(boot_game, "current_patch_set", lambda: ("c1", "p1"))
+    gt6 = fake("ok", tmp_path) if (FIX / "ok.py").exists() else tmp_path / "gt6"
+    try:
+        with pytest.raises(SystemExit, match="must be read-only"):
+            boot_game.boot(gt6, tree, seconds=1)
+        for p in [tree / "dev_bdvd" / "PS3_GAME" / "f", tree / "dev_bdvd" / "PS3_GAME", tree / "dev_bdvd"]:
+            p.chmod(0o555 if p.is_dir() else 0o444)
+        assert boot_game.disc_layer_writable(tree) is None
+    finally:
+        for p in [tree / "dev_bdvd", tree / "dev_bdvd" / "PS3_GAME", tree / "dev_bdvd" / "PS3_GAME" / "f"]:
+            p.chmod(0o755 if p.is_dir() else 0o644)
+
+
+def test_no_matching_build_and_stale_lines_are_reported():
+    """D47: the port's "[image] no-matching-build" and "stale-build" lines reach report.json."""
+    sha = "ab" * 32
+    err = f"x\n[image] no-matching-build sha256={sha}: the play folder...\n[image] stale-build /b/gt6\n"
+    assert boot_game.NO_BUILD_RE.findall(err) == [sha]
+    assert boot_game.STALE_RE.findall(err) == ["/b/gt6"]

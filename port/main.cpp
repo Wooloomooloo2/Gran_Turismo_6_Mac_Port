@@ -54,7 +54,8 @@
  * names over pthreads and mmap, so the call sites below are written once. */
 #include "win32_compat.h"
 
-#include "gt6_paths.h"   /* GT6_DEFAULT_VFS_ROOT, GT6_DEFAULT_HDD0_ROOT (generated) */
+#include "gt6_paths.h"     /* GT6_DEFAULT_VFS_ROOT, GT6_DEFAULT_HDD0_ROOT, GT6_PATCHES_HASH (generated) */
+#include "gt6_images.h"    /* gt6_find_image: the build for an EMAIN.SELF (D44, D47) */
 
 #include <stdint.h>
 #include <stdio.h>
@@ -532,8 +533,9 @@ static void gt6_exitspawn_output(const char* var, int n, bool dir)
 /* D44: GT6's first-run install replaces USRDIR/EMAIN.SELF with TPPS-01.22's, so the program
  * a boot or an exit-spawn starts is whichever EMAIN.SELF the play folder holds then. Each port
  * binary is one translated executable (GT6_SELF_SHA256, the SELF its ELF came from);
- * $GT6_IMAGES lists the others the harness knows, "<sha256>=<binary>|<elf>;...". Answers
- * false when this binary is the right one (or nothing better is known), else fills bin/elf. */
+ * $GT6_IMAGES lists the others the harness knows, "<sha256>=<binary>|<elf>|<patches>;..."
+ * (gt6_images.h). Answers false when this binary is the right one (or nothing better is
+ * known), else fills bin/elf; a build from another patch set ends the process (D47). */
 static bool gt6_sha256_file(const char* path, char hex[65])
 {
 #if defined(__APPLE__)
@@ -564,23 +566,25 @@ static bool gt6_other_image(std::string& bin, std::string& elf)
         return false;
     }
     if (strcmp(hex, GT6_SELF_SHA256) == 0) return false;
-    const char* list = getenv("GT6_IMAGES");
-    std::string all = list ? list : "";
-    size_t pos = 0;
-    while (pos < all.size()) {
-        size_t end = all.find(';', pos);
-        if (end == std::string::npos) end = all.size();
-        const std::string item = all.substr(pos, end - pos);
-        pos = end + 1;
-        const size_t eq = item.find('='), bar = item.find('|');
-        if (eq == std::string::npos || bar == std::string::npos || bar < eq) continue;
-        if (item.compare(0, eq, hex) != 0) continue;
-        bin = item.substr(eq + 1, bar - eq - 1);
-        elf = item.substr(bar + 1);
+    std::string stale;
+    switch (gt6_find_image(getenv("GT6_IMAGES"), hex, GT6_PATCHES_HASH, bin, elf, stale)) {
+    case GT6_IMAGE_FOUND:
         return true;
+    case GT6_IMAGE_STALE:
+        /* D47: never run a build that lacks the current patches; fail loudly instead. */
+        fprintf(stderr, "[image] REFUSED: %s, the build for the play folder's EMAIN.SELF, was made "
+                        "from ps3recomp patch set %.16s..., this binary from %.16s...; re-translate "
+                        "and rebuild every image (README step 4b)\n",
+                bin.c_str(), stale.empty() ? "(none recorded)" : stale.c_str(), GT6_PATCHES_HASH);
+        printf("[image] stale-build %s\n", bin.c_str());
+        fflush(NULL);
+        _exit(3);
+    case GT6_IMAGE_NONE:
+        break;
     }
-    printf("[image] the play folder's EMAIN.SELF (sha256 %.16s...) is not this binary's "
-           "(%.16s...) and no other build of it is known (GT6_IMAGES); running this one\n",
+    /* boot_game.py reports this line in report.json ("no_matching_build"). */
+    printf("[image] no-matching-build sha256=%s: the play folder's EMAIN.SELF is not this "
+           "binary's (%.16s...) and no other build of it is known (GT6_IMAGES); running this one\n",
            hex, GT6_SELF_SHA256);
     return false;
 }
