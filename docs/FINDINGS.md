@@ -126,6 +126,79 @@ and rebuilding with patch 0010: `boot_game.py "$GT6_TREE" --until time --seconds
   faked `cellFiberPpuContext*` imports, then `cellFsGetFreeSize` (12 unresolved imports, one
   stubbed system call, 327).
 
+## PPU fiber contexts (2026-10-28)
+
+**With the fiber calls implemented (patch 0011, D36), GT6 shows its first picture: "Sony
+Computer Entertainment presents", grey on black.** It then stays on that screen, because the
+job its fiber runs deadlocks with the main thread (below).
+
+**How GT6 uses fibers.** EMAIN imports six `cellFiber` calls: `_cellFiberPpuInitialize`,
+`_cellFiberPpuContextAttributeInitialize`, `cellFiberPpuContextInitialize`,
+`cellFiberPpuContextRun`, `cellFiberPpuContextReturnToThread` and
+`cellFiberPpuContextFinalize` (NIDs in `recomp/loader/EMAIN.SELF.imports.json`). It imports
+no scheduler call (`cellFiberPpuCreateFiber`, `RunFibers` and so on) and no `Switch` or `Self`.
+The calls sit in one small coroutine class (func_00A6CADC to func_00A6D018):
+- Its init (func_00A6CD88) names the attribute, then calls Initialize with entry OPD 0x015A1498
+  (func_00A6CADC), the object as the argument, and a guest stack the object owns. In the run
+  below: context 0x7FEEFA90, stack 0x72198000 + 0x10000 (64 KB).
+- Its step (func_00A6CEE8) puts the object in a TLS slot (r13 - 0x6FF4), calls
+  `Run(context, &cause, NULL, NULL)`, and clears the slot. So the context must see the calling
+  thread's r13.
+- The entry (func_00A6C9FC) calls the job function at object+0x28 once, then loops: poll
+  (func_00A4F9FC), then the virtual at vtable+0x18 (func_00A6CD64,
+  `ReturnToThread(0)`), until a state word reads 1; then it sets the state to 2 and yields for
+  ever. It never returns. Finalize is in the destructor (func_00A6CAF0, func_00A6D018), on a
+  suspended context.
+- So GT6 only runs and returns to the thread; it never switches between contexts. While Run was
+  faked it called Run 1k-9k times in 40 s (run 20261027-235022), about once a frame. Under
+  patch 0011 it called Run once, and the context has not returned yet.
+
+RPCS3 has stubs only for these calls (argument checks, then CELL_OK; `cellFiber.cpp`), and
+its reference runs load Sony's `libfiber` from firmware instead, so its log shows no calls.
+
+**Run 20261028-011330**, on a fresh play folder after re-translating and rebuilding with
+patch 0011: `boot_game.py "$GT6_TREE" --until time --seconds 300 --png`.
+- Outcome `timeout` after 300.2 s, no crash; 18,659 presents (about 62 a second); 300 frames
+  dumped (the cap, reached at present 17,940).
+- The fiber calls are in the milestone log and none are unresolved:
+  `hle:_cellFiberPpuContextAttributeInitialize`, `hle:cellFiberPpuContextInitialize`,
+  `hle:cellFsGetFreeSize`, `hle:cellFiberPpuContextRun` (count 1 each), then a new call,
+  `hle:sys_lwmutex_trylock`. Unresolved imports are down from 12 to 9.
+- **The screen.** From present 60 every frame has 12 to 19 draw calls and 2 clears (before
+  patch 0011: one draw and one clear, all black). Present 60 shows "Sony Computer
+  Entertainment / presents" fading in; presents 120 to 17,940 show it fully, grey on black,
+  identical to the end (`nonzero_share` 0.0049 in all of them). The text is centred about
+  x = 640 of the 1440-pixel-wide frame, so it is laid out for 1280 x 720 (the presented-size
+  question in "Long runs"). `drawn_frames` is 0 only because the text covers under 1% of
+  the pixels. RPCS3 shows the legal text and GT6's "Installing..." dialog at this point
+  (13 s); the splash was not in its 10 s screenshots.
+- The install did not get far: 24 files opened after the fiber started (the open log is not
+  capped), then none. It did
+  not reach "Installation complete." (Task 5's dialog).
+
+**The new blocker: a lock-order deadlock between the main thread and the fiber's job.**
+A host `sample` of a second run (20261028-012030, 50 s in) and a run with every contended
+lwmutex logged (20261028-012412, diagnostic build, since reverted):
+- The thread that called Run (guest thread 26, `9qstY`, in run 20261028-012412; thread ids
+  vary between runs) is blocked in `cellFiberPpuContextRun`, as it should be while its
+  context runs.
+- The context, on its own host thread with guest thread id 26, runs the job (func_005A6CA8,
+  func_005A6894 and on through the resource code). It is blocked in `sys_lwmutex_lock` on
+  0x01765788, owned by thread 1, from func_00841978: a one-time static initialiser (guard byte
+  at 0x01680258) that registers its destructor (func_00BD3FCC -> func_00BD3E6C), which takes
+  lock 1 of the C library's lock table (func_00BDC2D4 -> func_00BDD694).
+- Thread 1, GT6's main thread, holds that lock while it waits in `sys_lwcond_wait` on GT6's
+  event object (func_00A5F3DC, from func_005A7FA4 via func_00735DC4). Every other guest thread
+  is idle in an event queue, a condition or a sleep.
+- Nothing in the fiber implementation takes part: the context has thread 26's id, so the
+  lwmutex is genuinely owned by another thread, and the same order would deadlock on the
+  console. So the question is why the main thread is holding that lock while it waits, which
+  it presumably does not on the console: an earlier call path that differs, or timing. That is
+  the next bring-up round (BACKLOG).
+
+**Test evidence for patch 0011** (`tools/test_cellfiber_ppu.py`): a Run plus ReturnToThread
+round trip takes 5.6 µs and a Switch A -> B -> A 5.1 µs on the M4 Max (20,000 of each).
+
 ## RPCS3 reference: boot to the first menu (2026-10-28)
 
 **RPCS3 did not reach the first menu either.** It ran the first-run install to the end. After

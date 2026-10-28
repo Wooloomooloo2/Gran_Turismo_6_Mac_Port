@@ -1,0 +1,1300 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] cellFiber: PPU fiber contexts (cellFiberPpuContext*) on a host thread each
+
+Upstream: not yet submitted; written to be upstreamed (generic, no title names)
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0010)
+
+What: the SDK's low-level PPU fiber contexts, which had no handler (their
+imports took the unresolved path and faked CELL_OK, so no context ever ran):
+_cellFiberPpuContextAttributeInitialize, cellFiberPpuContextInitialize,
+cellFiberPpuContextFinalize, cellFiberPpuContextRun, cellFiberPpuContextSwitch,
+cellFiberPpuContextReturnToThread, cellFiberPpuContextSelf and
+cellFiberPpuContextCheckStackLimit, in libs/spurs/cellFiber.c (so
+gen_hle_nids.py registers them). A PPU thread runs a context with Run until a
+context returns to the thread (Run then hands back its cause and the context);
+contexts hand control to each other with Switch.
+
+A lifted context's suspended state includes host frames (the lifted calls it
+is inside), so each context runs on a host thread of its own, created by
+Initialize, and a baton (one lock, a condition variable per context and per
+Run) lets exactly one context, or the thread blocked in Run, execute at a
+time. Unlike ucontext (which the scheduler API in the same file uses), this
+keeps every host thread-local of the runtime per context without a list to
+swap: the guest setjmp chain of ppu_sjlj.h (a guest longjmp can only reach a
+setjmp made on its own context, and a context's chain starts empty), the
+indirect-call depth, the tail-call trampoline, the callback stack slot. A
+round trip costs about 5 us on an M4 Max.
+
+Guest identity: a context runs on the PPU thread that resumed it, as on the
+console, so each Run or Switch gives it that thread's thread_id and r13 (TLS).
+Its entry is entry(arg, fiberFrom), on the guest stack it was given (r1 16-byte
+aligned, back chain 0). Finalize on a suspended context sets a kill flag; its
+host thread longjmps from the suspending call to its base frame and exits, and
+Finalize joins it (the jump skips lifted frames and the HLE dispatch frame,
+which hold no lock, as a guest longjmp does). Host records are kept for the
+next Initialize, because each context's ppu_context joins the runtime's
+lwarx/stwcx reservation set (ppu_resv_register), which has no removal.
+Process exit with suspended contexts does not wait for them.
+
+Error codes follow RPCS3's argument checks (NULL_POINTER, ALIGN; the calls are
+stubs there) and the SDK's meanings: PERM for Run from a context or a
+scheduler fiber and for Switch, ReturnToThread or CheckStackLimit from a
+thread; INVAL for an address that holds no context; STAT for Run, Switch or
+Finalize on a running context, Run or Switch on one whose entry returned (it
+has ended, and Run returned cause 0), a Switch to itself, Initialize on a live
+context, and CheckStackLimit with r1 outside the context's stack; INVAL for a
+guest stack under 1 KB; AGAIN when no host thread can be created. The
+execution option and the attribute contents are not used (AttributeInitialize
+zeroes the 128-byte attribute, as RPCS3 does). ps3_fiber_context_host_threads()
+(not an SDK call) counts the host threads contexts hold.
+
+Why: titles that drive a coroutine with Run / ReturnToThread (one Run per
+frame is a typical pattern) stalled for good on the faked success, since the
+work the context does never happened.
+
+Test: tools/test_cellfiber_ppu.py (new) builds libs/spurs/tests/
+test_fiber_context.c with cellFiber.c: the entry returning, ReturnToThread and
+resume, A->B->A switches keeping each context's registers and guest stack,
+Self, thread identity across two owner threads, host thread-locals starting
+empty, Finalize of never-run, suspended (in ReturnToThread and in Switch) and
+ended contexts with the host threads counted back to zero, every error code
+above (Run and Finalize on a running context from another host thread), and
+a timed round trip; then runs it with "exit" (contexts left suspended, main
+returns) under a 20 s timeout, and runs tests/fiber_switch, whose main.c gains
+a ppu_resv_register stub.
+
+diff --git a/libs/spurs/cellFiber.c b/libs/spurs/cellFiber.c
+index 3673985c..64f89e18 100644
+--- a/libs/spurs/cellFiber.c
++++ b/libs/spurs/cellFiber.c
+@@ -8,6 +8,9 @@
+  *
+  * Not modelled: the scheduler attribute and fiber attribute contents (both are zeroed on initialisation and ignored),
+  * and the fiber context-switch trace/ufiber utilities of the SDK.
++ *
++ * The fiber contexts (cellFiberPpuContext*, at the end of this file) do not use ucontext: each context runs on a host
++ * thread of its own, see the comment there.
+  */
+ 
+ /* Darwin gates the ucontext routines AND the shape of ucontext_t itself on _XOPEN_SOURCE, so this has to come before
+@@ -21,6 +24,7 @@
+ #include "cellFiber.h"
+ #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_write32, vm_memset: guest EA -> host */
+ #include "../../runtime/syscalls/sys_ppu_thread.h"   /* ppu_context, g_ppu_thread_entry_trampoline */
++#include <setjmp.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -547,3 +551,400 @@ s32 cellFiberPpuJoinFiber(CellFiberPpu* fiber, s32* status)
+     UNLOCK();
+     return rc;
+ }
++
++/* ===========================================================================
++ * Fiber contexts (cellFiberPpuContext*)
++ *
++ * The SDK's low-level fibers: a PPU thread runs a context with cellFiberPpuContextRun, the context runs until it
++ * calls cellFiberPpuContextReturnToThread (Run then returns the cause it passed), and contexts hand control to each
++ * other with cellFiberPpuContextSwitch. On the console a context is a saved register set and a guest stack, and it
++ * runs on the PPU thread that resumed it.
++ *
++ * Lifted, a suspended context also has host frames: the lifted functions it was in the middle of, down to the import
++ * call that suspended it. So every context runs on a host thread of its own, created by Initialize, and a baton
++ * (one lock, a condition variable per context and per Run) lets exactly one of them, or the thread blocked in Run,
++ * execute at a time. A host thread per context, rather than ucontext as the scheduler above uses, keeps every
++ * host thread-local of the runtime per context with no list to keep in step: the guest setjmp chain (a guest longjmp
++ * can only reach a setjmp made on its own context, and a context's chain starts empty), the indirect-call depth, the
++ * tail-call trampoline, the callback stack slot. The handoff costs a few microseconds; titles switch a few times a
++ * frame.
++ *
++ * Guest identity: a context runs on the PPU thread that resumed it, so on every Run or Switch it takes that thread's
++ * thread_id and r13 (TLS). sys_ppu_thread_get_id and __thread data inside a context are the running thread's.
++ *
++ * Finalize on a suspended context wakes its host thread with a kill flag; the thread longjmps from the suspending call
++ * back to its base frame and exits, and Finalize joins it. The longjmp skips the lifted frames and the HLE dispatch
++ * frame of that call, as a guest longjmp does (runtime/ppu/ppu_sjlj.h); none of them holds a lock. The context's host
++ * record (with the ppu_context the reservation set holds) is kept for the next Initialize.
++ *
++ * Choices where the SDK documents nothing and RPCS3 stubs the call: an entry that returns ends the context and returns
++ * to the thread with cause 0, and an ended context cannot be run or switched to again (STAT); Initialize on a live
++ * context is STAT; a guest stack under 1 KB is INVAL; CheckStackLimit is STAT when r1 is outside the context's
++ * stack. The execution option and the attribute (zeroed by AttributeInitialize, as RPCS3 does) are not used. The
++ * argument checks (NULL_POINTER, ALIGN) follow RPCS3.
++ * =========================================================================*/
++
++enum { X_READY, X_RUNNING, X_SUSPENDED, X_ENDED };
++
++#define XCTX_HOST_STACK   (256u * 1024u * 1024u)   /* reserved, as for PPU threads (sys_ppu_thread.c) */
++#define XCTX_MIN_STACK    0x400u
++#define XCTX_FALLBACK_THREAD_ID 0x7FFF0000ull
++
++#ifdef _WIN32
++typedef CONDITION_VARIABLE xcond;
++static SRWLOCK s_xlock = SRWLOCK_INIT;
++#  define XLOCK()        AcquireSRWLockExclusive(&s_xlock)
++#  define XUNLOCK()      ReleaseSRWLockExclusive(&s_xlock)
++#  define XCINIT(c)      InitializeConditionVariable(c)
++#  define XCDESTROY(c)   ((void)(c))
++#  define XWAIT(c)       SleepConditionVariableSRW((c), &s_xlock, INFINITE, 0)
++#  define XWAKE(c)       WakeAllConditionVariable(c)
++typedef HANDLE xthread;
++#else
++typedef pthread_cond_t xcond;
++static pthread_mutex_t s_xlock = PTHREAD_MUTEX_INITIALIZER;
++#  define XLOCK()        pthread_mutex_lock(&s_xlock)
++#  define XUNLOCK()      pthread_mutex_unlock(&s_xlock)
++#  define XCINIT(c)      pthread_cond_init((c), NULL)
++#  define XCDESTROY(c)   pthread_cond_destroy(c)
++#  define XWAIT(c)       pthread_cond_wait((c), &s_xlock)
++#  define XWAKE(c)       pthread_cond_broadcast(c)
++typedef pthread_t xthread;
++#endif
++
++/* One cellFiberPpuContextRun in progress, on the stack of the thread that called it. */
++typedef struct {
++    int   done;
++    s32   cause;
++    u32   from;                  /* the context that returned to the thread */
++    xcond cv;
++} XRun;
++
++typedef struct XCtx XCtx;
++struct XCtx {
++    XCtx*   next;                /* live list, or the free list once finalized */
++    u32     ea;                  /* the guest CellFiberPpuContext */
++    u32     opd;
++    u32     stack_ea;
++    u32     stack_size;
++    int     state;
++    int     go;                  /* the baton: this context may run */
++    int     kill;                /* Finalize: unwind and exit */
++    int     exited;              /* the host thread has left its body */
++    int     registered;          /* ctx is in the runtime's reservation set */
++    u32     from;                /* who resumed it last: a context, or 0 for a thread */
++    XRun*   run;                 /* the Run it executes for, while RUNNING */
++    xcond   cv;
++    xthread thread;
++    jmp_buf unwind;
++    ppu_context ctx;
++};
++
++static XCtx* s_xlive;
++static XCtx* s_xfree;
++static int   s_xthreads;         /* host threads that have not left their body */
++static PPU_THREAD_LOCAL XCtx* t_xcur;
++
++/* The runtime's lwarx/stwcx reservation set (ppu_loader.cpp): every context's ppu_context joins it, once per host
++ * record, so a store by another thread breaks a reservation the context holds. */
++extern void ppu_resv_register(ppu_context* c);
++
++static XCtx* find_xctx(u32 ea)   /* the lock is held */
++{
++    for (XCtx* c = s_xlive; c; c = c->next)
++        if (c->ea == ea) return c;
++    return NULL;
++}
++
++/* Gives the baton to `c` for `run`, resumed by `from` (0: a thread) on the PPU thread `owner`. The lock is held. */
++static void xctx_resume_locked(XCtx* c, XRun* run, u32 from, const ppu_context* owner)
++{
++    c->run  = run;
++    c->from = from;
++    if (owner) {
++        c->ctx.gpr[13]   = owner->gpr[13];
++        c->ctx.thread_id = owner->thread_id;
++    }
++    c->state = X_RUNNING;
++    c->go    = 1;
++    XWAKE(&c->cv);
++}
++
++/* `c` ends its turn: the thread blocked in Run gets `cause` back. The lock is held. */
++static void xctx_return_locked(XCtx* c, s32 cause)
++{
++    XRun* r = c->run;
++    c->run = NULL;
++    if (!r) return;
++    r->cause = cause;
++    r->from  = c->ea;
++    r->done  = 1;
++    XWAKE(&r->cv);
++}
++
++/* The calling context waits for the baton. The lock is held, and is held again on return; a Finalize meanwhile
++ * unwinds the host thread instead (the lock is released first). */
++static void xctx_suspend_locked(XCtx* c)
++{
++    while (!c->go && !c->kill) XWAIT(&c->cv);
++    if (c->kill) {
++        XUNLOCK();
++        longjmp(c->unwind, 1);
++    }
++    c->go = 0;
++}
++
++#ifdef _WIN32
++static DWORD WINAPI xctx_thread(LPVOID p)
++#else
++static void* xctx_thread(void* p)
++#endif
++{
++    XCtx* c = (XCtx*)p;
++#if defined(__APPLE__)
++    pthread_setname_np("ppu fiber context");
++#endif
++    t_xcur       = c;
++    g_active_ctx = &c->ctx;
++
++    XLOCK();
++    while (!c->go && !c->kill) XWAIT(&c->cv);
++    const int killed = c->kill;
++    c->go = 0;
++    XUNLOCK();
++
++    if (!killed && setjmp(c->unwind) == 0) {
++        c->ctx.gpr[4] = c->from;                  /* entry(arg, fiberFrom) */
++        if (g_ppu_thread_entry_trampoline)
++            g_ppu_thread_entry_trampoline(&c->ctx);
++        XLOCK();
++        c->state = X_ENDED;                       /* the entry returned */
++        xctx_return_locked(c, 0);
++        XUNLOCK();
++    }
++
++    XLOCK();
++    c->exited = 1;
++    s_xthreads--;
++    XWAKE(&c->cv);
++    XUNLOCK();
++#ifdef _WIN32
++    return 0;
++#else
++    return NULL;
++#endif
++}
++
++static int xctx_start_thread(XCtx* c)
++{
++#ifdef _WIN32
++    c->thread = CreateThread(NULL, XCTX_HOST_STACK, xctx_thread, c, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
++    return c->thread != NULL;
++#else
++    pthread_attr_t attr;
++    pthread_attr_init(&attr);
++    pthread_attr_setstacksize(&attr, XCTX_HOST_STACK);
++    int rc = pthread_create(&c->thread, &attr, xctx_thread, c);
++    if (rc) rc = pthread_create(&c->thread, NULL, xctx_thread, c);   /* the default stack, rather than nothing */
++    pthread_attr_destroy(&attr);
++    return rc == 0;
++#endif
++}
++
++static void xctx_join_thread(XCtx* c)
++{
++#ifdef _WIN32
++    WaitForSingleObject(c->thread, INFINITE);
++    CloseHandle(c->thread);
++#else
++    pthread_join(c->thread, NULL);
++#endif
++}
++
++int ps3_fiber_context_host_threads(void)
++{
++    XLOCK();
++    const int n = s_xthreads;
++    XUNLOCK();
++    return n;
++}
++
++s32 _cellFiberPpuContextAttributeInitialize(CellFiberPpuContextAttribute* attr, u32 sdkVersion)
++{
++    (void)sdkVersion;
++    const u32 ea = (u32)(uintptr_t)attr;
++    if (!ea) return (s32)CELL_FIBER_ERROR_NULL_POINTER;
++    if (ea % CELL_FIBER_PPU_CONTEXT_ATTRIBUTE_ALIGN) return (s32)CELL_FIBER_ERROR_ALIGN;
++    vm_memset(ea, 0, CELL_FIBER_PPU_CONTEXT_ATTRIBUTE_SIZE);   /* debuggerSupport false */
++    return CELL_OK;
++}
++
++s32 cellFiberPpuContextInitialize(CellFiberPpuContext* context, u32 entry, u64 arg, void* eaStack, u32 sizeStack,
++                                  const CellFiberPpuContextAttribute* attr)
++{
++    (void)attr;
++    const u32 ea       = (u32)(uintptr_t)context;
++    const u32 stack_ea = (u32)(uintptr_t)eaStack;
++    if (!ea || !entry || !stack_ea) return (s32)CELL_FIBER_ERROR_NULL_POINTER;
++    if (ea % CELL_FIBER_PPU_CONTEXT_ALIGN) return (s32)CELL_FIBER_ERROR_ALIGN;
++    if (sizeStack < XCTX_MIN_STACK) return (s32)CELL_FIBER_ERROR_INVAL;
++
++    XLOCK();
++    if (find_xctx(ea)) { XUNLOCK(); return (s32)CELL_FIBER_ERROR_STAT; }
++    XCtx* c = s_xfree;
++    if (c) {
++        s_xfree = c->next;
++    } else {
++        c = (XCtx*)calloc(1, sizeof *c);
++        if (!c) { XUNLOCK(); return (s32)CELL_FIBER_ERROR_NOMEM; }
++        XCINIT(&c->cv);
++    }
++    const int registered = c->registered;
++    xcond cv = c->cv;
++    memset(c, 0, sizeof *c);
++    c->cv         = cv;
++    c->registered = registered;
++    c->ea         = ea;
++    c->opd        = entry;
++    c->stack_ea   = stack_ea;
++    c->stack_size = sizeStack;
++    c->state      = X_READY;
++
++    /* The initialising thread's identity and FP state until a Run hands it the running thread's. */
++    const ppu_context* me = g_active_ctx;
++    c->ctx.gpr[1]    = (stack_ea + sizeStack - FIBER_STACK_TOP_PAD) & ~0xFull;
++    c->ctx.gpr[3]    = arg;
++    c->ctx.gpr[13]   = me ? me->gpr[13] : 0;
++    c->ctx.thread_id = me ? me->thread_id : FIBER_FALLBACK_THREAD_ID;
++    c->ctx.fpscr     = me ? me->fpscr : 0;
++    c->ctx.vscr      = me ? me->vscr : PPU_VSCR_NJ;
++    c->ctx.cia       = entry;
++    vm_write64((u32)c->ctx.gpr[1], 0);          /* the back chain ends here */
++
++    if (!xctx_start_thread(c)) {
++        c->next = s_xfree;
++        s_xfree = c;
++        XUNLOCK();
++        return (s32)CELL_FIBER_ERROR_AGAIN;
++    }
++    s_xthreads++;
++    c->next = s_xlive;
++    s_xlive = c;
++    const int join_resv = !c->registered;
++    c->registered = 1;
++    XUNLOCK();
++    if (join_resv) ppu_resv_register(&c->ctx);
++
++    static int s_logged = 0;
++    if (s_logged < 8) {
++        s_logged++;
++        fprintf(stderr, "[cellFiber] context 0x%08X: entry=0x%08X arg=0x%llX stack=0x%08X+0x%X\n",
++                ea, entry, (unsigned long long)arg, stack_ea, sizeStack);
++    }
++    return CELL_OK;
++}
++
++s32 cellFiberPpuContextFinalize(CellFiberPpuContext* context)
++{
++    const u32 ea = (u32)(uintptr_t)context;
++    if (!ea) return (s32)CELL_FIBER_ERROR_NULL_POINTER;
++    if (ea % CELL_FIBER_PPU_CONTEXT_ALIGN) return (s32)CELL_FIBER_ERROR_ALIGN;
++
++    XLOCK();
++    XCtx* c = find_xctx(ea);
++    if (!c) { XUNLOCK(); return (s32)CELL_FIBER_ERROR_INVAL; }
++    if (c->state == X_RUNNING) { XUNLOCK(); return (s32)CELL_FIBER_ERROR_STAT; }
++    for (XCtx** pc = &s_xlive; *pc; pc = &(*pc)->next)
++        if (*pc == c) { *pc = c->next; break; }
++    c->kill = 1;
++    XWAKE(&c->cv);
++    while (!c->exited) XWAIT(&c->cv);
++    XUNLOCK();
++
++    xctx_join_thread(c);
++
++    XLOCK();
++    c->next = s_xfree;
++    s_xfree = c;
++    XUNLOCK();
++    return CELL_OK;
++}
++
++s32 cellFiberPpuContextRun(CellFiberPpuContext* context, s32* cause, CellFiberPpuContext** fiberFrom,
++                           const CellFiberPpuContextExecutionOption* option)
++{
++    (void)option;
++    const u32 ea = (u32)(uintptr_t)context;
++    if (!ea || !cause) return (s32)CELL_FIBER_ERROR_NULL_POINTER;
++    if (ea % CELL_FIBER_PPU_CONTEXT_ALIGN) return (s32)CELL_FIBER_ERROR_ALIGN;
++    if (t_xcur || t_cur) return (s32)CELL_FIBER_ERROR_PERM;    /* threads only */
++
++    XLOCK();
++    XCtx* c = find_xctx(ea);
++    if (!c) { XUNLOCK(); return (s32)CELL_FIBER_ERROR_INVAL; }
++    if (c->state == X_RUNNING || c->state == X_ENDED) { XUNLOCK(); return (s32)CELL_FIBER_ERROR_STAT; }
++    XRun r;
++    memset(&r, 0, sizeof r);
++    XCINIT(&r.cv);
++    xctx_resume_locked(c, &r, 0, g_active_ctx);
++    while (!r.done) XWAIT(&r.cv);
++    XUNLOCK();
++    XCDESTROY(&r.cv);
++
++    vm_write32((u32)(uintptr_t)cause, (u32)r.cause);
++    if (fiberFrom) vm_write32((u32)(uintptr_t)fiberFrom, r.from);
++    return CELL_OK;
++}
++
++s32 cellFiberPpuContextSwitch(CellFiberPpuContext* context, CellFiberPpuContext** fiberFrom,
++                              const CellFiberPpuContextExecutionOption* option)
++{
++    (void)option;
++    XCtx* me = t_xcur;
++    if (!me) return (s32)CELL_FIBER_ERROR_PERM;
++    const u32 ea = (u32)(uintptr_t)context;
++    if (!ea) return (s32)CELL_FIBER_ERROR_NULL_POINTER;
++    if (ea % CELL_FIBER_PPU_CONTEXT_ALIGN) return (s32)CELL_FIBER_ERROR_ALIGN;
++
++    XLOCK();
++    XCtx* to = find_xctx(ea);
++    if (!to) { XUNLOCK(); return (s32)CELL_FIBER_ERROR_INVAL; }
++    if (to == me || to->state == X_RUNNING || to->state == X_ENDED) { XUNLOCK(); return (s32)CELL_FIBER_ERROR_STAT; }
++    XRun* run = me->run;
++    me->run   = NULL;
++    me->state = X_SUSPENDED;
++    xctx_resume_locked(to, run, me->ea, &me->ctx);
++    xctx_suspend_locked(me);
++    const u32 from = me->from;
++    XUNLOCK();
++
++    if (fiberFrom) vm_write32((u32)(uintptr_t)fiberFrom, from);
++    return CELL_OK;
++}
++
++s32 cellFiberPpuContextReturnToThread(s32 cause)
++{
++    XCtx* me = t_xcur;
++    if (!me) return (s32)CELL_FIBER_ERROR_PERM;
++    XLOCK();
++    me->state = X_SUSPENDED;
++    xctx_return_locked(me, cause);
++    xctx_suspend_locked(me);
++    XUNLOCK();
++    return CELL_OK;
++}
++
++s32 cellFiberPpuContextCheckStackLimit(void)
++{
++    const XCtx* me = t_xcur;
++    if (!me) return (s32)CELL_FIBER_ERROR_PERM;
++    const u64 sp = me->ctx.gpr[1];
++    if (sp < me->stack_ea || sp > (u64)me->stack_ea + me->stack_size) return (s32)CELL_FIBER_ERROR_STAT;
++    return CELL_OK;
++}
++
++CellFiberPpuContext* cellFiberPpuContextSelf(void)
++{
++    const XCtx* me = t_xcur;
++    return (CellFiberPpuContext*)(uintptr_t)(me ? me->ea : 0);
++}
+diff --git a/libs/spurs/cellFiber.h b/libs/spurs/cellFiber.h
+index be88d447..093d4308 100644
+--- a/libs/spurs/cellFiber.h
++++ b/libs/spurs/cellFiber.h
+@@ -8,6 +8,11 @@
+  * JoinFiber. Each fiber has its own guest stack (the caller's eaStack) and its
+  * own host stack: ucontext on POSIX, Windows fibers on Windows.
+  *
++ * Below the scheduler the SDK has fiber contexts (cellFiberPpuContext*): a PPU thread runs a context with
++ * cellFiberPpuContextRun, and it runs until it calls cellFiberPpuContextReturnToThread; contexts hand control to each
++ * other directly with cellFiberPpuContextSwitch. Each context runs on a host thread of its own, handed a baton so that
++ * only one of them, or the thread that ran them, executes at a time (see cellFiber.c).
++ *
+  * Every pointer argument is a guest address, like in the other HLE libraries; the
+  * structs are opaque to the host and only have the SDK's size and alignment.
+  */
+@@ -46,11 +51,18 @@ extern "C" {
+ #define CELL_FIBER_PPU_SIZE                       896
+ #define CELL_FIBER_PPU_SCHEDULER_ALIGN            128
+ #define CELL_FIBER_PPU_ALIGN                      128
++#define CELL_FIBER_PPU_CONTEXT_SIZE               640
++#define CELL_FIBER_PPU_CONTEXT_ALIGN              16
++#define CELL_FIBER_PPU_CONTEXT_ATTRIBUTE_SIZE     128
++#define CELL_FIBER_PPU_CONTEXT_ATTRIBUTE_ALIGN    8
+ 
+ typedef struct CellFiberPpuSchedulerAttribute CellFiberPpuSchedulerAttribute;
+ typedef struct CellFiberPpuAttribute          CellFiberPpuAttribute;
+ typedef struct CellFiberPpuScheduler          CellFiberPpuScheduler;
+ typedef struct CellFiberPpu                   CellFiberPpu;
++typedef struct CellFiberPpuContext            CellFiberPpuContext;
++typedef struct CellFiberPpuContextAttribute   CellFiberPpuContextAttribute;
++typedef struct CellFiberPpuContextExecutionOption CellFiberPpuContextExecutionOption;
+ 
+ /* ---------------------------------------------------------------------------
+  * API
+@@ -84,6 +96,37 @@ CellFiberPpu* cellFiberPpuSelf(void);
+ s32 cellFiberPpuSendSignal(CellFiberPpu* fiber, u32* numWorker);
+ s32 cellFiberPpuJoinFiber(CellFiberPpu* fiber, s32* status);
+ 
++/* ---------------------------------------------------------------------------
++ * Fiber contexts
++ * -----------------------------------------------------------------------*/
++
++s32 _cellFiberPpuContextAttributeInitialize(CellFiberPpuContextAttribute* attr, u32 sdkVersion);
++
++/* `entry` is the guest address of the entry's descriptor (OPD): void entry(u64 arg, CellFiberPpuContext* fiberFrom),
++ * where fiberFrom is the context that switched to it first, NULL when a thread ran it. `eaStack`/`sizeStack` are its
++ * guest stack. */
++s32 cellFiberPpuContextInitialize(CellFiberPpuContext* context, u32 entry, u64 arg, void* eaStack, u32 sizeStack,
++                                  const CellFiberPpuContextAttribute* attr);
++/* Frees a context that is not running; a suspended one is discarded where it stands. */
++s32 cellFiberPpuContextFinalize(CellFiberPpuContext* context);
++
++/* Called by a PPU thread (not a context): runs `context` until a context returns to the thread. Then *cause is the
++ * cause it passed and *fiberFrom (optional) the context that returned. */
++s32 cellFiberPpuContextRun(CellFiberPpuContext* context, s32* cause, CellFiberPpuContext** fiberFrom,
++                           const CellFiberPpuContextExecutionOption* option);
++
++/* Called by a context. Switch suspends it and resumes `context`; it returns when something resumes the caller, with
++ * *fiberFrom (optional) the context that switched back, NULL when a thread's Run resumed it. */
++s32 cellFiberPpuContextSwitch(CellFiberPpuContext* context, CellFiberPpuContext** fiberFrom,
++                              const CellFiberPpuContextExecutionOption* option);
++s32 cellFiberPpuContextReturnToThread(s32 cause);
++s32 cellFiberPpuContextCheckStackLimit(void);
++/* Guest address of the running context, 0 outside one. */
++CellFiberPpuContext* cellFiberPpuContextSelf(void);
++
++/* Not an SDK call: the host threads that contexts hold at the moment (diagnostics and tests). */
++int ps3_fiber_context_host_threads(void);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/libs/spurs/tests/test_fiber_context.c b/libs/spurs/tests/test_fiber_context.c
+new file mode 100644
+index 00000000..0bc5b759
+--- /dev/null
++++ b/libs/spurs/tests/test_fiber_context.c
+@@ -0,0 +1,643 @@
++/*
++ * ps3recomp - libs/spurs/tests/test_fiber_context.c
++ *
++ * cellFiberPpuContext*: the SDK's low-level PPU fiber contexts (libs/spurs/cellFiber.c). A PPU thread runs a context
++ * with cellFiberPpuContextRun; the context runs until it calls cellFiberPpuContextReturnToThread (or its entry
++ * returns), and contexts hand control to each other with cellFiberPpuContextSwitch. Each context runs on a host
++ * thread of its own, and exactly one of them, or the thread that ran them, executes at a time.
++ *
++ * What is checked:
++ *   1. Run returns to the thread when the entry returns; the entry starts with its argument in r3, NULL in r4 and r1
++ *      inside the guest stack it was given (16-byte aligned, back chain 0). An ended context cannot run again.
++ *   2. ReturnToThread hands a cause back to Run, and the next Run resumes the context after the call.
++ *   3. A -> B -> A with Switch: fiberFrom names the switcher, each context keeps its own guest registers and guest
++ *      stack across the switches, and a context resumed by Run sees fiberFrom NULL.
++ *   4. Self is the running context, NULL on the thread.
++ *   5. Guest thread identity: inside a context, thread_id and r13 (TLS) are those of the PPU thread that ran it, even
++ *      when a second thread runs it next. Host identity: it runs on a host thread of its own, whose thread-locals
++ *      start empty (the guest setjmp chain is one of them).
++ *   6. Finalize on a suspended, a never-run and an ended context frees its host thread without a deadlock.
++ *   7. The error codes: NULL_POINTER, ALIGN, INVAL, STAT and PERM, including Run and Finalize on a running context
++ *      from another host thread.
++ *   8. A switch round trip count, timed (printed for the record).
++ *
++ * With the argument "exit", the program leaves contexts suspended in ReturnToThread and in Switch, and one never
++ * run, and returns from main: the process must exit (the runner holds it to a timeout).
++ *
++ * The guest entry is a host function: the PPU thread trampoline finds it by the descriptor address in ctx->cia.
++ *
++ * Exit code 0 = pass.
++ */
++#include "cellFiber.h"
++#include "../../../runtime/syscalls/sys_ppu_thread.h"   /* ppu_context, ppu_thread_entry_fn */
++#include <pthread.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++#include <time.h>
++#include <unistd.h>
++
++/* ---------------------------------------------------------------------------
++ * Guest memory shim (as tests/fiber_switch)
++ * -----------------------------------------------------------------------*/
++#define GUEST_MEM_SIZE (1u * 1024u * 1024u)
++static uint8_t g_guest_mem[GUEST_MEM_SIZE];
++uint8_t* vm_base = g_guest_mem;
++
++uint32_t g_ww_lo = 0xFFFFFFFFu, g_ww_hi = 0;
++int      g_resv_store_active = 0;
++void ppu_resv_break_store(uint64_t ea) { (void)ea; }
++void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width) { (void)addr; (void)val; (void)width; }
++int  spu_coh_is_reserved(uint32_t addr) { (void)addr; return 0; }
++void spu_lockline_lock(void)   { }
++void spu_lockline_unlock(void) { }
++void spu_coh_notify_write(uint32_t addr) { (void)addr; }
++
++/* The reservation set the runtime keeps (ppu_loader.cpp): every context's ppu_context joins it once. */
++static ppu_context* g_resv[64];
++static int          g_resv_n;
++static pthread_mutex_t g_resv_lock = PTHREAD_MUTEX_INITIALIZER;
++void ppu_resv_register(ppu_context* c)
++{
++    pthread_mutex_lock(&g_resv_lock);
++    if (g_resv_n < 64) g_resv[g_resv_n] = c;
++    g_resv_n++;
++    pthread_mutex_unlock(&g_resv_lock);
++}
++
++static uint32_t g_bump = 4096;
++static uint32_t guest_alloc(uint32_t size, uint32_t align)
++{
++    g_bump = (g_bump + align - 1u) & ~(align - 1u);
++    uint32_t a = g_bump;
++    g_bump += size;
++    return a;
++}
++
++static uint32_t read_be32(uint32_t a)
++{
++    const uint8_t* p = g_guest_mem + a;
++    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
++}
++static uint64_t read_be64(uint32_t a) { return ((uint64_t)read_be32(a) << 32) | read_be32(a + 4); }
++static void write_be32(uint32_t a, uint32_t v)
++{
++    uint8_t* p = g_guest_mem + a;
++    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v;
++}
++
++/* ---------------------------------------------------------------------------
++ * PPU side
++ * -----------------------------------------------------------------------*/
++PPU_THREAD_LOCAL ppu_context* g_active_ctx;
++
++typedef void (*guest_fn)(ppu_context* ctx);
++#define ENTRY_BASE 0x1000u
++#define MAX_ENTRIES 32
++static guest_fn g_entries[MAX_ENTRIES];
++
++static uint32_t entry_of(guest_fn fn)
++{
++    for (uint32_t i = 0; i < MAX_ENTRIES; i++) {
++        if (g_entries[i] == fn) return ENTRY_BASE + i;
++        if (!g_entries[i]) { g_entries[i] = fn; return ENTRY_BASE + i; }
++    }
++    return 0;
++}
++
++static void trampoline(ppu_context* ctx)
++{
++    g_active_ctx = ctx;
++    g_entries[ctx->cia - ENTRY_BASE](ctx);
++}
++ppu_thread_entry_fn g_ppu_thread_entry_trampoline = trampoline;
++
++/* The PPU thread the tests run on: guest thread 5, TLS at 0x7000. */
++static ppu_context g_main_ctx;
++
++/* ---------------------------------------------------------------------------
++ * Bookkeeping
++ * -----------------------------------------------------------------------*/
++static int g_fails = 0;
++#define FAILF(...) do { g_fails++; fprintf(stderr, "[FAIL] "); \
++                        fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } while (0)
++#define CHECK(c) do { if (!(c)) FAILF("line %d: %s", __LINE__, #c); } while (0)
++#define CHECK_RC(call, want) do { s32 rc_ = (call); \
++    if (rc_ != (s32)(want)) FAILF("line %d: %s = 0x%08X, want 0x%08X", __LINE__, #call, (unsigned)rc_, (unsigned)(want)); \
++    } while (0)
++
++#define STACK_SIZE 0x4000u
++typedef struct { uint32_t ea, stack; } ctx_ref;
++#define CTX(r) ((CellFiberPpuContext*)(uintptr_t)(r).ea)
++#define GP(a)  ((void*)(uintptr_t)(a))
++
++static ctx_ref new_context(guest_fn fn, uint64_t arg)
++{
++    ctx_ref r;
++    r.ea    = guest_alloc(CELL_FIBER_PPU_CONTEXT_SIZE, CELL_FIBER_PPU_CONTEXT_ALIGN);
++    r.stack = guest_alloc(STACK_SIZE, 16);
++    uint32_t attr = guest_alloc(CELL_FIBER_PPU_CONTEXT_ATTRIBUTE_SIZE, 8);
++    CHECK_RC(_cellFiberPpuContextAttributeInitialize(GP(attr), 0x330000), CELL_OK);
++    CHECK_RC(cellFiberPpuContextInitialize(CTX(r), entry_of(fn), arg, GP(r.stack), STACK_SIZE, GP(attr)), CELL_OK);
++    return r;
++}
++
++/* Run from the test's PPU thread; returns the cause, fiberFrom in *from. */
++static s32 run(ctx_ref r, uint32_t* from)
++{
++    uint32_t cause = guest_alloc(4, 4), ff = guest_alloc(4, 4);
++    write_be32(cause, 0xDEADBEEFu);
++    write_be32(ff, 0xDEADBEEFu);
++    CHECK_RC(cellFiberPpuContextRun(CTX(r), GP(cause), GP(ff), NULL), CELL_OK);
++    if (from) *from = read_be32(ff);
++    return (s32)read_be32(cause);
++}
++
++static int wait_threads(int want)
++{
++    for (int i = 0; i < 2000; i++) {
++        if (ps3_fiber_context_host_threads() == want) return 1;
++        usleep(1000);
++    }
++    return 0;
++}
++
++/* ---------------------------------------------------------------------------
++ * Case 1: the entry returns
++ * -----------------------------------------------------------------------*/
++static ctx_ref c1;
++static uint64_t c1_r3, c1_r4, c1_r1, c1_chain;
++static int c1_ran;
++
++static void c1_entry(ppu_context* ctx)
++{
++    c1_ran++;
++    c1_r3 = ctx->gpr[3];
++    c1_r4 = ctx->gpr[4];
++    c1_r1 = ctx->gpr[1];
++    c1_chain = read_be64((uint32_t)ctx->gpr[1]);
++    CHECK(g_active_ctx == ctx && ctx != &g_main_ctx);
++}
++
++static void case_entry_returns(void)
++{
++    c1 = new_context(c1_entry, 0x1122334455667788ull);
++    uint32_t from = 0;
++    s32 cause = run(c1, &from);
++    CHECK(c1_ran == 1);
++    CHECK(cause == 0);
++    CHECK(from == c1.ea);
++    CHECK(c1_r3 == 0x1122334455667788ull);
++    CHECK(c1_r4 == 0);
++    CHECK(c1_r1 > c1.stack && c1_r1 < c1.stack + STACK_SIZE && (c1_r1 & 0xF) == 0);
++    CHECK(c1_chain == 0);
++    /* an ended context does not run again */
++    uint32_t cs = guest_alloc(4, 4);
++    CHECK_RC(cellFiberPpuContextRun(CTX(c1), GP(cs), NULL, NULL), CELL_FIBER_ERROR_STAT);
++    CHECK(c1_ran == 1);
++    CHECK_RC(cellFiberPpuContextFinalize(CTX(c1)), CELL_OK);
++    CHECK(wait_threads(0));
++    printf("[case entry-returns] ok\n");
++}
++
++/* ---------------------------------------------------------------------------
++ * Case 2: ReturnToThread and resume
++ * -----------------------------------------------------------------------*/
++static int c2_steps;
++
++static void c2_entry(ppu_context* ctx)
++{
++    for (int i = 0; i < 5; i++) {
++        c2_steps++;
++        CHECK_RC(cellFiberPpuContextReturnToThread(100 + i), CELL_OK);
++        CHECK(g_active_ctx == ctx);
++    }
++    c2_steps = 1000;
++}
++
++static void case_return_to_thread(void)
++{
++    c2_steps = 0;
++    ctx_ref r = new_context(c2_entry, 0);
++    for (int i = 0; i < 5; i++) {
++        uint32_t from = 0;
++        s32 cause = run(r, &from);
++        CHECK(cause == 100 + i);
++        CHECK(from == r.ea);
++        CHECK(c2_steps == i + 1);
++    }
++    s32 cause = run(r, NULL);   /* the loop ends and the entry returns */
++    CHECK(cause == 0);
++    CHECK(c2_steps == 1000);
++    CHECK_RC(cellFiberPpuContextFinalize(CTX(r)), CELL_OK);
++    CHECK(wait_threads(0));
++    printf("[case return-to-thread] ok\n");
++}
++
++/* ---------------------------------------------------------------------------
++ * Case 3: A -> B -> A, registers and stacks
++ * -----------------------------------------------------------------------*/
++static ctx_ref ca, cb;
++static uint32_t a_from_after, b_r4, b_from_after_run;
++static int a_regs_ok, a_stack_ok, b_self_ok;
++
++static void fill_regs(ppu_context* ctx, uint64_t seed)
++{
++    for (int i = 14; i < 32; i++) ctx->gpr[i] = seed * 0x100000001ull + (uint64_t)i;
++    for (int i = 14; i < 32; i++) ctx->fpr[i] = (double)seed + i * 0.5;
++    ctx->cr = (uint32_t)seed;
++}
++static int regs_are(const ppu_context* ctx, uint64_t seed)
++{
++    for (int i = 14; i < 32; i++) if (ctx->gpr[i] != seed * 0x100000001ull + (uint64_t)i) return 0;
++    for (int i = 14; i < 32; i++) if (ctx->fpr[i] != (double)seed + i * 0.5) return 0;
++    return ctx->cr == (uint32_t)seed;
++}
++static void fill_stack(uint32_t sp, uint8_t seed)
++{
++    for (uint32_t k = 0; k < 256; k++) g_guest_mem[sp - 256 + k] = (uint8_t)(seed + k);
++}
++static int stack_is(uint32_t sp, uint8_t seed)
++{
++    for (uint32_t k = 0; k < 256; k++) if (g_guest_mem[sp - 256 + k] != (uint8_t)(seed + k)) return 0;
++    return 1;
++}
++
++static void a_entry(ppu_context* ctx)
++{
++    fill_regs(ctx, 0xA);
++    fill_stack((uint32_t)ctx->gpr[1], 0x3A);
++    uint32_t ff = guest_alloc(4, 4);
++    CHECK_RC(cellFiberPpuContextSwitch(CTX(cb), GP(ff), NULL), CELL_OK);
++    a_from_after = read_be32(ff);
++    a_regs_ok  = regs_are(ctx, 0xA) && g_active_ctx == ctx;
++    a_stack_ok = stack_is((uint32_t)ctx->gpr[1], 0x3A);
++    CHECK((uint32_t)(uintptr_t)cellFiberPpuContextSelf() == ca.ea);
++    CHECK_RC(cellFiberPpuContextReturnToThread(1), CELL_OK);
++}
++
++static void b_entry(ppu_context* ctx)
++{
++    b_r4 = (uint32_t)ctx->gpr[4];
++    b_self_ok = (uint32_t)(uintptr_t)cellFiberPpuContextSelf() == cb.ea;
++    fill_regs(ctx, 0xB);
++    fill_stack((uint32_t)ctx->gpr[1], 0x3B);
++    uint32_t ff = guest_alloc(4, 4);
++    CHECK_RC(cellFiberPpuContextSwitch(CTX(ca), GP(ff), NULL), CELL_OK);
++    /* resumed by Run from the thread */
++    b_from_after_run = read_be32(ff);
++    CHECK(regs_are(ctx, 0xB) && stack_is((uint32_t)ctx->gpr[1], 0x3B));
++    CHECK_RC(cellFiberPpuContextReturnToThread(2), CELL_OK);
++}
++
++static void case_switch(void)
++{
++    ca = new_context(a_entry, 0xAAAA);
++    cb = new_context(b_entry, 0xBBBB);
++    uint32_t from = 0;
++    s32 cause = run(ca, &from);
++    CHECK(cause == 1 && from == ca.ea);
++    CHECK(b_r4 == ca.ea);          /* B started by A's switch: fiberFrom is A */
++    CHECK(b_self_ok);
++    CHECK(a_from_after == cb.ea);  /* A resumed by B's switch */
++    CHECK(a_regs_ok);
++    CHECK(a_stack_ok);
++    cause = run(cb, &from);
++    CHECK(cause == 2 && from == cb.ea);
++    CHECK(b_from_after_run == 0);  /* resumed by the thread */
++    CHECK_RC(cellFiberPpuContextFinalize(CTX(ca)), CELL_OK);
++    CHECK_RC(cellFiberPpuContextFinalize(CTX(cb)), CELL_OK);
++    CHECK(wait_threads(0));
++    printf("[case switch] ok\n");
++}
++
++/* ---------------------------------------------------------------------------
++ * Case 4/5: Self, guest and host thread identity
++ * -----------------------------------------------------------------------*/
++static __thread int t_marker;
++static pthread_t g_main_host;
++static uint64_t id_tid, id_r13;
++static int id_other_host, id_marker;
++static uint32_t id_self;
++
++static void id_entry(ppu_context* ctx)
++{
++    for (;;) {
++        id_tid = ctx->thread_id;
++        id_r13 = ctx->gpr[13];
++        id_other_host = !pthread_equal(pthread_self(), g_main_host);
++        id_marker = t_marker;
++        id_self = (uint32_t)(uintptr_t)cellFiberPpuContextSelf();
++        CHECK_RC(cellFiberPpuContextReturnToThread(0), CELL_OK);
++    }
++}
++
++static ctx_ref g_id_ctx;
++static void* second_owner(void* p)
++{
++    (void)p;
++    ppu_context mine;
++    memset(&mine, 0, sizeof mine);
++    mine.thread_id = 9;
++    mine.gpr[13] = 0x9000;
++    g_active_ctx = &mine;
++    run(g_id_ctx, NULL);
++    g_active_ctx = NULL;
++    return NULL;
++}
++
++static void case_identity(void)
++{
++    CHECK(cellFiberPpuContextSelf() == NULL);
++    t_marker = 42;
++    g_main_host = pthread_self();
++    g_id_ctx = new_context(id_entry, 0);
++    run(g_id_ctx, NULL);
++    CHECK(id_tid == 5 && id_r13 == 0x7000);
++    CHECK(id_other_host);
++    CHECK(id_marker == 0);
++    CHECK(id_self == g_id_ctx.ea);
++    pthread_t th;
++    pthread_create(&th, NULL, second_owner, NULL);
++    pthread_join(th, NULL);
++    CHECK(id_tid == 9 && id_r13 == 0x9000);
++    run(g_id_ctx, NULL);
++    CHECK(id_tid == 5 && id_r13 == 0x7000);
++    CHECK(cellFiberPpuContextSelf() == NULL);
++    /* the context's ppu_context joined the reservation set */
++    int found = 0;
++    for (int i = 0; i < g_resv_n && i < 64; i++) if (g_resv[i] && g_resv[i]->thread_id == 5) found = 1;
++    CHECK(found);
++    CHECK_RC(cellFiberPpuContextFinalize(CTX(g_id_ctx)), CELL_OK);
++    CHECK(wait_threads(0));
++    printf("[case identity] ok\n");
++}
++
++/* ---------------------------------------------------------------------------
++ * Case 6: Finalize frees host threads
++ * -----------------------------------------------------------------------*/
++static int fin_after;
++static void fin_entry(ppu_context* ctx)
++{
++    (void)ctx;
++    CHECK_RC(cellFiberPpuContextReturnToThread(3), CELL_OK);
++    fin_after++;               /* never reached: finalized while suspended */
++}
++static ctx_ref fin_b;
++static void fin_switch_entry(ppu_context* ctx)
++{
++    (void)ctx;
++    CHECK_RC(cellFiberPpuContextSwitch(CTX(fin_b), NULL, NULL), CELL_OK);
++    fin_after++;
++}
++
++static void case_finalize(void)
++{
++    fin_after = 0;
++    ctx_ref never = new_context(fin_entry, 0);
++    ctx_ref susp  = new_context(fin_entry, 0);
++    fin_b         = new_context(fin_entry, 0);
++    ctx_ref sw    = new_context(fin_switch_entry, 0);
++    CHECK(ps3_fiber_context_host_threads() == 4);
++    CHECK(run(susp, NULL) == 3);
++    CHECK(run(sw, NULL) == 3);         /* sw switched to fin_b, which returned to the thread */
++    CHECK_RC(cellFiberPpuContextFinalize(CTX(never)), CELL_OK);
++    CHECK_RC(cellFiberPpuContextFinalize(CTX(susp)), CELL_OK);
++    CHECK_RC(cellFiberPpuContextFinalize(CTX(sw)), CELL_OK);      /* suspended in Switch */
++    CHECK_RC(cellFiberPpuContextFinalize(CTX(fin_b)), CELL_OK);
++    CHECK(wait_threads(0));
++    CHECK(fin_after == 0);
++    /* finalized: unknown again, and the memory can hold a new context */
++    uint32_t cs = guest_alloc(4, 4);
++    CHECK_RC(cellFiberPpuContextRun(CTX(susp), GP(cs), NULL, NULL), CELL_FIBER_ERROR_INVAL);
++    CHECK_RC(cellFiberPpuContextFinalize(CTX(susp)), CELL_FIBER_ERROR_INVAL);
++    CHECK_RC(cellFiberPpuContextInitialize(CTX(susp), entry_of(fin_entry), 0, GP(susp.stack), STACK_SIZE, NULL),
++             CELL_OK);
++    CHECK(run(susp, NULL) == 3);
++    CHECK_RC(cellFiberPpuContextFinalize(CTX(susp)), CELL_OK);
++    /* many contexts in turn: the host records are reused, not one per Initialize */
++    int resv_before = g_resv_n;
++    for (int i = 0; i < 50; i++) {
++        CHECK_RC(cellFiberPpuContextInitialize(CTX(susp), entry_of(fin_entry), 0, GP(susp.stack), STACK_SIZE, NULL),
++                 CELL_OK);
++        CHECK(run(susp, NULL) == 3);
++        CHECK_RC(cellFiberPpuContextFinalize(CTX(susp)), CELL_OK);
++    }
++    CHECK(g_resv_n <= resv_before + 1);
++    CHECK(wait_threads(0));
++    printf("[case finalize] ok\n");
++}
++
++/* ---------------------------------------------------------------------------
++ * Case 7: error codes
++ * -----------------------------------------------------------------------*/
++static ctx_ref err_ctx, err_other;
++static s32 err_run_inside, err_switch_self, err_switch_unknown, err_switch_ended, err_fin_self;
++static s32 err_run_other_host, err_fin_other_host, err_stack_ok, err_stack_over;
++
++static void* poke_running(void* p)
++{
++    (void)p;
++    uint32_t cs = guest_alloc(4, 4);
++    err_run_other_host = cellFiberPpuContextRun(CTX(err_ctx), GP(cs), NULL, NULL);
++    err_fin_other_host = cellFiberPpuContextFinalize(CTX(err_ctx));
++    return NULL;
++}
++
++static void err_entry(ppu_context* ctx)
++{
++    uint32_t cs = guest_alloc(4, 4);
++    err_run_inside     = cellFiberPpuContextRun(CTX(err_other), GP(cs), NULL, NULL);
++    err_switch_self    = cellFiberPpuContextSwitch(CTX(err_ctx), NULL, NULL);
++    err_switch_unknown = cellFiberPpuContextSwitch(GP(guest_alloc(CELL_FIBER_PPU_CONTEXT_SIZE, 16)), NULL, NULL);
++    err_switch_ended   = cellFiberPpuContextSwitch(CTX(c1), NULL, NULL);   /* finalized in case 1: unknown */
++    err_fin_self       = cellFiberPpuContextFinalize(CTX(err_ctx));
++    pthread_t th;
++    pthread_create(&th, NULL, poke_running, NULL);
++    pthread_join(th, NULL);
++    err_stack_ok = cellFiberPpuContextCheckStackLimit();
++    uint64_t sp = ctx->gpr[1];
++    ctx->gpr[1] = err_ctx.stack - 0x10;                    /* below the stack: overflowed */
++    err_stack_over = cellFiberPpuContextCheckStackLimit();
++    ctx->gpr[1] = sp;
++}
++
++static void case_errors(void)
++{
++    const uint32_t stack = guest_alloc(STACK_SIZE, 16);
++    const uint32_t ctx   = guest_alloc(CELL_FIBER_PPU_CONTEXT_SIZE, 16);
++    const uint32_t attr  = guest_alloc(CELL_FIBER_PPU_CONTEXT_ATTRIBUTE_SIZE, 8);
++    const uint32_t e     = entry_of(fin_entry);
++
++    CHECK_RC(_cellFiberPpuContextAttributeInitialize(NULL, 0), CELL_FIBER_ERROR_NULL_POINTER);
++    CHECK_RC(_cellFiberPpuContextAttributeInitialize(GP(attr + 4), 0), CELL_FIBER_ERROR_ALIGN);
++    memset(g_guest_mem + attr, 0xFF, CELL_FIBER_PPU_CONTEXT_ATTRIBUTE_SIZE);
++    CHECK_RC(_cellFiberPpuContextAttributeInitialize(GP(attr), 0x330000), CELL_OK);
++    { int zero = 1; for (unsigned k = 0; k < CELL_FIBER_PPU_CONTEXT_ATTRIBUTE_SIZE; k++) if (g_guest_mem[attr + k]) zero = 0;
++      CHECK(zero); }
++
++    CHECK_RC(cellFiberPpuContextInitialize(NULL, e, 0, GP(stack), STACK_SIZE, NULL), CELL_FIBER_ERROR_NULL_POINTER);
++    CHECK_RC(cellFiberPpuContextInitialize(GP(ctx), 0, 0, GP(stack), STACK_SIZE, NULL), CELL_FIBER_ERROR_NULL_POINTER);
++    CHECK_RC(cellFiberPpuContextInitialize(GP(ctx), e, 0, NULL, STACK_SIZE, NULL), CELL_FIBER_ERROR_NULL_POINTER);
++    CHECK_RC(cellFiberPpuContextInitialize(GP(ctx + 8), e, 0, GP(stack), STACK_SIZE, NULL), CELL_FIBER_ERROR_ALIGN);
++    CHECK_RC(cellFiberPpuContextInitialize(GP(ctx), e, 0, GP(stack), 0x100, NULL), CELL_FIBER_ERROR_INVAL);
++    CHECK_RC(cellFiberPpuContextInitialize(GP(ctx), e, 0, GP(stack), STACK_SIZE, NULL), CELL_OK);
++    CHECK_RC(cellFiberPpuContextInitialize(GP(ctx), e, 0, GP(stack), STACK_SIZE, NULL), CELL_FIBER_ERROR_STAT);
++    CHECK_RC(cellFiberPpuContextFinalize(GP(ctx)), CELL_OK);
++
++    uint32_t cs = guest_alloc(4, 4);
++    CHECK_RC(cellFiberPpuContextRun(NULL, GP(cs), NULL, NULL), CELL_FIBER_ERROR_NULL_POINTER);
++    CHECK_RC(cellFiberPpuContextRun(GP(ctx), NULL, NULL, NULL), CELL_FIBER_ERROR_NULL_POINTER);
++    CHECK_RC(cellFiberPpuContextRun(GP(ctx + 4), GP(cs), NULL, NULL), CELL_FIBER_ERROR_ALIGN);
++    CHECK_RC(cellFiberPpuContextRun(GP(ctx), GP(cs), NULL, NULL), CELL_FIBER_ERROR_INVAL);   /* not initialized */
++    CHECK_RC(cellFiberPpuContextFinalize(NULL), CELL_FIBER_ERROR_NULL_POINTER);
++    CHECK_RC(cellFiberPpuContextFinalize(GP(ctx + 4)), CELL_FIBER_ERROR_ALIGN);
++    CHECK_RC(cellFiberPpuContextFinalize(GP(ctx)), CELL_FIBER_ERROR_INVAL);
++
++    /* calls that only a context may make */
++    CHECK_RC(cellFiberPpuContextSwitch(GP(ctx), NULL, NULL), CELL_FIBER_ERROR_PERM);
++    CHECK_RC(cellFiberPpuContextReturnToThread(0), CELL_FIBER_ERROR_PERM);
++    CHECK_RC(cellFiberPpuContextCheckStackLimit(), CELL_FIBER_ERROR_PERM);
++
++    err_ctx   = new_context(err_entry, 0);
++    err_other = new_context(fin_entry, 0);
++    CHECK(run(err_ctx, NULL) == 0);
++    CHECK((u32)err_run_inside     == CELL_FIBER_ERROR_PERM);
++    CHECK((u32)err_switch_self    == CELL_FIBER_ERROR_STAT);
++    CHECK((u32)err_switch_unknown == CELL_FIBER_ERROR_INVAL);
++    CHECK((u32)err_switch_ended   == CELL_FIBER_ERROR_INVAL);
++    CHECK((u32)err_fin_self       == CELL_FIBER_ERROR_STAT);
++    CHECK((u32)err_run_other_host == CELL_FIBER_ERROR_STAT);
++    CHECK((u32)err_fin_other_host == CELL_FIBER_ERROR_STAT);
++    CHECK(err_stack_ok == CELL_OK);
++    CHECK((u32)err_stack_over     == CELL_FIBER_ERROR_STAT);
++    /* a Switch to an ended context */
++    CHECK_RC(cellFiberPpuContextFinalize(CTX(err_ctx)), CELL_OK);
++    CHECK_RC(cellFiberPpuContextFinalize(CTX(err_other)), CELL_OK);
++    CHECK(wait_threads(0));
++    printf("[case errors] ok\n");
++}
++
++/* An ended context refuses a Switch with STAT. */
++static ctx_ref se_ended;
++static s32 se_rc;
++static void se_entry(ppu_context* ctx)
++{
++    (void)ctx;
++    se_rc = cellFiberPpuContextSwitch(CTX(se_ended), NULL, NULL);
++}
++static void noop_entry(ppu_context* ctx) { (void)ctx; }
++
++static void case_switch_ended(void)
++{
++    se_ended = new_context(noop_entry, 0);
++    CHECK(run(se_ended, NULL) == 0);
++    ctx_ref s = new_context(se_entry, 0);
++    CHECK(run(s, NULL) == 0);
++    CHECK((u32)se_rc == CELL_FIBER_ERROR_STAT);
++    CHECK_RC(cellFiberPpuContextFinalize(CTX(se_ended)), CELL_OK);
++    CHECK_RC(cellFiberPpuContextFinalize(CTX(s)), CELL_OK);
++    CHECK(wait_threads(0));
++    printf("[case switch-ended] ok\n");
++}
++
++/* ---------------------------------------------------------------------------
++ * Case 8: timing
++ * -----------------------------------------------------------------------*/
++#define ROUNDS 20000
++static void loop_entry(ppu_context* ctx)
++{
++    (void)ctx;
++    for (;;) cellFiberPpuContextReturnToThread(0);
++}
++static ctx_ref pp_a, pp_b;
++static void pp_a_entry(ppu_context* ctx)
++{
++    (void)ctx;
++    for (;;) cellFiberPpuContextSwitch(CTX(pp_b), NULL, NULL);
++}
++static int pp_n;
++static void pp_b_entry(ppu_context* ctx)
++{
++    (void)ctx;
++    for (;;) {
++        if (++pp_n == ROUNDS) cellFiberPpuContextReturnToThread(0);
++        cellFiberPpuContextSwitch(CTX(pp_a), NULL, NULL);
++    }
++}
++
++static double now_us(void)
++{
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return ts.tv_sec * 1e6 + ts.tv_nsec / 1e3;
++}
++
++static void case_timing(void)
++{
++    ctx_ref r = new_context(loop_entry, 0);
++    double t0 = now_us();
++    for (int i = 0; i < ROUNDS; i++) run(r, NULL);
++    double t1 = now_us();
++    pp_a = new_context(pp_a_entry, 0);
++    pp_b = new_context(pp_b_entry, 0);
++    pp_n = 0;
++    double t2 = now_us();
++    run(pp_a, NULL);
++    double t3 = now_us();
++    CHECK(pp_n == ROUNDS);
++    printf("[case timing] Run+ReturnToThread round trip %.2f us; Switch A->B->A %.2f us\n",
++           (t1 - t0) / ROUNDS, (t3 - t2) / ROUNDS);
++    CHECK_RC(cellFiberPpuContextFinalize(CTX(r)), CELL_OK);
++    CHECK_RC(cellFiberPpuContextFinalize(CTX(pp_a)), CELL_OK);
++    CHECK_RC(cellFiberPpuContextFinalize(CTX(pp_b)), CELL_OK);
++    CHECK(wait_threads(0));
++}
++
++/* ---------------------------------------------------------------------------
++ * "exit": leave contexts suspended and return from main
++ * -----------------------------------------------------------------------*/
++static ctx_ref ex_b;
++static void ex_switch_entry(ppu_context* ctx)
++{
++    (void)ctx;
++    cellFiberPpuContextSwitch(CTX(ex_b), NULL, NULL);
++}
++
++static int exit_with_suspended(void)
++{
++    ctx_ref a = new_context(loop_entry, 0);
++    ex_b = new_context(loop_entry, 0);
++    ctx_ref s = new_context(ex_switch_entry, 0);
++    (void)new_context(loop_entry, 0);              /* never run */
++    run(a, NULL);
++    run(s, NULL);                                  /* s suspended in Switch, ex_b in ReturnToThread */
++    printf("[exit] returning from main with %d context host threads\n", ps3_fiber_context_host_threads());
++    fflush(stdout);
++    return g_fails ? 1 : 0;
++}
++
++int main(int argc, char** argv)
++{
++    alarm(60);                                     /* a deadlock fails the run instead of hanging it */
++    memset(&g_main_ctx, 0, sizeof g_main_ctx);
++    g_main_ctx.thread_id = 5;
++    g_main_ctx.gpr[13] = 0x7000;
++    g_active_ctx = &g_main_ctx;
++    if (argc > 1 && strcmp(argv[1], "exit") == 0) return exit_with_suspended();
++
++    case_entry_returns();
++    case_return_to_thread();
++    case_switch();
++    case_identity();
++    case_finalize();
++    case_errors();
++    case_switch_ended();
++    case_timing();
++    if (g_fails) {
++        fprintf(stderr, "%d check(s) failed\n", g_fails);
++        return 1;
++    }
++    printf("PASS\n");
++    return 0;
++}
+diff --git a/tests/fiber_switch/main.c b/tests/fiber_switch/main.c
+index 804dfc1d..c3785f58 100644
+--- a/tests/fiber_switch/main.c
++++ b/tests/fiber_switch/main.c
+@@ -75,6 +75,8 @@ static uint32_t read_be32(uint32_t addr)
+  * The PPU thread side the library calls into
+  * -----------------------------------------------------------------------*/
+ PPU_THREAD_LOCAL ppu_context* g_active_ctx;
++/* The runtime's reservation set, which cellFiber.c's fiber contexts join (not used by this suite). */
++void ppu_resv_register(ppu_context* c) { (void)c; }
+ 
+ typedef int32_t (*guest_fn)(uint64_t arg);
+ #define ENTRY_BASE 0x1000u
+diff --git a/tools/test_cellfiber_ppu.py b/tools/test_cellfiber_ppu.py
+new file mode 100644
+index 00000000..53969d86
+--- /dev/null
++++ b/tools/test_cellfiber_ppu.py
+@@ -0,0 +1,70 @@
++#!/usr/bin/env python3
++"""cellFiber's PPU fibers (libs/spurs/cellFiber.c).
++
++Builds libs/spurs/tests/test_fiber_context.c, the cellFiberPpuContext* suite (Run,
++Switch, ReturnToThread, Self, Finalize, CheckStackLimit, the error codes), with
++cellFiber.c and runs it; then runs it again with "exit", which leaves contexts
++suspended and returns from main, under a timeout, so a process that cannot exit fails.
++It also builds and runs tests/fiber_switch, the scheduler API that shares the file.
++"""
++import os
++import shutil
++import subprocess
++import sys
++import tempfile
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++FLAGS = ['-std=gnu17', '-O1', '-g', '-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter',
++         '-Wno-deprecated-declarations', '-pthread']
++
++
++def build(cc, out, *sources, includes=()):
++    r = subprocess.run([cc, *FLAGS, *('-I' + str(ROOT / i) for i in includes),
++                        *(str(ROOT / s) for s in sources), '-o', str(out)],
++                       capture_output=True, text=True)
++    if r.returncode:
++        print(r.stdout + r.stderr)
++        print(f'FAIL: {out.name} did not build')
++    return r.returncode == 0
++
++
++def run(exe, *args, timeout):
++    try:
++        r = subprocess.run([str(exe), *args], capture_output=True, text=True, timeout=timeout)
++    except subprocess.TimeoutExpired as e:
++        out = (e.stdout or b'').decode() if isinstance(e.stdout, bytes) else (e.stdout or '')
++        print(out)
++        print(f'FAIL: {exe.name} {" ".join(args)} did not finish within {timeout} s')
++        return False
++    sys.stdout.write(r.stdout + r.stderr)
++    if r.returncode:
++        print(f'FAIL: {exe.name} {" ".join(args)} exited with {r.returncode}')
++    return r.returncode == 0
++
++
++def main():
++    if os.name == 'nt':
++        print('SKIP: the fixture uses pthreads; run on macOS/Linux')
++        return 0
++    cc = os.environ.get('CC') or shutil.which('cc') or shutil.which('clang') or shutil.which('gcc')
++    if not cc:
++        print('SKIP: no C compiler')
++        return 0
++    with tempfile.TemporaryDirectory() as tmp:
++        ctx = Path(tmp) / 'test_fiber_context'
++        sched = Path(tmp) / 'fiber_switch'
++        if not build(cc, ctx, 'libs/spurs/tests/test_fiber_context.c', 'libs/spurs/cellFiber.c',
++                     includes=('libs/spurs', 'include')):
++            return 1
++        if not build(cc, sched, 'tests/fiber_switch/main.c', 'libs/spurs/cellFiber.c',
++                     includes=('libs/spurs', 'include')):
++            return 1
++        ok = run(ctx, timeout=120)
++        ok = run(ctx, 'exit', timeout=20) and ok
++        ok = run(sched, timeout=120) and ok
++        return 0 if ok else 1
++
++
++if __name__ == '__main__':
++    sys.exit(main())
