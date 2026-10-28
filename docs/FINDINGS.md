@@ -190,11 +190,11 @@ lwmutex logged (20261028-012412, diagnostic build, since reverted):
 - Thread 1, GT6's main thread, holds that lock while it waits in `sys_lwcond_wait` on GT6's
   event object (func_00A5F3DC, from func_005A7FA4 via func_00735DC4). Every other guest thread
   is idle in an event queue, a condition or a sleep.
-- Nothing in the fiber implementation takes part: the context has thread 26's id, so the
-  lwmutex is genuinely owned by another thread, and the same order would deadlock on the
-  console. So the question is why the main thread is holding that lock while it waits, which
-  it presumably does not on the console: an earlier call path that differs, or timing. That is
-  the next bring-up round (BACKLOG).
+- The fiber's identity is correct: the context has thread 26's id, and the lwmutex's owner
+  stamp 1 was written by thread 1, so the lock is genuinely held by another thread. Whether the
+  console ever reaches this order is unknown; the likely cause is ordering or timing (an
+  earlier call path that differs, or a wait that ends sooner on the console). That is the next
+  bring-up round (BACKLOG).
 
 **Test evidence for patch 0011** (`tools/test_cellfiber_ppu.py`): a Run plus ReturnToThread
 round trip takes 5.6 µs and a Switch A -> B -> A 5.1 µs on the M4 Max (20,000 of each).

@@ -47,7 +47,9 @@ context, and CheckStackLimit with r1 outside the context's stack; INVAL for a
 guest stack under 1 KB; AGAIN when no host thread can be created. The
 execution option and the attribute contents are not used (AttributeInitialize
 zeroes the 128-byte attribute, as RPCS3 does). ps3_fiber_context_host_threads()
-(not an SDK call) counts the host threads contexts hold.
+(not an SDK call) counts the host threads contexts hold. A Run from a host
+thread with no PPU context, and a host thread created on the default stack
+(the 256 MB reservation refused), are logged once and each time.
 
 Why: titles that drive a coroutine with Run / ReturnToThread (one Run per
 frame is a typical pattern) stalled for good on the faked success, since the
@@ -56,8 +58,9 @@ work the context does never happened.
 Test: tools/test_cellfiber_ppu.py (new) builds libs/spurs/tests/
 test_fiber_context.c with cellFiber.c: the entry returning, ReturnToThread and
 resume, A->B->A switches keeping each context's registers and guest stack,
-Self, thread identity across two owner threads, host thread-locals starting
-empty, Finalize of never-run, suspended (in ReturnToThread and in Switch) and
+Self, thread identity across two owner threads and a host thread with no PPU
+context (which gets 0x7FFF0000, not the last owner's id), host thread-locals
+starting empty, Finalize of never-run, suspended (in ReturnToThread and in Switch) and
 ended contexts with the host threads counted back to zero, every error code
 above (Run and Finalize on a running context from another host thread), and
 a timed round trip; then runs it with "exit" (contexts left suspended, main
@@ -65,7 +68,7 @@ returns) under a 20 s timeout, and runs tests/fiber_switch, whose main.c gains
 a ppu_resv_register stub.
 
 diff --git a/libs/spurs/cellFiber.c b/libs/spurs/cellFiber.c
-index 3673985c..64f89e18 100644
+index 3673985c..eb880b72 100644
 --- a/libs/spurs/cellFiber.c
 +++ b/libs/spurs/cellFiber.c
 @@ -8,6 +8,9 @@
@@ -86,7 +89,7 @@ index 3673985c..64f89e18 100644
  #include <stdio.h>
  #include <stdlib.h>
  #include <string.h>
-@@ -547,3 +551,400 @@ s32 cellFiberPpuJoinFiber(CellFiberPpu* fiber, s32* status)
+@@ -547,3 +551,421 @@ s32 cellFiberPpuJoinFiber(CellFiberPpu* fiber, s32* status)
      UNLOCK();
      return rc;
  }
@@ -127,7 +130,6 @@ index 3673985c..64f89e18 100644
 +
 +#define XCTX_HOST_STACK   (256u * 1024u * 1024u)   /* reserved, as for PPU threads (sys_ppu_thread.c) */
 +#define XCTX_MIN_STACK    0x400u
-+#define XCTX_FALLBACK_THREAD_ID 0x7FFF0000ull
 +
 +#ifdef _WIN32
 +typedef CONDITION_VARIABLE xcond;
@@ -203,6 +205,16 @@ index 3673985c..64f89e18 100644
 +    if (owner) {
 +        c->ctx.gpr[13]   = owner->gpr[13];
 +        c->ctx.thread_id = owner->thread_id;
++    } else {
++        /* Resumed by a host thread with no guest context: it gets no stale identity of an earlier owner. */
++        static int s_warned = 0;
++        if (!s_warned) {
++            s_warned = 1;
++            fprintf(stderr, "[cellFiber] context 0x%08X resumed with no PPU thread context; thread_id 0x%llX\n",
++                    c->ea, (unsigned long long)FIBER_FALLBACK_THREAD_ID);
++        }
++        c->ctx.gpr[13]   = 0;
++        c->ctx.thread_id = FIBER_FALLBACK_THREAD_ID;
 +    }
 +    c->state = X_RUNNING;
 +    c->go    = 1;
@@ -284,7 +296,12 @@ index 3673985c..64f89e18 100644
 +    pthread_attr_init(&attr);
 +    pthread_attr_setstacksize(&attr, XCTX_HOST_STACK);
 +    int rc = pthread_create(&c->thread, &attr, xctx_thread, c);
-+    if (rc) rc = pthread_create(&c->thread, NULL, xctx_thread, c);   /* the default stack, rather than nothing */
++    if (rc) {
++        /* The default stack, rather than nothing; a deep lifted call chain may then overflow it. */
++        fprintf(stderr, "[cellFiber] context 0x%08X: no %u MB host stack (error %d); using the default stack\n",
++                c->ea, XCTX_HOST_STACK >> 20, rc);
++        rc = pthread_create(&c->thread, NULL, xctx_thread, c);
++    }
 +    pthread_attr_destroy(&attr);
 +    return rc == 0;
 +#endif
@@ -338,11 +355,16 @@ index 3673985c..64f89e18 100644
 +        if (!c) { XUNLOCK(); return (s32)CELL_FIBER_ERROR_NOMEM; }
 +        XCINIT(&c->cv);
 +    }
-+    const int registered = c->registered;
-+    xcond cv = c->cv;
-+    memset(c, 0, sizeof *c);
-+    c->cv         = cv;
-+    c->registered = registered;
++    /* A reused record keeps its condition variable (it is never copied) and its place in the reservation set. */
++    c->next       = NULL;
++    c->go         = 0;
++    c->kill       = 0;
++    c->exited     = 0;
++    c->from       = 0;
++    c->run        = NULL;
++    memset(&c->thread, 0, sizeof c->thread);
++    memset(&c->unwind, 0, sizeof c->unwind);
++    memset(&c->ctx, 0, sizeof c->ctx);
 +    c->ea         = ea;
 +    c->opd        = entry;
 +    c->stack_ea   = stack_ea;
@@ -360,6 +382,11 @@ index 3673985c..64f89e18 100644
 +    c->ctx.cia       = entry;
 +    vm_write64((u32)c->ctx.gpr[1], 0);          /* the back chain ends here */
 +
++    /* Joins the reservation set before its host thread can run it (ppu_resv_register takes no lock). */
++    if (!c->registered) {
++        c->registered = 1;
++        ppu_resv_register(&c->ctx);
++    }
 +    if (!xctx_start_thread(c)) {
 +        c->next = s_xfree;
 +        s_xfree = c;
@@ -369,10 +396,7 @@ index 3673985c..64f89e18 100644
 +    s_xthreads++;
 +    c->next = s_xlive;
 +    s_xlive = c;
-+    const int join_resv = !c->registered;
-+    c->registered = 1;
 +    XUNLOCK();
-+    if (join_resv) ppu_resv_register(&c->ctx);
 +
 +    static int s_logged = 0;
 +    if (s_logged < 8) {
@@ -562,10 +586,10 @@ index be88d447..093d4308 100644
  #endif
 diff --git a/libs/spurs/tests/test_fiber_context.c b/libs/spurs/tests/test_fiber_context.c
 new file mode 100644
-index 00000000..0bc5b759
+index 00000000..192d1617
 --- /dev/null
 +++ b/libs/spurs/tests/test_fiber_context.c
-@@ -0,0 +1,643 @@
+@@ -0,0 +1,655 @@
 +/*
 + * ps3recomp - libs/spurs/tests/test_fiber_context.c
 + *
@@ -914,6 +938,15 @@ index 00000000..0bc5b759
 +    return NULL;
 +}
 +
++/* A host thread with no PPU thread context: the context must not keep the last owner's identity. */
++static void* no_owner(void* p)
++{
++    (void)p;
++    g_active_ctx = NULL;
++    run(g_id_ctx, NULL);
++    return NULL;
++}
++
 +static void case_identity(void)
 +{
 +    CHECK(cellFiberPpuContextSelf() == NULL);
@@ -929,6 +962,9 @@ index 00000000..0bc5b759
 +    pthread_create(&th, NULL, second_owner, NULL);
 +    pthread_join(th, NULL);
 +    CHECK(id_tid == 9 && id_r13 == 0x9000);
++    pthread_create(&th, NULL, no_owner, NULL);
++    pthread_join(th, NULL);
++    CHECK(id_tid == 0x7FFF0000ull && id_r13 == 0);   /* FIBER_FALLBACK_THREAD_ID, no TLS */
 +    run(g_id_ctx, NULL);
 +    CHECK(id_tid == 5 && id_r13 == 0x7000);
 +    CHECK(cellFiberPpuContextSelf() == NULL);
