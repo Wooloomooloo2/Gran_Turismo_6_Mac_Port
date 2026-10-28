@@ -5,6 +5,7 @@
 Usage:
     .venv/bin/python scripts/boot_game.py <tree> [--gt6 PATH] [--seconds N] [--idle N] [--window]
         [--until {flip,time}] [--frame-every N] [--frame-max N] [--png] [--prune]
+        [--press SECONDS:BUTTON ...]
 
 <tree> is the player's game folder ($GT6_TREE). It needs the play folder from
 prepare_play.py and the decrypted EMAIN.SELF.elf. The binary defaults to
@@ -34,6 +35,10 @@ clears and share of non-black pixels; a frame is "drawn" when it had at least on
 and more than 1% non-black pixels. --png converts the dumps to frames_png/*.png with sips;
 --prune then deletes all but the newest 10 runs.
 A process that exits by itself after a flip with no frame dumped is flip_no_frame too.
+--press S:BUTTON (repeatable; D40) presses a pad button S seconds after the game first polls
+the pad, through ps3recomp's PAD_SCRIPT (cellPad: held for 40 polls, about 0.4 s at GT6's
+rate). BUTTON is a CELL_PAD_CTRL_* name: cross, circle, triangle, square, start, select,
+up, down, left, right, l1, l2, l3, r1, r2, r3. report.json records them in "presses".
 The run is recorded in <tree>/play/prepare.json as "booted": <run>. A play folder an earlier
 run used is not clean (the game's first run changes it): the boot still runs, but warns,
 names the earlier run in report.json ("play_reused") and summary.md, and points at
@@ -123,6 +128,33 @@ def classify(returncode, timed_out, hung, keys, frames, until="flip"):
     if timed_out:
         return "timeout"
     return "exited"
+
+
+# CELL_PAD_CTRL_* as ps3recomp's PAD_SCRIPT packs them: (DIGITAL2 << 8) | DIGITAL1.
+PAD_BUTTONS = {
+    "select": 0x0001, "l3": 0x0002, "r3": 0x0004, "start": 0x0008,
+    "up": 0x0010, "right": 0x0020, "down": 0x0040, "left": 0x0080,
+    "l2": 0x0100, "r2": 0x0200, "l1": 0x0400, "r1": 0x0800,
+    "triangle": 0x1000, "circle": 0x2000, "cross": 0x4000, "square": 0x8000,
+}
+
+
+def parse_press(text):
+    """'<seconds>:<button>' -> (seconds, button name); ValueError if either is bad."""
+    sec, sep, name = text.partition(":")
+    name = name.strip().lower()
+    if not sep or name not in PAD_BUTTONS:
+        raise ValueError(f"--press wants SECONDS:BUTTON with BUTTON one of "
+                         f"{', '.join(sorted(PAD_BUTTONS))}, not {text!r}")
+    t = float(sec)
+    if not t >= 0:
+        raise ValueError(f"--press time must be 0 or more seconds, not {sec!r}")
+    return t, name
+
+
+def pad_script(presses):
+    """ps3recomp's PAD_SCRIPT value for [(seconds, button), ...], in time order."""
+    return ",".join(f"{t:g}:0x{PAD_BUTTONS[b]:04X}" for t, b in sorted(presses))
 
 
 def build_env(tree, run, headless, env, frame_every=60, frame_max=300):
@@ -508,14 +540,28 @@ def main(argv=None):
                     help="convert the dumped frames to frames_png/*.png (sips) for viewing")
     ap.add_argument("--prune", action="store_true",
                     help=f"after the run, delete all but the newest {PRUNE_KEEP} runs")
+    ap.add_argument("--press", action="append", default=[], metavar="SECONDS:BUTTON",
+                    help="press a pad button SECONDS after the game first polls the pad "
+                         "(repeatable), e.g. 480:cross")
     args = ap.parse_args(argv)
     if args.frame_every < 1 or args.frame_max < 0:
         ap.error("--frame-every must be at least 1 and --frame-max at least 0")
+    try:
+        presses = [parse_press(p) for p in args.press]
+    except ValueError as e:
+        ap.error(str(e))
+    env = {"PAD_SCRIPT": pad_script(presses)} if presses else None
     tree = Path(args.tree).expanduser()
     gt6 = Path(args.gt6) if args.gt6 else tree / GT6_REL
     rep = boot(gt6, tree, args.seconds, args.idle, headless=not args.window, until=args.until,
-               frame_every=args.frame_every, frame_max=args.frame_max)
+               frame_every=args.frame_every, frame_max=args.frame_max, env=env)
     run = Path(rep["run"])
+    if presses:
+        rep["presses"] = [{"seconds": t, "button": b} for t, b in sorted(presses)]
+        (run / "report.json").write_text(json.dumps(rep, indent=2) + "\n")
+        with open(run / "summary.md", "a") as f:
+            f.write("- Pad presses (seconds after the first pad poll): "
+                    + ", ".join(f"{t:g} s {b}" for t, b in sorted(presses)) + "\n")
     if args.png:
         rep["frames_png"] = to_png(run)
         (run / "report.json").write_text(json.dumps(rep, indent=2) + "\n")

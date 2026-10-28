@@ -376,3 +376,34 @@ def test_real_smoke(tmp_path):
     rep = boot_game.boot(gt6, Path(tree), seconds=60, idle=60)
     assert rep["outcome"] in boot_game.OUTCOMES
     assert (Path(rep["run"]) / "report.json").is_file()
+
+
+def test_parse_press_and_pad_script():
+    """--press S:BUTTON maps to ps3recomp's PAD_SCRIPT masks (CELL_PAD_CTRL_*, D40)."""
+    assert boot_game.parse_press("480:cross") == (480.0, "cross")
+    assert boot_game.parse_press("2.5:START") == (2.5, "start")
+    for bad in ("cross", "10:", "10:x", "-1:cross", "abc:cross"):
+        with pytest.raises(ValueError):
+            boot_game.parse_press(bad)
+    assert boot_game.pad_script([(30, "start"), (2.5, "cross")]) == "2.5:0x4000,30:0x0008"
+    # the masks are cellPad.h's: START is DIGITAL1 bit 3, CROSS DIGITAL2 bit 6
+    assert boot_game.PAD_BUTTONS["start"] == 1 << 3 and boot_game.PAD_BUTTONS["cross"] == 1 << 14
+    assert boot_game.PAD_BUTTONS["circle"] == 1 << 13 and boot_game.PAD_BUTTONS["select"] == 1
+
+
+def test_press_reaches_the_game_and_the_report(tree, tmp_path):
+    rc = boot_game.main([str(tree), "--gt6", str(fake("padenv", tmp_path)), "--until", "time",
+                         "--seconds", "2", "--press", "45:cross", "--press", "5:start"])
+    run = sorted((tree / "runs").iterdir())[-1]
+    assert rc == 0
+    assert "PAD_SCRIPT=5:0x0008,45:0x4000" in (run / "stdout.log").read_text()
+    rep = json.loads((run / "report.json").read_text())
+    assert rep["presses"] == [{"seconds": 5.0, "button": "start"}, {"seconds": 45.0, "button": "cross"}]
+    assert "Pad presses" in (run / "summary.md").read_text()
+
+
+def test_bad_press_is_a_usage_error(tree, tmp_path):
+    with pytest.raises(SystemExit) as e:
+        boot_game.main([str(tree), "--gt6", str(fake("padenv", tmp_path)), "--press", "5:jump"])
+    assert e.value.code == 2
+    assert not (tree / "runs").exists() or not any((tree / "runs").iterdir())

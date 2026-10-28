@@ -120,6 +120,9 @@ Options for long runs (D35):
   `report.json`).
 - `--png` copies the dumped frames to `frames_png/` as PNG (with macOS `sips`) for viewing.
 - `--prune` deletes all but the newest 10 runs in `$GT6_TREE/runs` after this one.
+- `--press SECONDS:BUTTON` (repeatable) presses a pad button that many seconds after the game
+  first polls the pad, e.g. `--press 480:cross` for GT6's "Installation complete." dialog.
+  Buttons: cross, circle, triangle, square, start, select, the d-pad, l1-l3, r1-r3 (D40).
 
 Each boot writes `$GT6_TREE/runs/<date-time>/` with `report.json` (outcome, frames, unresolved
 imports), `summary.md`, the logs, the dumped frames (`frames/frame_<present>.ppm`) and
