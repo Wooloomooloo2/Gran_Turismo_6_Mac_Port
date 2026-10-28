@@ -57,6 +57,8 @@ Dev tools: Homebrew `sdl2 spirv-cross` (D29). Suite: 2 ctest, 158 pytest with `G
 set (153 + 5 skipped without), 71 C++ cases (4 integration cases need `GT6_DISC_DIR`/`GT6_UPDATES_DIR`).
 Facts in `docs/FINDINGS.md`; decisions D1-D34.
 
+Milestone 3 (first menu) is in progress on `m3/first-menu` (Task 5 bring-up, FINDINGS "Bring-up log (milestone 3)"). As of batch 10: ps3recomp patches 0001-0041; decisions to D65. First boots need `--press 45:cross --press 75:cross` (the screen-adjust page, then the opening movie, which cannot play); runs ignore controllers paired with the Mac (D65, `--host-pad` to allow). The SPU fence stall is fixed (D64); the boot now stops on a page fault at ASCII "MDLO" (0x4D444C4F), a bad object pointer read in the frame loop. Deliberate test crashes leave no macOS crash report (D63).
+
 ## Next steps
 
 Milestone 3: reach the first menu. First: (1) capture what RPCS3 shows at the same point and
