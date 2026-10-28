@@ -170,6 +170,79 @@ def test_apply_verify_needs_every_patch_applied(tmp_path):
     assert p.returncode == 0, p.stderr
 
 
+def _series(tmp_path):
+    """A synthetic submodule (f.txt "a", g.txt "x") and three patches: 0001 a->b, 0002 b->c
+    (rewrites 0001's line), 0003 x->y on another file."""
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    subprocess.run(["git", "init", "-q", str(sub)], check=True)
+    (sub / "f.txt").write_text("a\n")
+    (sub / "g.txt").write_text("x\n1\n2\n3\n")
+    patches = tmp_path / "patches"
+    patches.mkdir()
+    hdr = "Upstream: not yet submitted\n"
+    (patches / "0001-ab.patch").write_text(
+        hdr + "diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-a\n+b\n")
+    (patches / "0002-bc.patch").write_text(
+        hdr + "diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-b\n+c\n")
+    (patches / "0003-xy.patch").write_text(
+        hdr + "diff --git a/g.txt b/g.txt\n--- a/g.txt\n+++ b/g.txt\n@@ -1,4 +1,5 @@\n"
+              "-x\n+y\n+z\n 1\n 2\n 3\n")
+    env = dict(os.environ, GT6_PS3RECOMP_PATCHES=str(patches), GT6_PS3RECOMP_DIR=str(sub))
+    return sub, env
+
+
+def _apply(env, *args):
+    return subprocess.run(["bash", str(APPLY), *args], capture_output=True, text=True, env=env)
+
+
+def test_apply_walk_rewrite_and_prefix(tmp_path):
+    sub, env = _series(tmp_path)
+    (sub / "f.txt").write_text("b\n")                  # 0001 in, 0002 and 0003 not
+    p = _apply(env, "--verify")
+    assert p.returncode != 0 and "already applied: 0001-ab.patch" in p.stdout
+    assert "0002-bc.patch is not applied" in p.stderr and "0003-xy.patch is not applied" in p.stderr
+    assert _apply(env).returncode == 0
+    assert (sub / "f.txt").read_text() == "c\n"        # 0002 rewrote 0001's line
+    p = _apply(env, "--verify")
+    assert p.returncode == 0, p.stderr
+    assert p.stdout.count("already applied") == 3
+
+
+def test_apply_walk_out_of_order(tmp_path):
+    sub, env = _series(tmp_path)
+    (sub / "g.txt").write_text("y\nz\n1\n2\n3\n")          # 0003 in, 0001 and 0002 not
+    p = _apply(env, "--verify")
+    assert p.returncode != 0 and "0003-xy.patch is applied but an earlier patch is not" in p.stderr
+
+
+def test_apply_walk_names_a_half_applied_patch(tmp_path):
+    """m2: with 0001 and 0002 in and 0003 half in, the message names 0003, not 0001."""
+    sub, env = _series(tmp_path)
+    (sub / "f.txt").write_text("c\n")
+    (sub / "g.txt").write_text("y\n1\n2\n3\n")              # 0003's "+z" line missing
+    for args in (("--verify",), ("--check",), ()):
+        p = _apply(env, *args)
+        assert p.returncode != 0
+        assert "cannot verify 0001-ab.patch..0002-bc.patch: 0003-xy.patch is partly applied" \
+            in p.stderr, p.stderr
+    assert (sub / "g.txt").read_text() == "y\n1\n2\n3\n"     # nothing changed
+
+
+def test_apply_walk_with_tmpdir_inside_a_work_tree(tmp_path):
+    """m1: a TMPDIR inside another repository must not make every check pass vacuously."""
+    sub, env = _series(tmp_path)
+    outer = tmp_path / "outer"
+    (outer / "tmp").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(outer)], check=True)
+    env["TMPDIR"] = str(outer / "tmp")
+    p = _apply(env, "--verify")
+    assert p.returncode != 0 and "already applied" not in p.stdout, p.stdout
+    assert _apply(env).returncode == 0
+    assert (sub / "f.txt").read_text() == "c\n"
+    assert _apply(env, "--verify").returncode == 0
+
+
 def test_patches_apply_check():
     p = subprocess.run(["bash", str(APPLY), "--check"], capture_output=True, text=True)
     assert p.returncode == 0, p.stdout + p.stderr

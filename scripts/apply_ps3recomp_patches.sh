@@ -50,8 +50,12 @@ n=${#all[@]}
 scratch="$(mktemp -d "${TMPDIR:-/tmp}/ps3recomp-patches-XXXXXX")"
 trap 'rm -rf "$scratch"' EXIT
 # Copy the files the series touches (from its ---/+++ headers) from the submodule to $1.
+# The copy is a git repository of its own: git apply run inside a folder that is part of
+# another work tree (a TMPDIR inside a repository) reads the patch paths relative to that
+# tree's root, ignores them, and every --check passes without testing anything.
 copy_touched() {
   mkdir -p "$1"
+  git init -q "$1"
   for p in "${all[@]}"; do
     sed -n -e 's|^--- a/\([^[:space:]]*\).*$|\1|p' -e 's|^+++ b/\([^[:space:]]*\).*$|\1|p' "$p"
   done | sort -u | while IFS= read -r f; do
@@ -63,17 +67,40 @@ copy_touched() {
 }
 copy_touched "$scratch/tree"
 applied=()
+unclear=-1   # the last patch that neither reverses nor applies where the walk reached it
 for ((i = n - 1; i >= 0; i--)); do
   if (cd "$scratch/tree" && git apply --reverse --check "${all[$i]}" 2>/dev/null); then
     (cd "$scratch/tree" && git apply --reverse --whitespace=nowarn "${all[$i]}")
     applied[$i]=1
   else
     applied[$i]=0
+    if [ "$unclear" -lt 0 ] && ! (cd "$scratch/tree" && git apply --check "${all[$i]}" 2>/dev/null); then
+      unclear=$i
+    fi
   fi
 done
 k=0
 while [ "$k" -lt "$n" ] && [ "${applied[$k]}" = 1 ]; do k=$((k + 1)); done
 failed=0
+# The first patch not in must apply to the tree as it is. If it does not, a patch is partly
+# applied or the files were edited, and the walk could not see past it: name that patch
+# (the last one that neither reversed nor applied), not the first of the series.
+if [ "$k" -lt "$n" ]; then
+  rm -rf "$scratch/first"
+  copy_touched "$scratch/first"
+  if ! (cd "$scratch/first" && git apply --check "${all[$k]}" 2>/dev/null); then
+    bad=$k
+    [ "$unclear" -ge "$k" ] && bad=$unclear
+    if [ "$bad" -gt 0 ]; then
+      echo "error: cannot verify $(basename "${all[0]}")..$(basename "${all[$((bad - 1))]}"):" \
+           "$(basename "${all[$bad]}") is partly applied, or the files it touches were edited" >&2
+    else
+      echo "error: $(basename "${all[$bad]}") is partly applied, or the files it touches were" \
+           "edited: it neither applies to $sub nor is already applied" >&2
+    fi
+    exit 1
+  fi
+fi
 for ((i = k; i < n; i++)); do
   if [ "${applied[$i]}" = 1 ]; then
     echo "error: $(basename "${all[$i]}") is applied but an earlier patch is not" >&2
