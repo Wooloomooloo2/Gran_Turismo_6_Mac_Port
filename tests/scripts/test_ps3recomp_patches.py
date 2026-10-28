@@ -88,6 +88,7 @@ def test_runners_found():
     assert "tools/test_exitspawn.py" in found   # patch 0019
     assert "tools/test_event_queue_destroy.py" in found   # patch 0021
     assert "tools/test_game_category.py" in found   # patch 0022
+    assert "tools/test_ppu_fs_imports.py" in found   # patches 0020, 0023
 
 
 @pytest.mark.parametrize("runner", runners())

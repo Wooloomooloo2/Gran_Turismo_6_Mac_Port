@@ -1,0 +1,125 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] cellFs: cellFsFtruncate on runtime/ppu/ppu_fs.cpp's own file descriptors
+
+Upstream: not yet submitted; written to be upstreamed (generic, no title names)
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0022)
+
+What: cellFsOpen and the other descriptor calls are registered by
+runtime/ppu/ppu_fs.cpp, but cellFsFtruncate (0x0E2939E5) was only
+libs/filesystem/cellFs.c's, whose own descriptor table never holds the fds
+ppu_fs hands out. Every ftruncate answered CELL_EBADF and changed nothing.
+ppu_fs now registers cellFsFtruncate on its fds, as lv2's sys_fs_ftruncate
+behaves under RPCS3 (behaviour only; no RPCS3 code): CELL_EBADF for an fd
+that is not open or not open for writing, else the file is cut or grown with
+zeros to the size (CELL_EIO if the host refuses).
+
+Why: a title that sizes a database file with ftruncate after creating it
+treated the EBADF as a full disk and stopped with its "insufficient free
+space" error.
+
+Test: runtime/ppu/tests/test_fs_imports.cpp (run by
+tools/test_ppu_fs_imports.py) opens a scratch /dev_hdd0 file for writing,
+grows it to 8 MB, cuts it to 100 bytes, and checks EBADF for the closed fd
+and for a read-only one.
+
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+index b96e688..abf5255 100644
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -997,6 +997,34 @@ static void cellFsGetFreeSize(ppu_context* ctx)
+     if (fb) vm_write64(fb, (32ULL << 30) / 4096);
+     ctx->gpr[3] = CELL_OK;
+ }
++/* cellFsFtruncate(fd, size): the fds are this file's, so the call must be too. It was only
++ * cellFs.c's, whose own table never holds these fds, so every call answered EBADF; GT6 then
++ * stopped its first boot after the install with "Insufficient free space on HDD" when it
++ * sized its user database. As lv2 (RPCS3's sys_fs_ftruncate): EBADF for a file that is not
++ * open or not open for writing; the file grows with zeros or is cut. */
++static void cellFsFtruncate(ppu_context* ctx)
++{
++    const int fd = (int)(uint32_t)ctx->gpr[3];
++    const uint64_t size = ctx->gpr[4];
++    FILE* f = fd_file(fd);
++    const uint32_t acc = f ? (g_fd_flags[fd] & 0x3) : 0;
++    int32_t rc = CELL_OK;
++    if (!f || acc == CELL_FS_O_RDONLY) {
++        rc = CELL_FS_EBADF;
++    } else {
++        std::lock_guard<std::mutex> hold(g_fd_lock);
++        fflush(f);
++#ifdef _WIN32
++        const int bad = _chsize_s(_fileno(f), (long long)size) != 0;
++#else
++        const int bad = ftruncate(fileno(f), (off_t)size) != 0;
++#endif
++        if (bad) rc = CELL_FS_EIO;
++    }
++    if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] ftruncate fd=%d size=%llu -> 0x%08X\n", fd,
++                                     (unsigned long long)size, (uint32_t)rc);
++    ctx->gpr[3] = (uint64_t)(int64_t)rc;
++}
+ static void cellFsChmod(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }   /* host ignores PS3 mode bits */
+ static void cellFsUtime(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }   /* timestamps are not modelled */
+ /* SDATA opened from an already-open fd is not implemented: fail visibly rather
+@@ -1178,6 +1206,7 @@ extern "C" void ppu_fs_register(void)
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsGetFreeSize"),   "cellFsGetFreeSize",   cellFsGetFreeSize);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsChmod"),         "cellFsChmod",         cellFsChmod);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsUtime"),         "cellFsUtime",         cellFsUtime);
++    ps3_hle_register_ctx(ps3_compute_nid("cellFsFtruncate"),     "cellFsFtruncate",     cellFsFtruncate);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsSdataOpenByFd"), "cellFsSdataOpenByFd", cellFsSdataOpenByFd);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsAllocateFileAreaWithoutZeroFill"),
+                          "cellFsAllocateFileAreaWithoutZeroFill", cellFsAllocateFileAreaWithoutZeroFill);
+diff --git a/runtime/ppu/tests/test_fs_imports.cpp b/runtime/ppu/tests/test_fs_imports.cpp
+index 402fa5c..1b8ca10 100644
+--- a/runtime/ppu/tests/test_fs_imports.cpp
++++ b/runtime/ppu/tests/test_fs_imports.cpp
+@@ -93,6 +93,48 @@ int main()
+         CHECK(fb != 0 && fb != 0xEEEEEEEEEEEEEEEEull, "cellFsGetFreeSize free_block_count = %llu",
+               (unsigned long long)fb);
+     }
++    /* cellFsFtruncate on this layer's own fds: grows, cuts, refuses a read-only or closed fd. */
++    {
++        char root[512];
++        const char* tmp = getenv("TMPDIR");
++        snprintf(root, sizeof root, "%s/ps3recomp-fs-ftrunc-XXXXXX", tmp && *tmp ? tmp : "/tmp");
++        const bool made = mkdtemp(root) != nullptr;
++        CHECK(made, "scratch folder (ftruncate)");
++        setenv("PS3_HDD0_ROOT", root, 1);
++        auto op = find(ps3_compute_nid("cellFsOpen")), cl = find(ps3_compute_nid("cellFsClose")),
++             ft = find(ps3_compute_nid("cellFsFtruncate"));
++        CHECK(ft != nullptr, "cellFsFtruncate: handler registered (NID 0x%08X)", ps3_compute_nid("cellFsFtruncate"));
++        auto open_ = [&](const char* g, uint32_t flags) {
++            memset(&ctx, 0, sizeof ctx); strcpy((char*)mem + 0x300, g);
++            ctx.gpr[3] = 0x300; ctx.gpr[4] = flags; ctx.gpr[5] = 0x400; op(&ctx);
++            return std::make_pair((uint32_t)ctx.gpr[3], rd32(0x400));
++        };
++        auto trunc = [&](uint32_t fd, uint64_t size) {
++            memset(&ctx, 0, sizeof ctx); ctx.gpr[3] = fd; ctx.gpr[4] = size; ft(&ctx);
++            return (uint32_t)ctx.gpr[3];
++        };
++        if (op && cl && ft) {
++            char p[700]; struct stat st;
++            snprintf(p, sizeof p, "%s/db.dat", root);
++            auto o = open_("/dev_hdd0/db.dat", 0x2 | 0x40);   /* RDWR | CREAT */
++            CHECK(o.first == 0, "open for writing (0x%08X)", o.first);
++            uint32_t r = trunc(o.second, 8u << 20);
++            const bool grown = stat(p, &st) == 0 && st.st_size == (8 << 20);
++            CHECK(r == 0 && grown, "ftruncate grows the file to 8 MB (0x%08X)", r);
++            r = trunc(o.second, 100);
++            const bool cut = stat(p, &st) == 0 && st.st_size == 100;
++            CHECK(r == 0 && cut, "ftruncate cuts it to 100 bytes (0x%08X)", r);
++            memset(&ctx, 0, sizeof ctx); ctx.gpr[3] = o.second; cl(&ctx);
++            r = trunc(o.second, 0);
++            CHECK(r == 0x8001002Au, "ftruncate of a closed fd is EBADF (0x%08X)", r);
++            auto ro = open_("/dev_hdd0/db.dat", 0);       /* RDONLY */
++            r = trunc(ro.second, 0);
++            CHECK(ro.first == 0 && r == 0x8001002Au, "ftruncate of a read-only fd is EBADF (0x%08X)", r);
++            memset(&ctx, 0, sizeof ctx); ctx.gpr[3] = ro.second; cl(&ctx);
++            unlink(p);
++        }
++        rmdir(root);
++    }
+     struct { uint32_t nid; const char* name; uint32_t ret; } rets[] = {
+         {NID_CHMOD, "cellFsChmod", 0}, {NID_UTIME, "cellFsUtime", 0},
+         {NID_SDATAOPENBYFD, "cellFsSdataOpenByFd", 0x80010003u /* CELL_ENOSYS */}};
