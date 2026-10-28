@@ -48,8 +48,9 @@ guest stack under 1 KB; AGAIN when no host thread can be created. The
 execution option and the attribute contents are not used (AttributeInitialize
 zeroes the 128-byte attribute, as RPCS3 does). ps3_fiber_context_host_threads()
 (not an SDK call) counts the host threads contexts hold. A Run from a host
-thread with no PPU context, and a host thread created on the default stack
-(the 256 MB reservation refused), are logged once and each time.
+thread with no PPU context is logged the first time only; a host thread
+created on the default stack (the 256 MB reservation refused) is logged every
+time.
 
 Why: titles that drive a coroutine with Run / ReturnToThread (one Run per
 frame is a typical pattern) stalled for good on the faked success, since the
