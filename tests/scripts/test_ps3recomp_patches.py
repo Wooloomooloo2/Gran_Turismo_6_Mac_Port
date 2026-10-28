@@ -81,6 +81,7 @@ def test_runners_found():
     assert "tools/test_avconf_screen_size.py" in found   # patch 0012
     assert "tools/test_spurs_workload_flag.py" in found   # patch 0013
     assert "tools/test_usbd_extra_ldd.py" in found   # patch 0014
+    assert "tools/test_mempool_module_list.py" in found   # patch 0015
 
 
 @pytest.mark.parametrize("runner", runners())

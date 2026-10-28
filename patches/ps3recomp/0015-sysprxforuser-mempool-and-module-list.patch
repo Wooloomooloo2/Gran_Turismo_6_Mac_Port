@@ -1,0 +1,429 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] sysPrxForUser: memory pools and sys_prx_get_module_list
+
+Upstream: not yet submitted; written to be upstreamed (generic, no title names)
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0014)
+
+What: sys_mempool_create (0xCA9A60BF), sys_mempool_destroy (0x9D3C0F81),
+sys_mempool_free_block (0x608212FC), sys_mempool_try_allocate_block
+(0x05C65656), sys_mempool_allocate_block, sys_mempool_get_count and
+sys_prx_get_module_list (0xA5D06BF0) had no handler, so they took the
+unresolved path and faked CELL_OK with nothing written.
+
+Memory pools hand out fixed-size blocks carved from a chunk the caller owns.
+create checks its arguments (a zero block or one larger than the chunk, an
+alignment that is not a power of two, a chunk off 8 bytes: EINVAL), splits
+the chunk into chunk_size / block_size blocks and writes an id from 1. The
+free blocks are a stack: the chunk's last block is handed out first, a freed
+block next. allocate_block waits for a free block (a destroy wakes it with 0);
+try_allocate_block answers 0 when none is free; free_block refuses an address
+outside the chunk or an unknown pool (EINVAL); get_count gives the free
+count. Behaviour follows RPCS3 (its sys_mempool), with two additions: a zero
+block size is EINVAL (it divides by it) and free_block also refuses an
+address below the chunk.
+
+sys_prx_get_module_list lists the PRX modules loaded into the process. Every
+library here is HLE and no PRX is ever loaded (sys_prx_get_module_id_by_name
+already answers UNKNOWN_MODULE for every name), so the list is empty: count 0,
+max and the id list untouched; a NULL info or id list is EINVAL. This is
+RPCS3's liblv2 wrapper over _sys_prx_get_module_list with no PRX object.
+
+Why: a faked create left the caller's pool id unwritten, so every later block
+call named a pool that did not exist; the module list left its count as
+whatever the caller's stack held.
+
+Test: tools/test_mempool_module_list.py (new) checks the names hash to the
+imported NIDs, then builds libs/system/tests/test_mempool_module_list.c with
+sysPrxForUser.c: each error, the block order, an allocate that waits until a
+free from another thread, destroy, and the empty module list.
+
+diff --git a/libs/system/sysPrxForUser.c b/libs/system/sysPrxForUser.c
+index b2cba7b6..d9dcb293 100644
+--- a/libs/system/sysPrxForUser.c
++++ b/libs/system/sysPrxForUser.c
+@@ -1083,6 +1083,182 @@ s32 sys_prx_get_module_id_by_name(const char* name, u64 flags, u32* id)
+     return (s32)0x8001112E;   /* CELL_PRX_ERROR_UNKNOWN_MODULE */
+ }
+ 
++/* sys_prx_get_module_list(flags, info): the ids of the PRX modules loaded into
++ * the process, info = { u64 size; u32 max; u32 count; u32 idlist; }. Every
++ * library here is HLE and no PRX is ever loaded (sys_prx_get_module_id_by_name
++ * above knows no name either), so the list is empty: count 0, max and the id
++ * list untouched. Behaviour follows RPCS3 (its liblv2 wrapper over
++ * _sys_prx_get_module_list, which lists loaded PRX objects and hides
++ * liblv2.sprx): NULL info or a NULL id list is EINVAL. NID 0xA5D06BF0. */
++s32 sys_prx_get_module_list(u64 flags, void* info)
++{
++    (void)flags;
++    const u32 ea = (u32)(uintptr_t)info;
++    if (!ea || !vm_read32(ea + 0x10)) return (s32)CELL_EINVAL;
++    vm_write32(ea + 0x0C, 0);   /* count */
++    return CELL_OK;
++}
++
++/* ---------------------------------------------------------------------------
++ * Memory pools (sys_mempool_*): fixed-size blocks carved from a chunk the
++ * caller owns. Behaviour follows RPCS3: ids from 1; the free blocks are a
++ * stack (the chunk's last block is handed out first, a freed block next);
++ * allocate_block waits for a free block, try_allocate_block answers 0.
++ * -----------------------------------------------------------------------*/
++#define MAX_MEMPOOL 1023
++
++#ifdef _WIN32
++typedef SRWLOCK mp_mutex;
++typedef CONDITION_VARIABLE mp_cond;
++#  define MP_STATIC_MUTEX            SRWLOCK_INIT
++#  define mp_init(m, c)              (InitializeSRWLock(m), InitializeConditionVariable(c))
++#  define mp_fini(m, c)              ((void)(m), (void)(c))
++#  define mp_lock(m)                 AcquireSRWLockExclusive(m)
++#  define mp_unlock(m)               ReleaseSRWLockExclusive(m)
++#  define mp_wait(c, m)              SleepConditionVariableSRW((c), (m), INFINITE, 0)
++#  define mp_signal(c)               WakeConditionVariable(c)
++#  define mp_broadcast(c)            WakeAllConditionVariable(c)
++#else
++typedef pthread_mutex_t mp_mutex;
++typedef pthread_cond_t mp_cond;
++#  define MP_STATIC_MUTEX            PTHREAD_MUTEX_INITIALIZER
++#  define mp_init(m, c)              (pthread_mutex_init((m), NULL), pthread_cond_init((c), NULL))
++#  define mp_fini(m, c)              (pthread_mutex_destroy(m), pthread_cond_destroy(c))
++#  define mp_lock(m)                 pthread_mutex_lock(m)
++#  define mp_unlock(m)               pthread_mutex_unlock(m)
++#  define mp_wait(c, m)              pthread_cond_wait((c), (m))
++#  define mp_signal(c)               pthread_cond_signal(c)
++#  define mp_broadcast(c)            pthread_cond_broadcast(c)
++#endif
++
++typedef struct {
++    u32  chunk, chunk_size, block_size, alignment;
++    u32* free_blocks;
++    u32  nfree, cap;
++    int  dead;
++    mp_mutex mtx;
++    mp_cond  cv;
++} MemPool;
++
++static MemPool* s_mempool[MAX_MEMPOOL];
++static mp_mutex s_mempool_lock = MP_STATIC_MUTEX;
++
++/* The pool, locked; NULL if the id is not a live pool. */
++static MemPool* mempool_get(u32 id)
++{
++    if (id == 0 || id > MAX_MEMPOOL) return NULL;
++    mp_lock(&s_mempool_lock);
++    MemPool* p = s_mempool[id - 1];
++    if (p) mp_lock(&p->mtx);
++    mp_unlock(&s_mempool_lock);
++    return p;
++}
++
++s32 sys_mempool_create(u32* mempool, void* chunk, u64 chunk_size, u64 block_size, u64 ralignment)
++{
++    const u32 chunk_ea = (u32)(uintptr_t)chunk;
++    if (!mempool) return (s32)CELL_EINVAL;
++    if (block_size == 0 || block_size > chunk_size) return (s32)CELL_EINVAL;
++    u64 alignment = (ralignment == 0 || ralignment == 2) ? 4 : ralignment;
++    if (alignment & (alignment - 1)) return (s32)CELL_EINVAL;
++    if (chunk_ea & 7u) return (s32)CELL_EINVAL;
++
++    MemPool* p = (MemPool*)calloc(1, sizeof *p);
++    if (!p) return (s32)CELL_ENOMEM;
++    p->chunk = chunk_ea;
++    p->chunk_size = (u32)chunk_size;
++    p->block_size = (u32)block_size;
++    p->alignment  = (u32)alignment;
++    p->cap = (u32)(chunk_size / block_size);
++    p->free_blocks = (u32*)malloc((p->cap ? p->cap : 1) * sizeof(u32));
++    if (!p->free_blocks) { free(p); return (s32)CELL_ENOMEM; }
++    for (u32 i = 0; i < p->cap; i++) p->free_blocks[i] = chunk_ea + i * p->block_size;
++    p->nfree = p->cap;
++    mp_init(&p->mtx, &p->cv);
++
++    mp_lock(&s_mempool_lock);
++    u32 id = 0;
++    for (u32 i = 0; i < MAX_MEMPOOL; i++)
++        if (!s_mempool[i]) { s_mempool[i] = p; id = i + 1; break; }
++    mp_unlock(&s_mempool_lock);
++    if (!id) {
++        mp_fini(&p->mtx, &p->cv);
++        free(p->free_blocks); free(p);
++        return (s32)CELL_EAGAIN;
++    }
++    vm_write32((u32)(uintptr_t)mempool, id);
++    return CELL_OK;
++}
++
++void sys_mempool_destroy(u32 mempool)
++{
++    if (mempool == 0 || mempool > MAX_MEMPOOL) return;
++    mp_lock(&s_mempool_lock);
++    MemPool* p = s_mempool[mempool - 1];
++    s_mempool[mempool - 1] = NULL;
++    mp_unlock(&s_mempool_lock);
++    if (!p) return;
++    /* Wake any waiter; it sees the pool dead and answers 0. The record is kept
++     * (a waiter may still hold its address), its block list freed. */
++    mp_lock(&p->mtx);
++    p->dead = 1;
++    free(p->free_blocks);
++    p->free_blocks = NULL;
++    p->nfree = p->cap = 0;
++    mp_broadcast(&p->cv);
++    mp_unlock(&p->mtx);
++}
++
++s32 sys_mempool_free_block(u32 mempool, void* block)
++{
++    const u32 ea = (u32)(uintptr_t)block;
++    MemPool* p = mempool_get(mempool);
++    if (!p) return (s32)CELL_EINVAL;
++    if (ea < p->chunk || ea >= p->chunk + p->chunk_size) {   /* not one of this pool's blocks */
++        mp_unlock(&p->mtx);
++        return (s32)CELL_EINVAL;
++    }
++    if (p->nfree == p->cap) {
++        u32 cap = p->cap ? p->cap * 2 : 4;
++        u32* nb = (u32*)realloc(p->free_blocks, cap * sizeof(u32));
++        if (!nb) { mp_unlock(&p->mtx); return (s32)CELL_ENOMEM; }
++        p->free_blocks = nb;
++        p->cap = cap;
++    }
++    p->free_blocks[p->nfree++] = ea;
++    mp_signal(&p->cv);
++    mp_unlock(&p->mtx);
++    return CELL_OK;
++}
++
++u64 sys_mempool_get_count(u32 mempool)
++{
++    MemPool* p = mempool_get(mempool);
++    if (!p) return CELL_EINVAL;
++    const u64 n = p->nfree;
++    mp_unlock(&p->mtx);
++    return n;
++}
++
++u32 sys_mempool_allocate_block(u32 mempool)
++{
++    MemPool* p = mempool_get(mempool);
++    if (!p) return 0;
++    while (!p->dead && p->nfree == 0) mp_wait(&p->cv, &p->mtx);
++    const u32 b = p->dead ? 0 : p->free_blocks[--p->nfree];
++    mp_unlock(&p->mtx);
++    return b;
++}
++
++u32 sys_mempool_try_allocate_block(u32 mempool)
++{
++    MemPool* p = mempool_get(mempool);
++    if (!p) return 0;
++    const u32 b = p->nfree ? p->free_blocks[--p->nfree] : 0;
++    mp_unlock(&p->mtx);
++    return b;
++}
++
+ /* ---------------------------------------------------------------------------
+  * Random number generation
+  *
+diff --git a/libs/system/sysPrxForUser.h b/libs/system/sysPrxForUser.h
+index 30290c73..11f1bda2 100644
+--- a/libs/system/sysPrxForUser.h
++++ b/libs/system/sysPrxForUser.h
+@@ -169,6 +169,15 @@ s32   _sys_heap_free(sys_heap_t heap, void* ptr);
+ 
+ s32 sys_prx_exitspawn_with_level(void);
+ s32 sys_prx_get_module_id_by_name(const char* name, u64 flags, u32* id);
++s32 sys_prx_get_module_list(u64 flags, void* info);
++
++/* Memory pools */
++s32 sys_mempool_create(u32* mempool, void* chunk, u64 chunk_size, u64 block_size, u64 ralignment);
++void sys_mempool_destroy(u32 mempool);
++s32 sys_mempool_free_block(u32 mempool, void* block);
++u64 sys_mempool_get_count(u32 mempool);
++u32 sys_mempool_allocate_block(u32 mempool);
++u32 sys_mempool_try_allocate_block(u32 mempool);
+ 
+ /* ---------------------------------------------------------------------------
+  * Random number generation
+diff --git a/libs/system/tests/test_mempool_module_list.c b/libs/system/tests/test_mempool_module_list.c
+new file mode 100644
+index 00000000..99edab2c
+--- /dev/null
++++ b/libs/system/tests/test_mempool_module_list.c
+@@ -0,0 +1,111 @@
++/*
++ * test_mempool_module_list - the sys_mempool_* calls and sys_prx_get_module_list
++ * (libs/system/sysPrxForUser.c).
++ *
++ * A memory pool hands out fixed-size blocks carved from a chunk the caller
++ * owns; allocate_block waits for a free one, try_allocate_block answers 0 when
++ * none is left. sys_prx_get_module_list lists the PRX modules loaded into the
++ * process: the runtime loads none (every library is HLE), so the list is
++ * empty. Behaviour follows RPCS3. Run by tools/test_mempool_module_list.py.
++ */
++#include "../sysPrxForUser.c"
++#include <assert.h>
++
++/* hooks the runtime supplies; inert here */
++uint8_t* vm_base;
++int g_resv_store_active = 0;
++uint32_t g_ww_lo = 0, g_ww_hi = 0;
++ps3_guest_caller_fn g_ps3_guest_caller;
++void ppu_resv_break_store(uint64_t ea) { (void)ea; }
++int  spu_coh_is_reserved(uint32_t addr) { (void)addr; return 0; }
++void spu_lockline_lock(void) {}
++void spu_lockline_unlock(void) {}
++void spu_coh_notify_write(uint32_t addr) { (void)addr; }
++void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width) { (void)addr; (void)val; (void)width; }
++unsigned int ppu_active_lr(void) { return 0; }
++
++static int fails = 0;
++#define CHECK(c, ...) do { const int ok_ = (c); printf(ok_ ? "[PASS] " : "[FAIL] "); printf(__VA_ARGS__); \
++                           printf("\n"); if (!ok_) fails++; } while (0)
++#define P(ea) ((void*)(uintptr_t)(ea))
++
++#define ID    0x100u
++#define CHUNK 0x1000u   /* 8-byte aligned */
++
++static u32 g_pool;
++static volatile u32 g_got;
++static void* waiter(void* a)
++{
++    (void)a;
++    g_got = sys_mempool_allocate_block(g_pool);   /* blocks: the pool is empty */
++    return NULL;
++}
++
++int main(void)
++{
++    setvbuf(stdout, NULL, _IONBF, 0);
++    vm_base = calloc(1, 0x10000);
++
++    /* --- sys_mempool_create --- */
++    CHECK(sys_mempool_create(P(ID), P(CHUNK), 0x100, 0x200, 0) == (s32)CELL_EINVAL,
++          "create: a block larger than the chunk is EINVAL");
++    CHECK(sys_mempool_create(P(ID), P(CHUNK), 0x400, 0x100, 3) == (s32)CELL_EINVAL,
++          "create: an alignment that is not a power of two is EINVAL");
++    CHECK(sys_mempool_create(P(ID), P(CHUNK + 4), 0x400, 0x100, 0) == (s32)CELL_EINVAL,
++          "create: a chunk off 8 bytes is EINVAL");
++    CHECK(sys_mempool_create(P(ID), P(CHUNK), 0x400, 0, 0) == (s32)CELL_EINVAL,
++          "create: a zero block size is EINVAL");
++    vm_write32(ID, 0);
++    CHECK(sys_mempool_create(P(ID), P(CHUNK), 0x400, 0x100, 16) == CELL_OK && vm_read32(ID) != 0,
++          "create writes a pool id (%u)", vm_read32(ID));
++    const u32 pool = vm_read32(ID);
++    CHECK(sys_mempool_get_count(pool) == 4, "four blocks free (%llu)", (unsigned long long)sys_mempool_get_count(pool));
++
++    /* --- allocation: the last block first, then 0 once empty --- */
++    u32 b[4];
++    for (int i = 0; i < 4; i++) b[i] = sys_mempool_try_allocate_block(pool);
++    CHECK(b[0] == CHUNK + 0x300 && b[1] == CHUNK + 0x200 && b[2] == CHUNK + 0x100 && b[3] == CHUNK,
++          "try_allocate hands out the blocks (0x%X 0x%X 0x%X 0x%X)", b[0], b[1], b[2], b[3]);
++    CHECK(sys_mempool_try_allocate_block(pool) == 0, "try_allocate on an empty pool is 0");
++    CHECK(sys_mempool_get_count(pool) == 0, "none free");
++
++    /* --- free_block --- */
++    CHECK(sys_mempool_free_block(pool, P(CHUNK + 0x800)) == (s32)CELL_EINVAL, "free: a block past the chunk is EINVAL");
++    CHECK(sys_mempool_free_block(pool + 7, P(b[0])) == (s32)CELL_EINVAL, "free: an unknown pool is EINVAL");
++    CHECK(sys_mempool_free_block(pool, P(b[1])) == CELL_OK && sys_mempool_get_count(pool) == 1, "free returns a block");
++    CHECK(sys_mempool_allocate_block(pool) == b[1], "allocate takes it again");
++
++    /* --- allocate_block waits for a free block --- */
++    g_pool = pool;
++    g_got = 0xFFFFFFFFu;
++    pthread_t t;
++    pthread_create(&t, NULL, waiter, NULL);
++    usleep(50000);
++    CHECK(g_got == 0xFFFFFFFFu, "allocate on an empty pool waits");
++    sys_mempool_free_block(pool, P(b[2]));
++    pthread_join(t, NULL);
++    CHECK(g_got == b[2], "a free wakes it with that block (0x%X)", g_got);
++
++    /* --- destroy --- */
++    sys_mempool_destroy(pool);
++    CHECK(sys_mempool_try_allocate_block(pool) == 0 && sys_mempool_free_block(pool, P(b[0])) == (s32)CELL_EINVAL,
++          "a destroyed pool allocates nothing and frees nothing");
++    CHECK(sys_mempool_get_count(pool) == CELL_EINVAL, "get_count on a destroyed pool is EINVAL");
++
++    /* --- sys_prx_get_module_list: { u64 size; u32 max; u32 count; u32 idlist; } --- */
++    const u32 INFO = 0x2000, LIST = 0x2100;
++    CHECK(sys_prx_get_module_list(0, NULL) == (s32)CELL_EINVAL, "module list: NULL info is EINVAL");
++    memset(vm_base + INFO, 0, 0x18);
++    vm_write32(INFO + 0x08, 8);
++    CHECK(sys_prx_get_module_list(0, P(INFO)) == (s32)CELL_EINVAL, "module list: a NULL id list is EINVAL");
++    vm_write32(INFO + 0x0C, 0xDEAD);
++    vm_write32(INFO + 0x10, LIST);
++    vm_write32(LIST, 0xAAAAAAAAu);
++    CHECK(sys_prx_get_module_list(0, P(INFO)) == CELL_OK && vm_read32(INFO + 0x0C) == 0 &&
++          vm_read32(INFO + 0x08) == 8 && vm_read32(LIST) == 0xAAAAAAAAu,
++          "module list: no PRX is loaded (count %u, max %u)", vm_read32(INFO + 0x0C), vm_read32(INFO + 0x08));
++
++    if (fails) { printf("%d check(s) failed\n", fails); return 1; }
++    puts("test_mempool_module_list: OK");
++    return 0;
++}
+diff --git a/tools/test_mempool_module_list.py b/tools/test_mempool_module_list.py
+new file mode 100644
+index 00000000..1992698f
+--- /dev/null
++++ b/tools/test_mempool_module_list.py
+@@ -0,0 +1,59 @@
++#!/usr/bin/env python3
++"""The sys_mempool_* calls and sys_prx_get_module_list (libs/system/sysPrxForUser.c).
++
++Titles import sys_mempool_create (0xCA9A60BF) and sys_prx_get_module_list
++(0xA5D06BF0), among others. None had a handler, so each took the unresolved
++path and faked CELL_OK with nothing written. Checks that the names hash to the
++imported NIDs (the HLE table registers by the hash of the name), then builds
++libs/system/tests/test_mempool_module_list.c, which includes sysPrxForUser.c,
++and runs it.
++"""
++import hashlib
++import os
++import shutil
++import struct
++import subprocess
++import sys
++import tempfile
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++SUFFIX = b"\x67\x59\x65\x99\x04\x25\x04\x90\x56\x64\x27\x49\x94\x89\x74\x1A"
++NIDS = (('sys_mempool_create', 0xCA9A60BF), ('sys_mempool_destroy', 0x9D3C0F81),
++        ('sys_mempool_free_block', 0x608212FC), ('sys_mempool_try_allocate_block', 0x05C65656),
++        ('sys_prx_get_module_list', 0xA5D06BF0))
++
++
++def nid(name):
++    return struct.unpack('<I', hashlib.sha1(name.encode() + SUFFIX).digest()[:4])[0]
++
++
++def main():
++    if os.name == 'nt':
++        print('SKIP: the fixture uses pthreads; run on macOS/Linux')
++        return 0
++    fails = 0
++    for name, want in NIDS:
++        got = nid(name)
++        fails += got != want
++        print(f"[{'PASS' if got == want else 'FAIL'}] {name} hashes to 0x{got:08X} (imported as 0x{want:08X})")
++    cc = os.environ.get('CC') or shutil.which('cc') or shutil.which('gcc') or shutil.which('clang')
++    if not cc:
++        print('SKIP: no C compiler')
++        return 1 if fails else 0
++    with tempfile.TemporaryDirectory() as tmp:
++        exe = Path(tmp) / 'test_mempool_module_list'
++        r = subprocess.run([cc, '-std=gnu17', '-O1', '-w', '-pthread', '-I' + str(ROOT / 'include'),
++                            str(ROOT / 'libs/system/tests/test_mempool_module_list.c'), '-o', str(exe)],
++                           capture_output=True, text=True)
++        if r.returncode:
++            print(r.stdout + r.stderr)
++            print('FAIL: fixture did not build')
++            return 1
++        r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=30)
++        sys.stdout.write(r.stdout + r.stderr)
++        return 1 if (fails or r.returncode) else 0
++
++
++if __name__ == '__main__':
++    sys.exit(main())
