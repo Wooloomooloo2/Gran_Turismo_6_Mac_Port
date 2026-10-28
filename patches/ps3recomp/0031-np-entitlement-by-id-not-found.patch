@@ -1,0 +1,152 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] sceNpManagerGetEntitlementById: no entitlement offline (ID_NOT_FOUND)
+
+Upstream: not yet submitted; written to be upstreamed (generic, no title names)
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0030)
+
+What: sceNpManagerGetEntitlementById (NID 0xA1709ABD) had no handler, so the
+call was an unresolved import that answered CELL_OK and left the caller's
+SceNpEntitlement as it was. It now answers as RPCS3 does (sceNp.cpp):
+SCE_NP_ERROR_NOT_INITIALIZED before sceNpInit, SCE_NP_ERROR_INVALID_ARGUMENT
+for a NULL id, otherwise SCE_NP_ERROR_ID_NOT_FOUND (no entitlement is held
+offline), with the record untouched.
+
+Why: CELL_OK with an unwritten record reads as an entitlement the player
+holds, with whatever the record held before.
+
+Test: tools/test_np_entitlement.py (new) builds tests/test_np_entitlement.c
+with the real sceNp.c and checks the three answers and the untouched record.
+
+diff --git a/libs/network/sceNp.c b/libs/network/sceNp.c
+index 125835bc..987ead23 100644
+--- a/libs/network/sceNp.c
++++ b/libs/network/sceNp.c
+@@ -245,6 +245,20 @@ s32 sceNpManagerGetStatus(s32* status)
+     return CELL_OK;
+ }
+ 
++/* sceNpManagerGetEntitlementById(const char* entId, SceNpEntitlement* ent):
++ * no entitlement is ever held offline. As RPCS3 answers: NOT_INITIALIZED
++ * before sceNpInit, INVALID_ARGUMENT for a NULL id, otherwise ID_NOT_FOUND
++ * with *ent untouched. */
++s32 sceNpManagerGetEntitlementById(const char* entId, void* ent)
++{
++    (void)ent;
++    if (!s_np_initialized)
++        return SCE_NP_ERROR_NOT_INITIALIZED;
++    if (!entId)
++        return SCE_NP_ERROR_INVALID_ARGUMENT;
++    return SCE_NP_ERROR_ID_NOT_FOUND;
++}
++
+ s32 sceNpManagerRegisterCallback(SceNpManagerCallback callback, void* arg)
+ {
+     if (!s_np_initialized)
+diff --git a/libs/network/sceNp.h b/libs/network/sceNp.h
+index 5efd6f66..7d6be44a 100644
+--- a/libs/network/sceNp.h
++++ b/libs/network/sceNp.h
+@@ -130,6 +130,7 @@ typedef void (*SceNpManagerCallback)(s32 event, s32 result, void* arg);
+ #define SCE_NP_MANAGER_EVENT_GOT_TICKET         255
+ 
+ s32 sceNpManagerGetStatus(s32* status);
++s32 sceNpManagerGetEntitlementById(const char* entId, void* ent);
+ s32 sceNpManagerRegisterCallback(SceNpManagerCallback callback, void* arg);
+ s32 sceNpManagerUnregisterCallback(void);
+ s32 sceNpManagerGetNpId(SceNpId* npId);
+diff --git a/tests/test_np_entitlement.c b/tests/test_np_entitlement.c
+new file mode 100644
+index 00000000..3027fba2
+--- /dev/null
++++ b/tests/test_np_entitlement.c
+@@ -0,0 +1,34 @@
++/* sceNpManagerGetEntitlementById through the real libs/network/sceNp.c:
++ * NOT_INITIALIZED before sceNpInit, INVALID_ARGUMENT for a NULL id, and
++ * ID_NOT_FOUND otherwise, as RPCS3 answers. Run by tools/test_np_entitlement.py. */
++#include "../libs/network/sceNp.h"
++#include <stdio.h>
++#include <string.h>
++#include <sys/mman.h>
++
++uint8_t* vm_base;
++uint32_t ppu_vm_size;
++int g_resv_store_active;          /* ppu_memory.h store hooks; none armed here */
++uint32_t g_ww_lo, g_ww_hi;
++const char* np_psnr_online_id(void) { return "PS3Player"; }   /* np_psnr.c, not linked here */
++
++static int fails;
++#define CHECK(c, ...) do { const int ok_ = (c); printf(ok_ ? "[PASS] " : "[FAIL] "); printf(__VA_ARGS__); \
++                           printf("\n"); if (!ok_) fails++; } while (0)
++
++int main(void)
++{
++    setvbuf(stdout, NULL, _IONBF, 0);
++    vm_base = (uint8_t*)mmap(NULL, 0x200000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
++    const char* id = "GT6DLC00000000001";
++    void* ent = (void*)(uintptr_t)0x1000;
++    CHECK((uint32_t)sceNpManagerGetEntitlementById(id, ent) == SCE_NP_ERROR_NOT_INITIALIZED, "before sceNpInit: NOT_INITIALIZED");
++    CHECK(sceNpInit(0x20000, (void*)(uintptr_t)0x100000) == CELL_OK, "sceNpInit");
++    memset(vm_base + 0x1000, 0xAA, 64);
++    CHECK((uint32_t)sceNpManagerGetEntitlementById(NULL, ent) == SCE_NP_ERROR_INVALID_ARGUMENT, "a NULL id: INVALID_ARGUMENT");
++    CHECK((uint32_t)sceNpManagerGetEntitlementById(id, ent) == SCE_NP_ERROR_ID_NOT_FOUND, "an id: ID_NOT_FOUND (no entitlement offline)");
++    CHECK(vm_base[0x1000] == 0xAA && vm_base[0x103F] == 0xAA, "the entitlement record is left untouched");
++    if (fails) { printf("%d check(s) failed\n", fails); return 1; }
++    puts("test_np_entitlement: OK");
++    return 0;
++}
+diff --git a/tools/test_np_entitlement.py b/tools/test_np_entitlement.py
+new file mode 100644
+index 00000000..602fc817
+--- /dev/null
++++ b/tools/test_np_entitlement.py
+@@ -0,0 +1,49 @@
++#!/usr/bin/env python3
++"""sceNpManagerGetEntitlementById through the real libs/network/sceNp.c.
++
++It had no handler, so the call answered CELL_OK and left the entitlement
++record as it was, which reads as a held entitlement. Offline none is held: as
++RPCS3 answers, NOT_INITIALIZED before sceNpInit, INVALID_ARGUMENT for a NULL
++id, ID_NOT_FOUND otherwise. Builds tests/test_np_entitlement.c with sceNp.c
++and runs it.
++"""
++import os
++import platform
++import subprocess
++import sys
++import tempfile
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++def main():
++    if os.name == 'nt':
++        print('SKIP: the fixture is POSIX; run on macOS/Linux')
++        return 0
++    with tempfile.TemporaryDirectory(prefix='np-entitlement-') as tmp:
++        exe = Path(tmp) / 'test_np_entitlement'
++        link = ['-Wl,-undefined,dynamic_lookup'] if platform.system() == 'Darwin' else ['-Wl,--unresolved-symbols=ignore-all']
++        r = subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-w',
++                            '-I' + str(ROOT / 'include'), '-I' + str(ROOT / 'runtime'),
++                            '-I' + str(ROOT / 'libs/network'), '-I' + str(ROOT / 'libs/system'),
++                            '-I' + str(ROOT / 'libs'),
++                            str(ROOT / 'tests/test_np_entitlement.c'), str(ROOT / 'libs/network/sceNp.c'),
++                            *link, '-o', str(exe)],
++                           capture_output=True, text=True)
++        if r.returncode:
++            print(r.stdout + r.stderr)
++            print('FAIL: fixture did not build')
++            return 1
++        rc = 0
++        for args, extra in (([], {}),):
++            env = {k: v for k, v in os.environ.items() if k not in ('PS3_NET_ONLINE', 'PS3_NETCTL_OFFLINE_FAIL')}
++            env.update(extra)
++            r = subprocess.run([str(exe), *args], capture_output=True, text=True, timeout=30, env=env)
++            sys.stdout.write(r.stdout + r.stderr)
++            rc |= r.returncode
++        return rc
++
++
++if __name__ == '__main__':
++    sys.exit(main())
