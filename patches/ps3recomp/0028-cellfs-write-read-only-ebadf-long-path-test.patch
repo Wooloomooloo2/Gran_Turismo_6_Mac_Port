@@ -1,0 +1,71 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] ppu_fs: cellFsWrite on a read-only or closed fd is EBADF; the long-path test sizes itself
+
+Upstream: not yet submitted; written to be upstreamed (generic, no title names)
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0027)
+
+What: cellFsWrite answers EBADF, with *nwrite 0 and nothing written, for an fd
+that is not open (was EIO) and for a write of any bytes to an fd opened
+read-only (was CELL_OK with 0 written), as lv2 does (RPCS3 sys_fs_write checks
+the same two cases, behaviour only). cellFsWriteWithOffset already did.
+Test: test_fs_imports.cpp writes to a read-only fd. The long-path unlink case
+now expects ENOENT while the host path fits in PATH_MAX and ENAMETOOLONG past
+it, so it passes with a long TMPDIR.
+
+Why: a title that checks the result read a failed write as success; the
+long-path case failed with a TMPDIR of about 100 characters.
+
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -746,7 +746,13 @@
+     uint64_t nbytes = ctx->gpr[5];
+     uint32_t nwr_ptr = (uint32_t)ctx->gpr[6];
+     FILE* f = fd_file(fd);
+-    if (!f) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
++    /* lv2 (as RPCS3's sys_fs_write models it): an fd that is not open, or a write of any
++     * bytes to one opened read-only, is EBADF with nothing written. */
++    if (!f || (nbytes && (g_fd_flags[fd] & 0x3) == CELL_FS_O_RDONLY)) {
++        if (nwr_ptr) vm_write64(nwr_ptr, 0);
++        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EBADF;
++        return;
++    }
+     fs_prefault(buf, nbytes);   /* kernel READS the buffer; same reserved-page trap */
+     fs_set_dir(fd, f, 2);
+     size_t n = fwrite(vm_base + buf, 1, (size_t)nbytes, f);
+diff --git a/runtime/ppu/tests/test_fs_imports.cpp b/runtime/ppu/tests/test_fs_imports.cpp
+--- a/runtime/ppu/tests/test_fs_imports.cpp
++++ b/runtime/ppu/tests/test_fs_imports.cpp
+@@ -135,6 +135,14 @@
+             auto ro = open_("/dev_hdd0/db.dat", 0);       /* RDONLY */
+             r = trunc(ro.second, 0);
+             CHECK(ro.first == 0 && r == 0x8001002Au, "ftruncate of a read-only fd is EBADF (0x%08X)", r);
++            if (auto wr = find(ps3_compute_nid("cellFsWrite"))) {   /* (fd, buf, nbytes, u64* nwrite) */
++                memcpy(mem + 0x500, "data", 4); memset(mem + 0x600, 0xEE, 8);
++                memset(&ctx, 0, sizeof ctx);
++                ctx.gpr[3] = ro.second; ctx.gpr[4] = 0x500; ctx.gpr[5] = 4; ctx.gpr[6] = 0x600; wr(&ctx);
++                r = (uint32_t)ctx.gpr[3];
++                CHECK(r == 0x8001002Au && rd64(0x600) == 0 && stat(p, &st) == 0 && st.st_size == 100,
++                      "cellFsWrite to a read-only fd is EBADF, 0 written, file unchanged (0x%08X)", r);
++            } else CHECK(false, "cellFsWrite: handler registered");
+             memset(&ctx, 0, sizeof ctx); ctx.gpr[3] = ro.second; cl(&ctx);
+             unlink(p);
+         }
+@@ -264,7 +272,15 @@
+             { char longp[1000] = "/dev_hdd0/"; for (int i = 0; i < 9; i++) strcat(longp, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/");
+               strcat(longp, "f");
+               r = call(un, longp);
+-              CHECK(r == 0x80010006u, "a long path whose parent is missing is ENOENT (0x%08X)", r); }
++              /* ENOENT while the host path fits in PATH_MAX; past it lv2's answer for an
++               * over-long path, ENAMETOOLONG. Which one depends on the scratch root's length. */
++              char real[PATH_MAX];
++              const size_t host = strlen(realpath(hdd0, real) ? real : hdd0) + strlen(longp) - strlen("/dev_hdd0");
++              const bool fits = host + 1 < PATH_MAX, over = host >= PATH_MAX;
++              CHECK((fits && r == 0x80010006u) || (over && r == 0x80010034u) ||
++                    (!fits && !over && (r == 0x80010006u || r == 0x80010034u)),
++                    "a long path whose parent is missing is ENOENT, or ENAMETOOLONG past PATH_MAX "
++                    "(host length %zu, 0x%08X)", host, r); }
+         }
+         snprintf(p, sizeof p, "rm -rf '%s'", base);
+         (void)!system(p);
