@@ -42,7 +42,6 @@ pager's data, unmap's id, contents kept across unmap and map, and the map,
 unmap and free errors. lv2_register.c registers 327, 57 and 198 beside
 sys_memory_init, so the memory tests that build sys_memory.c alone still link.
 
-+++ b/runtime/syscalls/lv2_register.c
 diff --git a/runtime/ppu/ppu_sysprx.cpp b/runtime/ppu/ppu_sysprx.cpp
 index 007bf49a..963c1d21 100644
 --- a/runtime/ppu/ppu_sysprx.cpp

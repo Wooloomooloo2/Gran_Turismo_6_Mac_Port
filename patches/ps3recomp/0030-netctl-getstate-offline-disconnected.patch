@@ -1,7 +1,10 @@
 From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
 Subject: [PATCH] cellNetCtlGetState offline: CELL_OK with state Disconnected after Init
 
-Upstream: not yet submitted; written to be upstreamed (generic, no title names)
+Upstream: not yet submitted; written to be upstreamed (generic, no title names).
+  Note for upstream: this changes LittleBigPlanet's default. Its connect job
+  polls GetState until the call fails, so upstream it must run with
+  PS3_NETCTL_OFFLINE_FAIL=1 (or a per-title setting) or it polls for ever.
 Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
 Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0029)
 
