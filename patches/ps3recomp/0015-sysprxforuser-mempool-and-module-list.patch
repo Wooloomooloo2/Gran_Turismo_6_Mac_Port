@@ -18,10 +18,13 @@ the chunk into chunk_size / block_size blocks and writes an id from 1. The
 free blocks are a stack: the chunk's last block is handed out first, a freed
 block next. allocate_block waits for a free block (a destroy wakes it with 0);
 try_allocate_block answers 0 when none is free; free_block refuses an address
-outside the chunk or an unknown pool (EINVAL); get_count gives the free
-count. Behaviour follows RPCS3 (its sys_mempool), with two additions: a zero
-block size is EINVAL (it divides by it) and free_block also refuses an
-address below the chunk.
+past the chunk's end or an unknown pool (EINVAL); get_count gives the free
+count. Behaviour follows RPCS3 (its sys_mempool), with three guards of our
+own where RPCS3 would fault: a NULL id pointer and a zero block size (it
+divides by it) are EINVAL, and running out of the 1023 ids is EAGAIN. A pool
+is reference counted: destroy drops the table's reference, and the record and
+its mutex are freed when the last call inside the pool (a waiter) leaves.
+The table is guarded by a mutex.
 
 sys_prx_get_module_list lists the PRX modules loaded into the process. Every
 library here is HLE and no PRX is ever loaded (sys_prx_get_module_id_by_name
@@ -35,14 +38,16 @@ whatever the caller's stack held.
 
 Test: tools/test_mempool_module_list.py (new) checks the names hash to the
 imported NIDs, then builds libs/system/tests/test_mempool_module_list.c with
-sysPrxForUser.c: each error, the block order, an allocate that waits until a
-free from another thread, destroy, and the empty module list.
+sysPrxForUser.c: each error, the block order, free_block taking the chunk's
+end address (RPCS3's test is "past the end"), an allocate that waits until a
+free from another thread, destroy (with a waiter woken with 0), and the
+empty module list.
 
 diff --git a/libs/system/sysPrxForUser.c b/libs/system/sysPrxForUser.c
-index b2cba7b6..d9dcb293 100644
+index b2cba7b6..9a7e951f 100644
 --- a/libs/system/sysPrxForUser.c
 +++ b/libs/system/sysPrxForUser.c
-@@ -1083,6 +1083,182 @@ s32 sys_prx_get_module_id_by_name(const char* name, u64 flags, u32* id)
+@@ -1083,6 +1083,202 @@ s32 sys_prx_get_module_id_by_name(const char* name, u64 flags, u32* id)
      return (s32)0x8001112E;   /* CELL_PRX_ERROR_UNKNOWN_MODULE */
  }
  
@@ -66,7 +71,11 @@ index b2cba7b6..d9dcb293 100644
 + * Memory pools (sys_mempool_*): fixed-size blocks carved from a chunk the
 + * caller owns. Behaviour follows RPCS3: ids from 1; the free blocks are a
 + * stack (the chunk's last block is handed out first, a freed block next);
-+ * allocate_block waits for a free block, try_allocate_block answers 0.
++ * allocate_block waits for a free block, try_allocate_block answers 0;
++ * free_block refuses only a block past the chunk's end. Our own guards where
++ * RPCS3 would fault: a NULL id pointer or a block size of 0 is EINVAL, and
++ * running out of ids EAGAIN. A pool is reference counted, so its record and
++ * mutex are freed once destroyed and no call is still inside it.
 + * -----------------------------------------------------------------------*/
 +#define MAX_MEMPOOL 1023
 +
@@ -99,6 +108,7 @@ index b2cba7b6..d9dcb293 100644
 +    u32* free_blocks;
 +    u32  nfree, cap;
 +    int  dead;
++    u32  refs;      /* the table's, plus one per call inside; under s_mempool_lock */
 +    mp_mutex mtx;
 +    mp_cond  cv;
 +} MemPool;
@@ -106,15 +116,31 @@ index b2cba7b6..d9dcb293 100644
 +static MemPool* s_mempool[MAX_MEMPOOL];
 +static mp_mutex s_mempool_lock = MP_STATIC_MUTEX;
 +
-+/* The pool, locked; NULL if the id is not a live pool. */
++/* The pool, locked and referenced; NULL if the id is not a live pool. Every
++ * non-NULL answer is paired with mempool_put. */
 +static MemPool* mempool_get(u32 id)
 +{
 +    if (id == 0 || id > MAX_MEMPOOL) return NULL;
 +    mp_lock(&s_mempool_lock);
 +    MemPool* p = s_mempool[id - 1];
-+    if (p) mp_lock(&p->mtx);
++    if (p) p->refs++;
 +    mp_unlock(&s_mempool_lock);
++    if (p) mp_lock(&p->mtx);
 +    return p;
++}
++
++/* Unlock the pool and drop one reference; the last one frees it. */
++static void mempool_put(MemPool* p)
++{
++    mp_unlock(&p->mtx);
++    mp_lock(&s_mempool_lock);
++    const int last = --p->refs == 0;
++    mp_unlock(&s_mempool_lock);
++    if (last) {
++        mp_fini(&p->mtx, &p->cv);
++        free(p->free_blocks);
++        free(p);
++    }
 +}
 +
 +s32 sys_mempool_create(u32* mempool, void* chunk, u64 chunk_size, u64 block_size, u64 ralignment)
@@ -137,6 +163,7 @@ index b2cba7b6..d9dcb293 100644
 +    if (!p->free_blocks) { free(p); return (s32)CELL_ENOMEM; }
 +    for (u32 i = 0; i < p->cap; i++) p->free_blocks[i] = chunk_ea + i * p->block_size;
 +    p->nfree = p->cap;
++    p->refs = 1;
 +    mp_init(&p->mtx, &p->cv);
 +
 +    mp_lock(&s_mempool_lock);
@@ -161,15 +188,13 @@ index b2cba7b6..d9dcb293 100644
 +    s_mempool[mempool - 1] = NULL;
 +    mp_unlock(&s_mempool_lock);
 +    if (!p) return;
-+    /* Wake any waiter; it sees the pool dead and answers 0. The record is kept
-+     * (a waiter may still hold its address), its block list freed. */
++    /* Wake any waiter; it sees the pool dead and answers 0. The table's
++     * reference goes; the last waiter out frees the pool. */
 +    mp_lock(&p->mtx);
 +    p->dead = 1;
-+    free(p->free_blocks);
-+    p->free_blocks = NULL;
-+    p->nfree = p->cap = 0;
++    p->nfree = 0;
 +    mp_broadcast(&p->cv);
-+    mp_unlock(&p->mtx);
++    mempool_put(p);
 +}
 +
 +s32 sys_mempool_free_block(u32 mempool, void* block)
@@ -177,20 +202,20 @@ index b2cba7b6..d9dcb293 100644
 +    const u32 ea = (u32)(uintptr_t)block;
 +    MemPool* p = mempool_get(mempool);
 +    if (!p) return (s32)CELL_EINVAL;
-+    if (ea < p->chunk || ea >= p->chunk + p->chunk_size) {   /* not one of this pool's blocks */
-+        mp_unlock(&p->mtx);
++    if (ea > p->chunk + p->chunk_size) {   /* past the chunk: RPCS3's only test */
++        mempool_put(p);
 +        return (s32)CELL_EINVAL;
 +    }
 +    if (p->nfree == p->cap) {
 +        u32 cap = p->cap ? p->cap * 2 : 4;
 +        u32* nb = (u32*)realloc(p->free_blocks, cap * sizeof(u32));
-+        if (!nb) { mp_unlock(&p->mtx); return (s32)CELL_ENOMEM; }
++        if (!nb) { mempool_put(p); return (s32)CELL_ENOMEM; }
 +        p->free_blocks = nb;
 +        p->cap = cap;
 +    }
 +    p->free_blocks[p->nfree++] = ea;
 +    mp_signal(&p->cv);
-+    mp_unlock(&p->mtx);
++    mempool_put(p);
 +    return CELL_OK;
 +}
 +
@@ -199,7 +224,7 @@ index b2cba7b6..d9dcb293 100644
 +    MemPool* p = mempool_get(mempool);
 +    if (!p) return CELL_EINVAL;
 +    const u64 n = p->nfree;
-+    mp_unlock(&p->mtx);
++    mempool_put(p);
 +    return n;
 +}
 +
@@ -209,7 +234,7 @@ index b2cba7b6..d9dcb293 100644
 +    if (!p) return 0;
 +    while (!p->dead && p->nfree == 0) mp_wait(&p->cv, &p->mtx);
 +    const u32 b = p->dead ? 0 : p->free_blocks[--p->nfree];
-+    mp_unlock(&p->mtx);
++    mempool_put(p);
 +    return b;
 +}
 +
@@ -218,7 +243,7 @@ index b2cba7b6..d9dcb293 100644
 +    MemPool* p = mempool_get(mempool);
 +    if (!p) return 0;
 +    const u32 b = p->nfree ? p->free_blocks[--p->nfree] : 0;
-+    mp_unlock(&p->mtx);
++    mempool_put(p);
 +    return b;
 +}
 +
@@ -247,10 +272,10 @@ index 30290c73..11f1bda2 100644
   * Random number generation
 diff --git a/libs/system/tests/test_mempool_module_list.c b/libs/system/tests/test_mempool_module_list.c
 new file mode 100644
-index 00000000..99edab2c
+index 00000000..c0f97924
 --- /dev/null
 +++ b/libs/system/tests/test_mempool_module_list.c
-@@ -0,0 +1,111 @@
+@@ -0,0 +1,133 @@
 +/*
 + * test_mempool_module_list - the sys_mempool_* calls and sys_prx_get_module_list
 + * (libs/system/sysPrxForUser.c).
@@ -259,7 +284,9 @@ index 00000000..99edab2c
 + * owns; allocate_block waits for a free one, try_allocate_block answers 0 when
 + * none is left. sys_prx_get_module_list lists the PRX modules loaded into the
 + * process: the runtime loads none (every library is HLE), so the list is
-+ * empty. Behaviour follows RPCS3. Run by tools/test_mempool_module_list.py.
++ * empty. Behaviour follows RPCS3, apart from the guards recorded in the
++ * source (NULL id pointer, zero block size, out of ids). Run by
++ * tools/test_mempool_module_list.py.
 + */
 +#include "../sysPrxForUser.c"
 +#include <assert.h>
@@ -327,6 +354,9 @@ index 00000000..99edab2c
 +    CHECK(sys_mempool_free_block(pool + 7, P(b[0])) == (s32)CELL_EINVAL, "free: an unknown pool is EINVAL");
 +    CHECK(sys_mempool_free_block(pool, P(b[1])) == CELL_OK && sys_mempool_get_count(pool) == 1, "free returns a block");
 +    CHECK(sys_mempool_allocate_block(pool) == b[1], "allocate takes it again");
++    /* RPCS3 refuses only a block past the chunk's end: the end itself is taken */
++    CHECK(sys_mempool_free_block(pool, P(CHUNK + 0x400)) == CELL_OK && sys_mempool_try_allocate_block(pool) == CHUNK + 0x400,
++          "free: the chunk's end address is accepted (RPCS3's > test)");
 +
 +    /* --- allocate_block waits for a free block --- */
 +    g_pool = pool;
@@ -344,6 +374,23 @@ index 00000000..99edab2c
 +    CHECK(sys_mempool_try_allocate_block(pool) == 0 && sys_mempool_free_block(pool, P(b[0])) == (s32)CELL_EINVAL,
 +          "a destroyed pool allocates nothing and frees nothing");
 +    CHECK(sys_mempool_get_count(pool) == CELL_EINVAL, "get_count on a destroyed pool is EINVAL");
++
++    /* destroying a pool a thread waits on wakes it with 0; the last one out frees the pool */
++    vm_write32(ID, 0);
++    assert(sys_mempool_create(P(ID), P(CHUNK), 0x100, 0x100, 0) == CELL_OK);
++    g_pool = vm_read32(ID);
++    assert(sys_mempool_try_allocate_block(g_pool) == CHUNK);
++    g_got = 0xFFFFFFFFu;
++    pthread_create(&t, NULL, waiter, NULL);
++    usleep(50000);
++    CHECK(g_got == 0xFFFFFFFFu, "a second pool's allocate waits");
++    sys_mempool_destroy(g_pool);
++    pthread_join(t, NULL);
++    CHECK(g_got == 0, "destroy wakes the waiter with 0 (0x%X)", g_got);
++    vm_write32(ID, 0);
++    CHECK(sys_mempool_create(P(ID), P(CHUNK), 0x100, 0x100, 0) == CELL_OK && sys_mempool_get_count(vm_read32(ID)) == 1,
++          "a pool created afterwards works");
++    sys_mempool_destroy(vm_read32(ID));
 +
 +    /* --- sys_prx_get_module_list: { u64 size; u32 max; u32 count; u32 idlist; } --- */
 +    const u32 INFO = 0x2000, LIST = 0x2100;
