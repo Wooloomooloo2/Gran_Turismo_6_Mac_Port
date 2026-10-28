@@ -1,0 +1,187 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] sceNpTrophy: sceNpTrophySetSoundLevel
+
+Upstream: not yet submitted; written to be upstreamed (generic, no title names)
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0016)
+
+What: sceNpTrophySetSoundLevel (0x27DEDA93) had no handler, so it took the
+unresolved path and faked CELL_OK whatever its arguments. It sets the volume
+of the trophy-unlock sound for a context, 20 to 100. There is no unlock sound
+to play, so a valid call only succeeds. The checks follow RPCS3's order: a
+level outside 20-100 is INVALID_ARGUMENT, any option NOT_SUPPORTED (none is
+defined; the PS3 SDK's 0x80022903 is added for it), then the library must be
+initialised and the context and handle must exist (the module's
+NOT_INITIALIZED, INVALID_CONTEXT and INVALID_HANDLE).
+
+The module's other error values (0x805516xx) are not the PS3 SDK's
+(0x800229xx, as RPCS3 has them); that is left for its own change.
+
+Why: a faked success hid a level out of range from the caller.
+
+Test: tools/test_trophy_sound_level.py (new) checks the name hashes to the
+imported NID, then builds libs/network/tests/test_trophy_sound_level.c with
+sceNpTrophy.c: each refusal above and the two ends of the range.
+
+diff --git a/libs/network/sceNpTrophy.c b/libs/network/sceNpTrophy.c
+index d956e6dd..950c7868 100644
+--- a/libs/network/sceNpTrophy.c
++++ b/libs/network/sceNpTrophy.c
+@@ -388,6 +388,27 @@ s32 sceNpTrophyGetRequiredDiskSpace(SceNpTrophyContext context,
+     return CELL_OK;
+ }
+ 
++/* sceNpTrophySetSoundLevel(context, handle, level, options): the volume of the
++ * unlock sound, 20 to 100. There is no unlock sound to play, so a valid call
++ * only succeeds. Checks in RPCS3's order: the level (INVALID_ARGUMENT), the
++ * options, of which none are defined (NOT_SUPPORTED), then initialisation,
++ * the context and the handle. NID 0x27DEDA93. */
++s32 sceNpTrophySetSoundLevel(SceNpTrophyContext context, SceNpTrophyHandle handle, u32 level, u64 options)
++{
++    if (level < 20 || level > 100)
++        return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
++    if (options)
++        return SCE_NP_TROPHY_ERROR_NOT_SUPPORTED;
++    if (!s_trophy_initialized)
++        return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
++    if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS || !s_contexts[context].in_use)
++        return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
++    if (handle <= 0 || handle > SCE_NP_TROPHY_MAX_HANDLES || !s_handles[handle].in_use)
++        return SCE_NP_TROPHY_ERROR_INVALID_HANDLE;
++    printf("[sceNpTrophy] SetSoundLevel(ctx=%d, level=%u)\n", context, level);
++    return CELL_OK;
++}
++
+ s32 sceNpTrophyGetGameInfo(SceNpTrophyContext context,
+                            SceNpTrophyHandle handle,
+                            SceNpTrophyGameDetails* details,
+diff --git a/libs/network/sceNpTrophy.h b/libs/network/sceNpTrophy.h
+index 48faefdc..b7ddafa3 100644
+--- a/libs/network/sceNpTrophy.h
++++ b/libs/network/sceNpTrophy.h
+@@ -34,6 +34,7 @@ extern "C" {
+ #define SCE_NP_TROPHY_ERROR_PROCESSING              0x8055160E
+ #define SCE_NP_TROPHY_ERROR_ABORT                   0x8055160F
+ #define SCE_NP_TROPHY_ERROR_UNKNOWN                 0x805516FF
++#define SCE_NP_TROPHY_ERROR_NOT_SUPPORTED           0x80022903   /* the PS3 SDK's value */
+ 
+ /* ---------------------------------------------------------------------------
+  * Constants
+@@ -110,6 +111,7 @@ typedef struct SceNpTrophyFlagArray {
+ 
+ s32 sceNpTrophyInit(void* poolPtr, u32 poolSize, u32 containerId, u64 options);
+ s32 sceNpTrophyTerm(void);
++s32 sceNpTrophySetSoundLevel(SceNpTrophyContext context, SceNpTrophyHandle handle, u32 level, u64 options);
+ 
+ s32 sceNpTrophyCreateContext(SceNpTrophyContext* context,
+                              const SceNpCommunicationId* commId,
+diff --git a/libs/network/tests/test_trophy_sound_level.c b/libs/network/tests/test_trophy_sound_level.c
+new file mode 100644
+index 00000000..b7ad9888
+--- /dev/null
++++ b/libs/network/tests/test_trophy_sound_level.c
+@@ -0,0 +1,46 @@
++/*
++ * test_trophy_sound_level - sceNpTrophySetSoundLevel (libs/network/sceNpTrophy.c).
++ *
++ * Sets the volume of the trophy-unlock sound for a context, 20 to 100. The
++ * checks follow RPCS3's order: the level, then the options (none are
++ * defined), then initialisation, the context and the handle; the module's own
++ * codes are used for the last three. Run by tools/test_trophy_sound_level.py.
++ */
++#include "../sceNpTrophy.c"
++#include <assert.h>
++uint8_t* vm_base;
++uint32_t ppu_vm_size;
++int g_resv_store_active;
++uint32_t g_ww_lo, g_ww_hi;
++void ppu_resv_break_store(uint64_t ea) { (void)ea; }
++void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
++int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
++void spu_coh_notify_write(uint32_t a) { (void)a; }
++void spu_lockline_lock(void) {}
++void spu_lockline_unlock(void) {}
++
++static int fails = 0;
++#define CHECK(c, ...) do { const int ok_ = (c); printf(ok_ ? "[PASS] " : "[FAIL] "); printf(__VA_ARGS__); \
++                           printf("\n"); if (!ok_) fails++; } while (0)
++
++int main(void)
++{
++    vm_base = calloc(1, 65536);
++    memcpy(vm_base + 0x100, "NPWR00000", 9);
++    CHECK(sceNpTrophySetSoundLevel(1, 1, 50, 0) == (s32)SCE_NP_TROPHY_ERROR_NOT_INITIALIZED,
++          "before sceNpTrophyInit: NOT_INITIALIZED");
++    assert(sceNpTrophyInit(NULL, 0, 0, 0) == CELL_OK);
++    assert(sceNpTrophyCreateContext((void*)0x200, (void*)0x100, NULL, 0) == CELL_OK);
++    assert(sceNpTrophyCreateHandle((void*)0x204) == CELL_OK);
++    const u32 ctx = vm_read32(0x200), h = vm_read32(0x204);
++    CHECK(sceNpTrophySetSoundLevel(ctx, h, 19, 0) == (s32)SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT, "level 19: INVALID_ARGUMENT");
++    CHECK(sceNpTrophySetSoundLevel(ctx, h, 101, 0) == (s32)SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT, "level 101: INVALID_ARGUMENT");
++    CHECK(sceNpTrophySetSoundLevel(ctx, h, 50, 1) == (s32)SCE_NP_TROPHY_ERROR_NOT_SUPPORTED, "options: NOT_SUPPORTED");
++    CHECK(sceNpTrophySetSoundLevel(ctx + 1, h, 50, 0) == (s32)SCE_NP_TROPHY_ERROR_INVALID_CONTEXT, "an unknown context");
++    CHECK(sceNpTrophySetSoundLevel(ctx, h + 1, 50, 0) == (s32)SCE_NP_TROPHY_ERROR_INVALID_HANDLE, "an unknown handle");
++    CHECK(sceNpTrophySetSoundLevel(ctx, h, 20, 0) == CELL_OK && sceNpTrophySetSoundLevel(ctx, h, 100, 0) == CELL_OK,
++          "levels 20 and 100 are CELL_OK");
++    if (fails) { printf("%d check(s) failed\n", fails); return 1; }
++    puts("test_trophy_sound_level: OK");
++    return 0;
++}
+diff --git a/tools/test_trophy_sound_level.py b/tools/test_trophy_sound_level.py
+new file mode 100644
+index 00000000..64167e77
+--- /dev/null
++++ b/tools/test_trophy_sound_level.py
+@@ -0,0 +1,52 @@
++#!/usr/bin/env python3
++"""sceNpTrophySetSoundLevel (libs/network/sceNpTrophy.c).
++
++Titles import it as 0x27DEDA93. It had no handler, so it took the unresolved
++path and faked CELL_OK whatever its arguments. Checks that the name hashes to
++that NID, then builds libs/network/tests/test_trophy_sound_level.c, which
++includes sceNpTrophy.c, and runs it.
++"""
++import hashlib
++import os
++import shutil
++import struct
++import subprocess
++import sys
++import tempfile
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++SUFFIX = b"\x67\x59\x65\x99\x04\x25\x04\x90\x56\x64\x27\x49\x94\x89\x74\x1A"
++NIDS = (('sceNpTrophySetSoundLevel', 0x27DEDA93),)
++
++
++def nid(name):
++    return struct.unpack('<I', hashlib.sha1(name.encode() + SUFFIX).digest()[:4])[0]
++
++
++def main():
++    fails = 0
++    for name, want in NIDS:
++        got = nid(name)
++        fails += got != want
++        print(f"[{'PASS' if got == want else 'FAIL'}] {name} hashes to 0x{got:08X} (imported as 0x{want:08X})")
++    cc = os.environ.get('CC') or shutil.which('cc') or shutil.which('gcc') or shutil.which('clang')
++    if not cc:
++        print('SKIP: no C compiler')
++        return 1 if fails else 0
++    with tempfile.TemporaryDirectory() as tmp:
++        exe = Path(tmp) / 'test_trophy_sound_level'
++        r = subprocess.run([cc, '-std=gnu17', '-O1', '-w', '-Wl,-dead_strip' if sys.platform == 'darwin' else '-Wl,--gc-sections', '-ffunction-sections', '-fdata-sections', '-I' + str(ROOT / 'include'),
++                            str(ROOT / 'libs/network/tests/test_trophy_sound_level.c'), '-o', str(exe)],
++                           capture_output=True, text=True)
++        if r.returncode:
++            print(r.stdout + r.stderr)
++            print('FAIL: fixture did not build')
++            return 1
++        r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=30)
++        sys.stdout.write(r.stdout + r.stderr)
++        return 1 if (fails or r.returncode) else 0
++
++
++if __name__ == '__main__':
++    sys.exit(main())
