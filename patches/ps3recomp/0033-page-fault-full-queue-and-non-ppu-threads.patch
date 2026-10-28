@@ -1,0 +1,303 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] page faults: a full queue is retried, non-PPU threads are paged in, 337 records its mapping
+
+Upstream: not yet submitted; written to be upstreamed (generic, no title names)
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0032)
+
+What (fixes to 0029, from its review):
+- A fault whose event the queue refuses (full) waits and sends again every
+  1 ms, as lv2 does (RPCS3 Thread.cpp retries the same way; no code taken).
+  Before, the page was committed as zeros and never paged in for anyone. A
+  queue that no longer exists stops the process with the page named.
+- A thread with no guest PPU identity of its own (an SPU worker, an HLE host
+  thread, or a guest callback on a host thread, which all shared the id
+  0x7FFF0000) no longer gets an empty page that then reads as zeros for every
+  thread. Its fault goes to the pager as a PPU fault under an id of its own
+  (0x7FFE0001 on, one per host thread); it waits until the page is mapped or
+  that id is recovered with lv2 57. Every such fault is reported on stderr.
+  lv2 would report an SPU thread's fault with its SPU type (a departure).
+- ps3_pf_page_unmapped() is used by that wait.
+- sys_mmapper_search_and_map (337) records the block it maps, so
+  sys_mmapper_unmap_memory answers its id again (it answered EINVAL after
+  0029) and a block inside a page-fault area is reachable.
+
+Test: tools/test_mmapper_page_fault.py gains a size-1 queue that is full when
+a PPU thread faults (it waits, the retried event arrives, the access sees the
+pager's data) and a thread with no PPU context faulting (it waits, the page
+stays unmapped meanwhile, the pager gets its event under 0x7FFE0001 and the
+access sees the pager's data). tools/test_loader_memory_domain.py checks that
+337 records the block it maps.
+
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index 5d100d5c..f661b2fa 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -49,6 +49,7 @@
+ #include <unistd.h>
+ #endif
+ extern "C" uint32_t ppu_prof_resolve_host(void* ra);
++extern "C" int32_t ps3_mm_map(uint32_t addr, uint32_t mem_id);   /* sys_mmapper_pf.c */
+ 
+ /* Resolve the GUEST function on the host stack (closest lifted entry below
+  * each frame) -- the same trick the [BLOCK] profiler uses. */
+@@ -3401,6 +3402,13 @@ extern "C" void lv2_syscall(ppu_context* ctx)
+             ctx->gpr[3] = (uint64_t)rc;
+             return;
+         }
++        /* Record the block as mapped there, so unmap answers its id and a
++         * page-fault area treats the block as present (an unknown id, for
++         * which the 1 MB default was used, keeps no record). */
++        if (size == ps3_mmapper_block_size(mem_id)) {
++            extern int32_t ps3_mm_map(uint32_t addr, uint32_t mem_id);   /* extern "C" above */
++            (void)ps3_mm_map(va, mem_id);
++        }
+         if (outp) vm_write32(outp, va);
+         ctx->gpr[3] = 0;
+         return;
+diff --git a/runtime/syscalls/sys_mmapper_pf.c b/runtime/syscalls/sys_mmapper_pf.c
+index 4b384540..4b90948d 100644
+--- a/runtime/syscalls/sys_mmapper_pf.c
++++ b/runtime/syscalls/sys_mmapper_pf.c
+@@ -33,9 +33,13 @@
+  * already has a notification; 57 is EINVAL for a thread that is not
+  * suspended on a page fault.
+  *
+- * Not covered: faults from SPU threads (DMA) and from host threads (RSX, audio)
+- * are not turned into events; such an access commits the page empty and is
+- * reported once on stderr.
++ * Threads with no guest PPU identity (SPU workers, HLE host threads, guest
++ * callbacks on host threads): lv2 would report an SPU fault with its SPU type;
++ * here the fault goes to the pager as a PPU fault under an id of the host
++ * thread's own (0x7FFE0001 on), and the thread waits until the page is mapped
++ * or that id is recovered. The page is never committed empty. Every such fault
++ * is reported on stderr. A full queue is retried every 1 ms, as lv2 does; a
++ * queue that is gone stops the process, naming the page.
+  */
+ #include "sys_mmapper_pf.h"
+ #include "sys_memory.h"
+@@ -216,6 +220,8 @@ int32_t ps3_mm_free(uint32_t mem_id)
+     return CELL_OK;
+ }
+ 
++/* Is the guest page holding addr inside a page-fault area and not mapped?
++ * The fault handler's wait for a host thread uses it. */
+ int ps3_pf_page_unmapped(uint32_t addr)
+ {
+     pf_area* a = area_of(addr, 1);
+@@ -235,6 +241,26 @@ static void pf_nap(void)
+ #endif
+ }
+ 
++static void pf_nap_ms(void)
++{
++#ifdef _WIN32
++    Sleep(1);
++#else
++    struct timespec ts = { 0, 1000000 };
++    nanosleep(&ts, NULL);
++#endif
++}
++
++static int pf_queue_alive(uint32_t qid)
++{
++    return qid && qid <= SYS_EVENT_QUEUE_MAX && g_sys_event_queues[qid - 1].active;
++}
++
++/* Fault ids for threads with no PPU identity of their own (see pf_veh). */
++#define PF_HOST_ID_BASE 0x7FFE0000u
++static PPU_THREAD_LOCAL uint32_t s_host_pf_id;
++static uint32_t s_host_pf_next;
++
+ static LONG WINAPI pf_veh(EXCEPTION_POINTERS* ep)
+ {
+     if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || !vm_base)
+@@ -251,14 +277,21 @@ static LONG WINAPI pf_veh(EXCEPTION_POINTERS* ep)
+ 
+     ppu_context* ctx = g_active_ctx;
+     uint64_t tid = ctx ? ctx->thread_id : 0;
+-    if (!tid) {
+-        /* Not a guest PPU thread: nothing in lv2 to suspend. Give it an empty page. */
+-        static int n = 0;
+-        if (n++ < 4)
+-            fprintf(stderr, "[pf] a host thread touched unmapped page 0x%08X of page-fault area 0x%08X; committed empty\n",
+-                    page, a->start);
+-        host_protect(page, MM_PAGE, 1);
+-        return EXCEPTION_CONTINUE_EXECUTION;
++    /* A thread with no guest PPU identity of its own: an SPU worker, an HLE
++     * host thread, or a guest callback run on a host thread (which all share
++     * the id 0x7FFF0000). lv2 has no such thread to suspend. Its fault is sent
++     * to the pager under an id of its own (PF_HOST_ID_BASE + n, one per host
++     * thread), and it waits until the page is mapped or that id is recovered
++     * with lv2 57. The page is never handed out empty: a PPU thread touching
++     * it later still faults (D52). Reported every time. */
++    int host = 0;
++    if (!tid || (tid & 0xFFFF0000ull) == 0x7FFF0000ull) {
++        if (!s_host_pf_id)
++            s_host_pf_id = PF_HOST_ID_BASE + __atomic_add_fetch(&s_host_pf_next, 1, __ATOMIC_ACQ_REL);
++        tid = s_host_pf_id;
++        host = 1;
++        fprintf(stderr, "[pf] NON-PPU thread (fault id 0x%08llX) touched unmapped page 0x%08X of page-fault area 0x%08X; "
++                "sent to the pager, waiting for the page\n", (unsigned long long)tid, page, a->start);
+     }
+ 
+     pf_fault* f = NULL;
+@@ -273,20 +306,33 @@ static LONG WINAPI pf_veh(EXCEPTION_POINTERS* ep)
+     }
+     f->addr = addr;
+     __atomic_store_n(&f->recovered, 0, __ATOMIC_RELEASE);
+-    if (sys_event_queue_push_by_id(a->queue_id, SYS_MEMORY_PAGE_FAULT_EVENT_KEY, addr,
+-                                   (SYS_MEMORY_PAGE_FAULT_TYPE_PPU_THREAD << 32) | (tid & 0xFFFFFFFFull),
+-                                   SYS_MEMORY_PAGE_FAULT_CAUSE_NON_MAPPED) != 0) {
+-        static int n = 0;
+-        if (n++ < 4)
+-            fprintf(stderr, "[pf] page fault at 0x%08X (tid %llu): queue %u refused the event; committed empty\n",
++    /* A full queue refuses the event: wait and send again, as lv2 does (RPCS3
++     * retries every 1 ms). Never map zeros. A queue that is gone can never be
++     * answered: stop the process, naming the page, rather than hand out data
++     * the pager never filled. */
++    for (int tries = 0;; tries++) {
++        if (sys_event_queue_push_by_id(a->queue_id, SYS_MEMORY_PAGE_FAULT_EVENT_KEY, addr,
++                                       (SYS_MEMORY_PAGE_FAULT_TYPE_PPU_THREAD << 32) | (tid & 0xFFFFFFFFull),
++                                       SYS_MEMORY_PAGE_FAULT_CAUSE_NON_MAPPED) == 0)
++            break;
++        if (!pf_queue_alive(a->queue_id)) {
++            fprintf(stderr, "[pf] FATAL: page fault at 0x%08X (fault id 0x%08llX) but queue %u of area 0x%08X is gone; "
++                    "no pager can map it\n", addr, (unsigned long long)tid, a->queue_id, a->start);
++            abort();
++        }
++        if (tries == 0)
++            fprintf(stderr, "[pf] page fault at 0x%08X (fault id 0x%08llX): queue %u is full; retrying every 1 ms\n",
+                     addr, (unsigned long long)tid, a->queue_id);
+-        __atomic_store_n(&f->tid, 0, __ATOMIC_RELEASE);
+-        host_protect(page, MM_PAGE, 1);
+-        return EXCEPTION_CONTINUE_EXECUTION;
++        pf_nap_ms();
+     }
+     if (getenv("PS3_PFLOG"))
+-        fprintf(stderr, "[pf] tid %llu faulted at 0x%08X -> queue %u\n", (unsigned long long)tid, addr, a->queue_id);
+-    while (!__atomic_load_n(&f->recovered, __ATOMIC_ACQUIRE)) pf_nap();
++        fprintf(stderr, "[pf] tid 0x%llX faulted at 0x%08X -> queue %u\n", (unsigned long long)tid, addr, a->queue_id);
++    for (;;) {
++        if (__atomic_load_n(&f->recovered, __ATOMIC_ACQUIRE)) break;
++        /* A host thread also goes on once the page is mapped, whoever asked. */
++        if (host && !ps3_pf_page_unmapped(page)) break;
++        pf_nap();
++    }
+     __atomic_store_n(&f->tid, 0, __ATOMIC_RELEASE);
+     return EXCEPTION_CONTINUE_EXECUTION;       /* re-run the access */
+ }
+diff --git a/tests/test_mmapper_page_fault.c b/tests/test_mmapper_page_fault.c
+index f709d27c..6f541149 100644
+--- a/tests/test_mmapper_page_fault.c
++++ b/tests/test_mmapper_page_fault.c
+@@ -112,6 +112,43 @@ static void* pager(void* arg)
+     return NULL;
+ }
+ 
++
++/* Review I-1 and I-2: a full queue, and a thread with no PPU identity. */
++static uint32_t g_area2, g_q2;
++static volatile uint32_t g_seen2 = 0xFFFFFFFFu, g_seen3 = 0xFFFFFFFFu;
++static uint64_t g_evt2[4], g_evt3[4];
++static void* guest_full(void* arg)
++{
++    (void)arg;
++    ppu_context self; memset(&self, 0, sizeof self);
++    self.thread_id = 9;
++    g_active_ctx = &self;
++    __asm__ volatile("" ::: "memory");
++    g_seen2 = *(volatile uint32_t*)vm_to_host(g_area2 + 0x10010);
++    return NULL;
++}
++static void* host_toucher(void* arg)
++{
++    (void)arg;
++    g_active_ctx = NULL;                  /* an SPU worker or HLE host thread */
++    __asm__ volatile("" ::: "memory");
++    g_seen3 = *(volatile uint32_t*)vm_to_host(g_area2 + 0x30010);
++    return NULL;
++}
++/* Receive one event into out[], map a patterned object at its page, recover. */
++static int64_t serve_one(uint32_t q, uint64_t* out, uint32_t pattern)
++{
++    ppu_context c; memset(&c, 0, sizeof c);
++    c.gpr[3] = q; c.gpr[4] = SCRATCH + 0x200; c.gpr[5] = 0;
++    if (sys_event_queue_receive(&c) != CELL_OK) return -1;
++    for (int i = 0; i < 4; i++) out[i] = rd64(SCRATCH + 0x200 + 8 * i);
++    if (out[0] != SYS_MEMORY_PAGE_FAULT_EVENT_KEY) return 0;   /* the filler */
++    uint32_t page = (uint32_t)out[1] & ~0xFFFFu;
++    if (ps3_mm_map(page, ps3_mm_object_create(0x10000)) != CELL_OK) return -2;
++    *(volatile uint32_t*)vm_to_host(page + 0x10) = pattern;
++    return recover(out[2] & 0xFFFFFFFFu);
++}
++
+ int main(void)
+ {
+     setvbuf(stdout, NULL, _IONBF, 0);
+@@ -165,6 +202,40 @@ int main(void)
+     CHECK(ps3_mm_unmap(g_area + 0x50000, &id) == CELL_OK && ps3_mm_free(g_obj) == CELL_OK, "unmapped, it frees");
+     CHECK(ps3_mm_free(g_obj) == (int32_t)CELL_ESRCH, "a freed object is ESRCH");
+ 
++    {   /* A second area whose queue holds one event, already full. */
++        ppu_context c; memset(&c, 0, sizeof c);
++        c.gpr[3] = 0x1000000; c.gpr[4] = 0; c.gpr[5] = 0x10000000; c.gpr[6] = SCRATCH;
++        assert(sys_mmapper_allocate_address(&c) == CELL_OK);
++        g_area2 = rd32(SCRATCH);
++        memset(&c, 0, sizeof c);
++        c.gpr[3] = SCRATCH + 8; c.gpr[4] = 0; c.gpr[5] = 0x7778; c.gpr[6] = 1;
++        assert(sys_event_queue_create(&c) == CELL_OK);
++        g_q2 = rd32(SCRATCH + 8);
++        assert(enable(g_area2, g_q2) == CELL_OK);
++        CHECK(sys_event_queue_push_by_id(g_q2, 0x1234, 1, 2, 3) == 0, "the size-1 queue is filled");
++    }
++    pthread_t tf;
++    pthread_create(&tf, NULL, guest_full, NULL);
++    usleep(50000);                        /* the fault meets a full queue and retries */
++    CHECK(g_seen2 == 0xFFFFFFFFu, "with the queue full, the faulting thread waits (no zeros handed out)");
++    uint64_t filler[4];
++    CHECK(serve_one(g_q2, filler, 0) == 0 && filler[0] == 0x1234, "the pager takes the filler event first");
++    CHECK(serve_one(g_q2, g_evt2, 0xA5A5A5A5u) == CELL_OK, "then the retried fault event arrives and is recovered");
++    pthread_join(tf, NULL);
++    CHECK(g_evt2[2] == ((SYS_MEMORY_PAGE_FAULT_TYPE_PPU_THREAD << 32) | 9), "it is thread 9's fault (0x%llX)", (unsigned long long)g_evt2[2]);
++    CHECK(g_seen2 == 0xA5A5A5A5u, "the retried access sees the pager's data (0x%08X)", g_seen2);
++
++    pthread_t th;
++    pthread_create(&th, NULL, host_toucher, NULL);
++    usleep(50000);
++    CHECK(g_seen3 == 0xFFFFFFFFu, "a non-PPU thread's touch waits for the pager");
++    CHECK(ps3_pf_page_unmapped(g_area2 + 0x30000), "and the page is not committed empty meanwhile");
++    CHECK(serve_one(g_q2, g_evt3, 0x5A5A5A5Au) == CELL_OK, "its fault reaches the pager, which maps and recovers it");
++    pthread_join(th, NULL);
++    CHECK((g_evt3[2] >> 32) == SYS_MEMORY_PAGE_FAULT_TYPE_PPU_THREAD && (uint32_t)g_evt3[2] > 0x7FFE0000u &&
++          (uint32_t)g_evt3[2] < 0x7FFF0000u, "under a host fault id of its own (0x%llX)", (unsigned long long)g_evt3[2]);
++    CHECK(g_seen3 == 0x5A5A5A5Au, "the host thread then reads the pager's data (0x%08X)", g_seen3);
++
+     if (fails) { printf("%d check(s) failed\n", fails); return 1; }
+     puts("test_mmapper_page_fault: OK");
+     return 0;
+diff --git a/tools/test_loader_memory_domain.py b/tools/test_loader_memory_domain.py
+index 6569cb3a..cfa48292 100644
+--- a/tools/test_loader_memory_domain.py
++++ b/tools/test_loader_memory_domain.py
+@@ -19,6 +19,8 @@ uint8_t* vm_base; uint32_t ppu_vm_size; uint32_t ppu_hle_inject_base=0x20000000u
+ uint32_t vm_read32(uint64_t a){auto p=vm_base+a;return (uint32_t(p[0])<<24)|(uint32_t(p[1])<<16)|(uint32_t(p[2])<<8)|p[3];}
+ void vm_write32(uint64_t a,uint32_t x){auto p=vm_base+a;p[0]=x>>24;p[1]=x>>16;p[2]=x>>8;p[3]=x;}
+ uint32_t ps3_mmapper_block_size(uint32_t id){return id==1?0x100000u:0x200000u;}
++static uint32_t g_map_va, g_map_id; static int g_maps;
++int32_t ps3_mm_map(uint32_t va,uint32_t id){g_map_va=va;g_map_id=id;g_maps++;return 0;}
+ void actual_loader_cases(ppu_context* ctx){switch(ctx->gpr[11]){
+ '''
+  post='''default:std::abort();}}
+@@ -29,8 +31,9 @@ c={};c.gpr[11]=337;c.gpr[3]=0x10000000;c.gpr[4]=1;c.gpr[6]=0x10000;actual_loader
+ c.gpr[3]=base;actual_loader_cases(&c);CHECK(c.gpr[3]==0&&vm_read32(0x10000)==base);
+ c.gpr[3]=base;actual_loader_cases(&c);CHECK(c.gpr[3]!=0);
+ c={};c.gpr[11]=330;c.gpr[3]=0x100000;c.gpr[5]=0x100000;c.gpr[6]=0x10000;actual_loader_cases(&c);CHECK(c.gpr[3]==0);uint32_t second=vm_read32(0x10000);CHECK(second>=base+0x100000);
+-c={};c.gpr[11]=337;c.gpr[3]=second;c.gpr[4]=1;c.gpr[6]=0x10000;actual_loader_cases(&c);CHECK(c.gpr[3]==0&&vm_read32(0x10000)==second);
+-vm_shutdown();std::puts("PASS loader330/337 failure recovery, reservation bounds and independent cursors");}
++c={};c.gpr[11]=337;c.gpr[3]=second;c.gpr[4]=1;c.gpr[6]=0x10000;g_maps=0;actual_loader_cases(&c);CHECK(c.gpr[3]==0&&vm_read32(0x10000)==second);
++CHECK(g_maps==1&&g_map_va==second&&g_map_id==1);
++vm_shutdown();std::puts("PASS loader330/337 failure recovery, reservation bounds, independent cursors and 337 recording its mapping");}
+ '''
+  with tempfile.TemporaryDirectory(prefix='ps3-loader-memory-') as tmp:
+   tmp=Path(tmp);(tmp/'fixture.cpp').write_text(pre+body+post)
