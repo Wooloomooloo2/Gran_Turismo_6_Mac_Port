@@ -42,6 +42,9 @@ Shortcuts taken, with the proper fix logged. Priority order: 1) Stability, 2) Pe
 - The frame series and draw statistics (patch 0010, D35) cover the draw-engine render path only. The legacy vtable path (`PS3RECOMP_RSX_ENGINE=vtable`) counts nothing and dumps no series; add it there if that path is ever used again.
 - ps3recomp's `cellKb` reports a keyboard always connected on port 0 and caps `CELL_KB_MAX_KEYBOARDS` at 2 (SDK: 127). Check what GT6 does with a keyboard present versus RPCS3's default null keyboard.
 
+- Writers outside the cellFs allowlist (D45, batch 3 review m5): `cellSysCacheMount` and cellGame CreateGameData join a guest-supplied name to a host root without canonicalising it (a `../` in a cache id or game-data folder name would leave the play folder; GT6 passes its title id). The EDAT `.dec` cache is written beside the encrypted file wherever that is (refused on the read-only disc layer, D46). `cellFsUtil*` (`cellFsUtility.c`) uses the raw guest path as a host path (GT6 does not import it). Proper fix: route all four through ppu_fs.cpp's resolver.
+- The `GT6_IMAGE_SWITCHED` guard and the per-image `PAD_SCRIPT` hand-over in `port/main.cpp` have no automated test (batch 3 review m7); they are exercised only by the end-to-end install run.
+
 ## 2) Performance
 
 - The lwcond waiter queue (patch 0005) is one lock and one condition variable for every lwcond; each signal wakes all waiters to check their own flag. Fine for boot; give each lwcond its own channel if a profile shows wakeup storms.
