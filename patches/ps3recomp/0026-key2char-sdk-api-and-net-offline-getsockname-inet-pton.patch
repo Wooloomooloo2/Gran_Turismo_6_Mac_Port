@@ -1,0 +1,809 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] cellKey2char: the SDK's API; sys_net offline: bind, getsockname, inet_pton
+
+Upstream: not yet submitted; written to be upstreamed (generic, no title names)
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0025)
+
+What:
+- libs/misc/cellKey2char.c declared invented signatures: Open(arrangement,
+  handle*), with a u32 index as the handle, and KeyCodeToChar/GetMode, which
+  no title imports. The SDK passes the address of the title's own 128-byte
+  handle buffer to Open, Close, GetChar, SetMode and SetArrangement. A title's
+  Open(handle) was therefore read with its second register as the
+  out-pointer, and the index was written through whatever that register held
+  (guest memory corruption); SetArrangement (0x0DFBADFA) and GetChar were not
+  registered at all. The module now has the SDK's five calls with RPCS3's
+  answers (behaviour only; no RPCS3 code) and RPCS3's error values
+  (0x80121301-06; the header had 0x801216xx): NULL handle INVALID_HANDLE, byte
+  8 of the buffer the open flag (ALREADY_INITIALIZED / UNINITIALIZED), byte 0
+  == 255 OTHER, mode at most NATIVE2 and arrangement 0..24 (INVALID_PARAMETER).
+  Where RPCS3 has a TODO: Open sets the flag and Close clears it,
+  SetArrangement keeps the arrangement in byte 1, and GetChar converts
+  nothing (*charNum 0, *processed false), since no keyboard is attached.
+- runtime/ppu/ppu_sysprx.cpp's sys_net offline model (the default without
+  PS3_NET_ONLINE) had no getsockname (0x13EFE7F5) or inet_pton (0x8AF3825E):
+  both took the unresolved path, CELL_OK with nothing written. bind answered
+  0 and kept nothing. New runtime/ppu/ppu_net_offline.h: bind records the
+  address per socket (an ephemeral port from 49152 for port 0, EINVAL for a
+  second bind), getsockname reports it (0.0.0.0:0 when unbound) and sets the
+  length to 16, writing at most *addrlen bytes; inet_pton parses AF_INET
+  dotted quads (1 and the address, 0 and dst untouched otherwise, -1 with
+  EAFNOSUPPORT for another family). Errors are -1 with errno (EBADF, EFAULT).
+  _sys_net_errno_loc no longer overwrites errno with EWOULDBLOCK on every
+  call; it sets that once, when it allocates the cell.
+
+Why: a title that opens a key-to-character handle at boot had guest memory
+overwritten, and one that reads back its bound socket's address or parses an
+address literal got garbage or "invalid".
+
+Test: libs/misc/tests/test_key2char.c (tools/test_key2char.py) checks the
+NIDs, that Open writes only inside the handle buffer, and every answer above.
+runtime/ppu/tests/test_net_offline.cpp (tools/test_net_offline.py) checks
+bind and getsockname (bound, unbound, port 0, short length, EBADF, EFAULT) and
+inet_pton on valid and invalid literals.
+
+diff --git a/libs/misc/cellKey2char.c b/libs/misc/cellKey2char.c
+--- a/libs/misc/cellKey2char.c
++++ b/libs/misc/cellKey2char.c
+@@ -1,206 +1,83 @@
+ /*
+  * ps3recomp - cellKey2char HLE implementation
+  *
+- * Maps HID keyboard scancodes to ASCII/Unicode characters.
+- * Implements US-101 layout; other layouts return the same mapping
+- * (sufficient for most recompiled games).
++ * The SDK's API: cellKey2CharOpen(handle), Close(handle), GetChar(handle,
++ * kdata, charCode, charNum, processed), SetMode(handle, mode) and
++ * SetArrangement(handle, arrange), where handle is the guest address of the
++ * title's 128-byte handle buffer. The module used to declare invented
++ * signatures (Open(arrangement, handle*), a u32 index as the handle), so a
++ * title's Open(handle) was read with its second register as the out-pointer
++ * and a small index was written through whatever that register held.
++ *
++ * Behaviour follows RPCS3's cellKey2char (behaviour only; no RPCS3 code):
++ * NULL handle INVALID_HANDLE; byte 8 of the buffer is the open flag
++ * (ALREADY_INITIALIZED, UNINITIALIZED); byte 0 == 255 is OTHER; the mode must
++ * be at most NATIVE2 and the arrangement 0..24 (INVALID_PARAMETER). Where
++ * RPCS3 leaves a TODO this module does the plain thing: Open sets the flag
++ * (RPCS3 sets nothing, so every later call there answers UNINITIALIZED), Close
++ * clears it, SetArrangement keeps the arrangement in byte 1, and GetChar
++ * converts nothing (*charNum 0, *processed false), because no keyboard is
++ * attached (cellKb reports none).
+  */
+-
+ #include "cellKey2char.h"
+ #include <stdio.h>
+ #include <string.h>
+-#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
++#include "../../runtime/ppu/ppu_memory.h"
+ 
+-/* ---------------------------------------------------------------------------
+- * HID usage codes (subset used for key-to-char mapping)
+- * -----------------------------------------------------------------------*/
+-#define HID_KEY_A          0x04
+-#define HID_KEY_Z          0x1D
+-#define HID_KEY_1          0x1E
+-#define HID_KEY_0          0x27
+-#define HID_KEY_ENTER      0x28
+-#define HID_KEY_ESCAPE     0x29
+-#define HID_KEY_BACKSPACE  0x2A
+-#define HID_KEY_TAB        0x2B
+-#define HID_KEY_SPACE      0x2C
+-#define HID_KEY_MINUS      0x2D
+-#define HID_KEY_EQUAL      0x2E
+-#define HID_KEY_LBRACKET   0x2F
+-#define HID_KEY_RBRACKET   0x30
+-#define HID_KEY_BACKSLASH  0x31
+-#define HID_KEY_SEMICOLON  0x33
+-#define HID_KEY_QUOTE      0x34
+-#define HID_KEY_GRAVE      0x35
+-#define HID_KEY_COMMA      0x36
+-#define HID_KEY_PERIOD     0x37
+-#define HID_KEY_SLASH      0x38
++#define K2C_OPEN_BYTE  8
++#define K2C_MAP_BYTE   1
+ 
+-/* Modifier key bits */
+-#define MKEY_L_CTRL        0x01
+-#define MKEY_L_SHIFT       0x02
+-#define MKEY_R_CTRL        0x10
+-#define MKEY_R_SHIFT       0x20
+-#define MKEY_SHIFT         (MKEY_L_SHIFT | MKEY_R_SHIFT)
+-
+-/* LED bits */
+-#define LED_CAPS_LOCK      0x02
+-
+-/* ---------------------------------------------------------------------------
+- * Internal state
+- * -----------------------------------------------------------------------*/
+-#define MAX_K2C_HANDLES 4
+-
+-typedef struct {
+-    int  in_use;
+-    u32  arrangement;
+-    s32  mode; /* 0 = normal, 1 = dead-key compose */
+-} K2CContext;
+-
+-static K2CContext s_contexts[MAX_K2C_HANDLES];
+-
+-/* US-101 layout tables */
+-static const char s_unshifted_symbols[] = {
+-    /* 0x2D - 0x38: - = [ ] \ # ; ' ` , . / */
+-    '-', '=', '[', ']', '\\', '#', ';', '\'', '`', ',', '.', '/'
+-};
+-
+-static const char s_shifted_symbols[] = {
+-    '_', '+', '{', '}', '|', '~', ':', '"', '~', '<', '>', '?'
+-};
+-
+-static const char s_shifted_numbers[] = {
+-    '!', '@', '#', '$', '%', '^', '&', '*', '(', ')'
+-};
+-
+-/* ---------------------------------------------------------------------------
+- * API implementations
+- * -----------------------------------------------------------------------*/
+-
+-s32 cellKey2CharOpen(u32 arrangement, CellKey2CharHandle* handle)
++static s32 k2c_check(u32 handle)
+ {
+-    printf("[cellKey2char] Open(arrangement=%u)\n", arrangement);
+-
+-    if (!handle)
+-        return (s32)CELL_K2C_ERROR_INVALID_PARAMETER;
+-
+-    for (int i = 0; i < MAX_K2C_HANDLES; i++) {
+-        if (!s_contexts[i].in_use) {
+-            s_contexts[i].in_use = 1;
+-            s_contexts[i].arrangement = arrangement;
+-            s_contexts[i].mode = 0;
+-            vm_write32((u32)(uintptr_t)handle, (u32)i);
+-            return CELL_OK;
+-        }
+-    }
+-
+-    return (s32)CELL_K2C_ERROR_FATAL;
++    if (!handle) return (s32)CELL_K2C_ERROR_INVALID_HANDLE;
++    if (vm_read8(handle + K2C_OPEN_BYTE) == 0) return (s32)CELL_K2C_ERROR_UNINITIALIZED;
++    return CELL_OK;
+ }
+ 
+-s32 cellKey2CharClose(CellKey2CharHandle handle)
++s32 cellKey2CharOpen(u32 handle)
+ {
+-    printf("[cellKey2char] Close(handle=%u)\n", handle);
+-
+-    if (handle >= MAX_K2C_HANDLES || !s_contexts[handle].in_use)
+-        return (s32)CELL_K2C_ERROR_INVALID_HANDLE;
+-
+-    s_contexts[handle].in_use = 0;
++    printf("[cellKey2char] Open(handle=0x%08X)\n", handle);
++    if (!handle) return (s32)CELL_K2C_ERROR_INVALID_HANDLE;
++    if (vm_read8(handle + K2C_OPEN_BYTE) != 0) return (s32)CELL_K2C_ERROR_ALREADY_INITIALIZED;
++    vm_write8(handle + K2C_OPEN_BYTE, 1);
+     return CELL_OK;
+ }
+ 
+-s32 cellKey2CharKeyCodeToChar(CellKey2CharHandle handle,
+-                               u32 mkey, u32 led, u16 rawcode,
+-                               u16* charCode, u32* charNum)
++s32 cellKey2CharClose(u32 handle)
+ {
+-    if (handle >= MAX_K2C_HANDLES || !s_contexts[handle].in_use)
+-        return (s32)CELL_K2C_ERROR_INVALID_HANDLE;
++    const s32 rc = k2c_check(handle);
++    if (rc != CELL_OK) return rc;
++    vm_write8(handle + K2C_OPEN_BYTE, 0);
++    return CELL_OK;
++}
+ 
+-    if (!charCode || !charNum)
++s32 cellKey2CharGetChar(u32 handle, u32 kdata, u32 charCode, u32 charNum, u32 processed)
++{
++    const s32 rc = k2c_check(handle);
++    if (rc != CELL_OK) return rc;
++    /* kdata = {u32 led, u32 mkey, u16 keycode} */
++    if (!charCode || !kdata || vm_read16(kdata + 8) == 0)
+         return (s32)CELL_K2C_ERROR_INVALID_PARAMETER;
+-
+-    int shift = (mkey & MKEY_SHIFT) != 0;
+-    int caps  = (led & LED_CAPS_LOCK) != 0;
+-
+-    vm_write32((u32)(uintptr_t)charNum, (u32)0);
+-
+-    /* Letters A-Z (HID 0x04 - 0x1D) */
+-    if (rawcode >= HID_KEY_A && rawcode <= HID_KEY_Z) {
+-        char base = 'a' + (char)(rawcode - HID_KEY_A);
+-        if (shift ^ caps) /* XOR: shift or caps but not both */
+-            base = (char)(base - 32); /* to uppercase */
+-        charCode[0] = (u16)base;
+-        vm_write32((u32)(uintptr_t)charNum, (u32)1);
+-        return CELL_OK;
+-    }
+-
+-    /* Numbers 1-9, 0 (HID 0x1E - 0x27) */
+-    if (rawcode >= HID_KEY_1 && rawcode <= HID_KEY_0) {
+-        int idx = rawcode - HID_KEY_1;
+-        if (shift) {
+-            charCode[0] = (u16)s_shifted_numbers[idx];
+-        } else {
+-            charCode[0] = (idx < 9) ? (u16)('1' + idx) : (u16)'0';
+-        }
+-        vm_write32((u32)(uintptr_t)charNum, (u32)1);
+-        return CELL_OK;
+-    }
+-
+-    /* Special keys */
+-    switch (rawcode) {
+-    case HID_KEY_ENTER:
+-        charCode[0] = '\n';
+-        vm_write32((u32)(uintptr_t)charNum, (u32)1);
+-        return CELL_OK;
+-    case HID_KEY_TAB:
+-        charCode[0] = '\t';
+-        vm_write32((u32)(uintptr_t)charNum, (u32)1);
+-        return CELL_OK;
+-    case HID_KEY_SPACE:
+-        charCode[0] = ' ';
+-        vm_write32((u32)(uintptr_t)charNum, (u32)1);
+-        return CELL_OK;
+-    case HID_KEY_BACKSPACE:
+-        charCode[0] = 0x08;
+-        vm_write32((u32)(uintptr_t)charNum, (u32)1);
+-        return CELL_OK;
+-    case HID_KEY_ESCAPE:
+-        charCode[0] = 0x1B;
+-        vm_write32((u32)(uintptr_t)charNum, (u32)1);
+-        return CELL_OK;
+-    }
+-
+-    /* Symbol keys (0x2D - 0x38) */
+-    if (rawcode >= HID_KEY_MINUS && rawcode <= HID_KEY_SLASH) {
+-        int idx = rawcode - HID_KEY_MINUS;
+-        if (idx < (int)sizeof(s_unshifted_symbols)) {
+-            charCode[0] = shift ? (u16)s_shifted_symbols[idx]
+-                                : (u16)s_unshifted_symbols[idx];
+-            vm_write32((u32)(uintptr_t)charNum, (u32)1);
+-            return CELL_OK;
+-        }
+-    }
+-
+-    /* Unknown key - no character output */
+-    vm_write32((u32)(uintptr_t)charNum, (u32)0);
++    if (charNum) vm_write32(charNum, 0);
++    if (processed) vm_write8(processed, 0);
+     return CELL_OK;
+ }
+ 
+-s32 cellKey2CharSetMode(CellKey2CharHandle handle, s32 mode)
++s32 cellKey2CharSetMode(u32 handle, s32 mode)
+ {
+-    if (handle >= MAX_K2C_HANDLES || !s_contexts[handle].in_use)
+-        return (s32)CELL_K2C_ERROR_INVALID_HANDLE;
+-
+-    s_contexts[handle].mode = mode;
++    const s32 rc = k2c_check(handle);
++    if (rc != CELL_OK) return rc;
++    if (mode > CELL_KEY2CHAR_MODE_NATIVE2) return (s32)CELL_K2C_ERROR_INVALID_PARAMETER;
++    if (vm_read8(handle) == 255) return (s32)CELL_K2C_ERROR_OTHER;
+     return CELL_OK;
+ }
+ 
+-s32 cellKey2CharGetMode(CellKey2CharHandle handle, s32* mode)
++s32 cellKey2CharSetArrangement(u32 handle, s32 arrange)
+ {
+-    if (handle >= MAX_K2C_HANDLES || !s_contexts[handle].in_use)
+-        return (s32)CELL_K2C_ERROR_INVALID_HANDLE;
+-
+-    if (!mode)
++    const s32 rc = k2c_check(handle);
++    if (rc != CELL_OK) return rc;
++    if (arrange < CELL_K2C_MAPPING_FIRST || arrange > CELL_K2C_MAPPING_LAST)
+         return (s32)CELL_K2C_ERROR_INVALID_PARAMETER;
+-
+-    vm_write32((u32)(uintptr_t)mode, (u32)s_contexts[handle].mode);
++    vm_write8(handle + K2C_MAP_BYTE, (uint8_t)arrange);
+     return CELL_OK;
+ }
+diff --git a/libs/misc/cellKey2char.h b/libs/misc/cellKey2char.h
+--- a/libs/misc/cellKey2char.h
++++ b/libs/misc/cellKey2char.h
+@@ -1,10 +1,9 @@
+ /*
+  * ps3recomp - cellKey2char HLE
+  *
+- * Keyboard scancode to character conversion. Maps PS3 keyboard HID
+- * scancodes to Unicode characters based on keyboard arrangement.
++ * Keyboard key code to character conversion, with the SDK's API: the title
++ * owns a 128-byte handle buffer and passes its address to every call.
+  */
+-
+ #ifndef PS3RECOMP_CELL_KEY2CHAR_H
+ #define PS3RECOMP_CELL_KEY2CHAR_H
+ 
+@@ -15,67 +14,32 @@
+ extern "C" {
+ #endif
+ 
+-/* ---------------------------------------------------------------------------
+- * Error codes
+- * -----------------------------------------------------------------------*/
+-#define CELL_K2C_ERROR_FATAL               0x80121601
+-#define CELL_K2C_ERROR_INVALID_HANDLE      0x80121602
+-#define CELL_K2C_ERROR_INVALID_PARAMETER   0x80121603
+-#define CELL_K2C_ERROR_ALREADY_INITIALIZED 0x80121604
+-#define CELL_K2C_ERROR_UNINITIALIZED       0x80121605
++/* Error codes (the SDK's, as RPCS3 lists them) */
++#define CELL_K2C_ERROR_FATAL               0x80121301
++#define CELL_K2C_ERROR_INVALID_HANDLE      0x80121302
++#define CELL_K2C_ERROR_INVALID_PARAMETER   0x80121303
++#define CELL_K2C_ERROR_ALREADY_INITIALIZED 0x80121304
++#define CELL_K2C_ERROR_UNINITIALIZED       0x80121305
++#define CELL_K2C_ERROR_OTHER               0x80121306
+ 
+-/* ---------------------------------------------------------------------------
+- * Keyboard arrangements
+- * -----------------------------------------------------------------------*/
+-#define CELL_KB_MAPPING_101                0
+-#define CELL_KB_MAPPING_106                1
+-#define CELL_KB_MAPPING_106_KANA           2
+-#define CELL_KB_MAPPING_GERMAN_GERMANY     3
+-#define CELL_KB_MAPPING_SPANISH_SPAIN      4
+-#define CELL_KB_MAPPING_FRENCH_FRANCE      5
+-#define CELL_KB_MAPPING_ITALIAN_ITALY      6
+-#define CELL_KB_MAPPING_PORTUGUESE_PORTUGAL 7
+-#define CELL_KB_MAPPING_RUSSIAN_RUSSIA     8
+-#define CELL_KB_MAPPING_ENGLISH_UK         9
+-#define CELL_KB_MAPPING_KOREAN_KOREA       10
+-#define CELL_KB_MAPPING_NORWEGIAN_NORWAY   11
+-#define CELL_KB_MAPPING_FINNISH_FINLAND    12
+-#define CELL_KB_MAPPING_DANISH_DENMARK     13
+-#define CELL_KB_MAPPING_SWEDISH_SWEDEN     14
+-#define CELL_KB_MAPPING_CHINESE_TRADITIONAL 15
+-#define CELL_KB_MAPPING_CHINESE_SIMPLIFIED 16
+-#define CELL_KB_MAPPING_SWISS_FRENCH       17
+-#define CELL_KB_MAPPING_SWISS_GERMAN       18
+-#define CELL_KB_MAPPING_CANADIAN_FRENCH    19
+-#define CELL_KB_MAPPING_BELGIAN_BELGIUM    20
+-#define CELL_KB_MAPPING_POLISH_POLAND      21
+-#define CELL_KB_MAPPING_BRAZILIAN          22
+-#define CELL_KB_MAPPING_TURKISH_TURKEY     23
++/* Modes */
++#define CELL_KEY2CHAR_MODE_ENGLISH 0
++#define CELL_KEY2CHAR_MODE_NATIVE  1
++#define CELL_KEY2CHAR_MODE_NATIVE2 2
+ 
+-/* ---------------------------------------------------------------------------
+- * Types
+- * -----------------------------------------------------------------------*/
+-typedef u32 CellKey2CharHandle;
++/* Keyboard arrangements: CELL_KB_MAPPING_101 (0) .. CELL_KB_MAPPING_TURKISH_TURKEY (24) */
++#define CELL_K2C_MAPPING_FIRST 0
++#define CELL_K2C_MAPPING_LAST  24
+ 
+-/* ---------------------------------------------------------------------------
+- * Functions
+- * -----------------------------------------------------------------------*/
++#define SCE_KEY2CHAR_HANDLE_SIZE 128
+ 
+-s32 cellKey2CharOpen(u32 arrangement, CellKey2CharHandle* handle);
+-s32 cellKey2CharClose(CellKey2CharHandle handle);
++/* Every pointer is a guest address. The handle is the title's 128-byte buffer. */
++s32 cellKey2CharOpen(u32 handle);
++s32 cellKey2CharClose(u32 handle);
++s32 cellKey2CharGetChar(u32 handle, u32 kdata, u32 charCode, u32 charNum, u32 processed);
++s32 cellKey2CharSetMode(u32 handle, s32 mode);
++s32 cellKey2CharSetArrangement(u32 handle, s32 arrange);
+ 
+-/* Convert a keyboard scancode to Unicode character(s) */
+-s32 cellKey2CharKeyCodeToChar(CellKey2CharHandle handle,
+-                               u32 mkey,        /* modifier keys */
+-                               u32 led,         /* LED state */
+-                               u16 rawcode,     /* HID usage code */
+-                               u16* charCode,   /* output char */
+-                               u32* charNum);   /* number of output chars */
+-
+-/* Set/get dead key composition mode */
+-s32 cellKey2CharSetMode(CellKey2CharHandle handle, s32 mode);
+-s32 cellKey2CharGetMode(CellKey2CharHandle handle, s32* mode);
+-
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/runtime/ppu/ppu_sysprx.cpp b/runtime/ppu/ppu_sysprx.cpp
+--- a/runtime/ppu/ppu_sysprx.cpp
++++ b/runtime/ppu/ppu_sysprx.cpp
+@@ -717,8 +717,12 @@
+ static uint32_t g_net_errno_ea = 0;
+ static void hle_net_errno_loc(ppu_context* ctx)
+ {
+-    if (!g_net_errno_ea) g_net_errno_ea = gcm_guest_alloc(4, 4);
+-    vm_write32(g_net_errno_ea, SYS_NET_EWOULDBLOCK_V);
++    /* errno is what the last failing call set (would-block for a receive); reading its
++     * address must not overwrite it, or a bind or inet_pton error reads as EWOULDBLOCK. */
++    if (!g_net_errno_ea) {
++        g_net_errno_ea = gcm_guest_alloc(4, 4);
++        if (g_net_errno_ea) vm_write32(g_net_errno_ea, SYS_NET_EWOULDBLOCK_V);
++    }
+     ctx->gpr[3] = g_net_errno_ea;
+ }
+ static void hle_net_wouldblock(ppu_context* ctx)
+@@ -758,7 +762,9 @@
+ }
+ /* Distinct small fds: the unresolved default handed EVERY socket() call fd 0,
+  * making all sockets alias one id in the game's tables. */
+-static void hle_net_socket(ppu_context* ctx) { static uint32_t s_fd = 3; ctx->gpr[3] = s_fd++; }
++static uint32_t s_net_next_fd = 3;
++static void hle_net_socket(ppu_context* ctx) { ctx->gpr[3] = s_net_next_fd++; }
++#include "ppu_net_offline.h"   /* bind, getsockname, inet_pton */
+ /* sendto: report the full length as sent (packets vanish into the void, matching
+  * the RPCS3-offline oracle where broadcasts go out and nothing answers). */
+ static void hle_net_sendto(ppu_context* ctx) { ctx->gpr[3] = (uint32_t)ctx->gpr[5]; }
+@@ -1060,7 +1066,9 @@
+     ps3_hle_register_ctx(0x3F09E20Au, "sys_net_bnet_select",    hle_net_select);
+     ps3_hle_register_ctx(0x139A9E9Bu, "netInitializeNetworkEx", hle_net_zero);   /* lib init ok */
+     ps3_hle_register_ctx(0x9C056962u, "netSocket",              hle_net_socket);
+-    ps3_hle_register_ctx(0xB0A59804u, "netBind",                hle_net_zero);
++    ps3_hle_register_ctx(0xB0A59804u, "netBind",                hle_net_bind);
++    ps3_hle_register_ctx(0x13EFE7F5u, "netGetSockName",         hle_net_getsockname);
++    ps3_hle_register_ctx(0x8AF3825Eu, "netInetPton",            hle_net_inet_pton);
+     ps3_hle_register_ctx(0x88F03575u, "netSetSockOpt",          hle_net_zero);
+     ps3_hle_register_ctx(0x9647570Bu, "netSendTo",              hle_net_sendto);
+     ps3_hle_register_ctx(0x6DB6E8CDu, "netClose",               hle_net_zero);
+diff --git a/runtime/ppu/ppu_net_offline.h b/runtime/ppu/ppu_net_offline.h
+new file mode 100644
+--- /dev/null
++++ b/runtime/ppu/ppu_net_offline.h
+@@ -0,0 +1,85 @@
++/*
++ * ps3recomp - sys_net offline model: bind, getsockname and inet_pton.
++ *
++ * Included by ppu_sysprx.cpp after its offline-model state (g_net_errno_ea,
++ * s_net_next_fd, gcm_guest_alloc); a header so
++ * runtime/ppu/tests/test_net_offline.cpp can drive the handlers alone.
++ */
++#pragma once
++/* bind and getsockname: the offline stack still has local sockets, so a bind takes and a
++ * getsockname reports the address it was bound to, with an ephemeral port for port 0 (as a
++ * BSD stack assigns one); an unbound socket reports 0.0.0.0:0. getsockname was unresolved,
++ * so it answered CELL_OK with the address left unwritten. sockaddr_in as the guest lays it
++ * out: {u8 len, u8 family, u16 port, u32 addr, u8 zero[8]}, port and address in network
++ * order. Errors follow libnet: -1 with errno (EBADF 9, EINVAL 22, EFAULT 14). */
++#define NET_OFFLINE_FDS 1024
++static uint8_t  s_net_bound[NET_OFFLINE_FDS][16];
++static uint8_t  s_net_is_bound[NET_OFFLINE_FDS];
++static uint16_t s_net_next_port = 49152;
++static void net_fail(ppu_context* ctx, uint32_t err)
++{
++    if (!g_net_errno_ea) g_net_errno_ea = gcm_guest_alloc(4, 4);
++    if (g_net_errno_ea) vm_write32(g_net_errno_ea, err);
++    ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)-1;
++}
++static bool net_open_fd(uint32_t s) { return s >= 3 && s < s_net_next_fd && s < NET_OFFLINE_FDS; }
++static void hle_net_bind(ppu_context* ctx)
++{
++    const uint32_t s = (uint32_t)ctx->gpr[3], addr = (uint32_t)ctx->gpr[4], len = (uint32_t)ctx->gpr[5];
++    if (!net_open_fd(s)) { net_fail(ctx, 9); return; }
++    if (!addr) { net_fail(ctx, 14); return; }
++    if (len < 8 || s_net_is_bound[s]) { net_fail(ctx, 22); return; }
++    uint8_t* b = s_net_bound[s];
++    memset(b, 0, 16);
++    for (int i = 0; i < 8; i++) b[i] = vm_read8(addr + i);
++    b[0] = 16; b[1] = 2;                        /* AF_INET */
++    if (b[2] == 0 && b[3] == 0) {               /* port 0: an ephemeral port */
++        const uint16_t port = s_net_next_port++;
++        b[2] = (uint8_t)(port >> 8); b[3] = (uint8_t)port;
++    }
++    s_net_is_bound[s] = 1;
++    ctx->gpr[3] = 0;
++}
++static void hle_net_getsockname(ppu_context* ctx)
++{
++    const uint32_t s = (uint32_t)ctx->gpr[3], addr = (uint32_t)ctx->gpr[4], lenp = (uint32_t)ctx->gpr[5];
++    if (!net_open_fd(s)) { net_fail(ctx, 9); return; }
++    if (!addr || !lenp) { net_fail(ctx, 14); return; }
++    uint8_t unbound[16] = { 16, 2 };
++    const uint8_t* b = s_net_is_bound[s] ? s_net_bound[s] : unbound;
++    uint32_t n = vm_read32(lenp);
++    if (n > 16) n = 16;
++    for (uint32_t i = 0; i < n; i++) vm_write8(addr + i, b[i]);
++    vm_write32(lenp, 16);
++    ctx->gpr[3] = 0;
++}
++/* inet_pton(af, src, dst): AF_INET (2) only, as libnet; 1 and the 4 address bytes in network
++ * order for a dotted quad, 0 (dst untouched) for anything else, -1 with EAFNOSUPPORT (47) for
++ * another family. It was unresolved: 0 for every address, so every literal read as invalid. */
++static void hle_net_inet_pton(ppu_context* ctx)
++{
++    const int32_t af = (int32_t)(uint32_t)ctx->gpr[3];
++    const uint32_t src = (uint32_t)ctx->gpr[4], dst = (uint32_t)ctx->gpr[5];
++    if (af != 2) { net_fail(ctx, 47); return; }
++    if (!src || !dst) { net_fail(ctx, 14); return; }
++    char text[64];
++    uint32_t i = 0;
++    for (; i + 1 < sizeof text; i++) { text[i] = (char)vm_read8(src + i); if (!text[i]) break; }
++    text[i] = 0;
++    /* exactly four decimal parts, each 0..255 with no leading zero, separated by '.' */
++    uint8_t out[4];
++    bool ok = true;
++    size_t p = 0;
++    for (int k = 0; ok && k < 4; k++) {
++        if (text[p] < '0' || text[p] > '9') { ok = false; break; }
++        if (text[p] == '0' && text[p + 1] >= '0' && text[p + 1] <= '9') { ok = false; break; }
++        unsigned v = 0;
++        while (text[p] >= '0' && text[p] <= '9') { v = v * 10 + (unsigned)(text[p++] - '0'); if (v > 255) break; }
++        if (v > 255) { ok = false; break; }
++        out[k] = (uint8_t)v;
++        if (k < 3) { if (text[p] != '.') ok = false; else p++; }
++    }
++    if (ok && text[p] != 0) ok = false;
++    if (ok) for (int k = 0; k < 4; k++) vm_write8(dst + k, out[k]);
++    ctx->gpr[3] = ok ? 1 : 0;
++}
+diff --git a/runtime/ppu/tests/test_net_offline.cpp b/runtime/ppu/tests/test_net_offline.cpp
+new file mode 100644
+--- /dev/null
++++ b/runtime/ppu/tests/test_net_offline.cpp
+@@ -0,0 +1,88 @@
++/*
++ * ps3recomp - the sys_net offline model's bind, getsockname and inet_pton
++ * (runtime/ppu/ppu_net_offline.h, included by ppu_sysprx.cpp).
++ *
++ * getsockname (0x13EFE7F5) and inet_pton (0x8AF3825E) were unresolved, so they
++ * answered CELL_OK with nothing written, and bind did not record the address.
++ * Checks: bind keeps the address (an ephemeral port for port 0), getsockname
++ * reports it (0.0.0.0:0 when unbound) and the 16-byte length, bad descriptors
++ * and NULL pointers are -1 with errno, inet_pton parses dotted quads only.
++ * Run by tools/test_net_offline.py.
++ */
++#include "../ppu_memory.h"
++#include <stdio.h>
++
++extern "C" {
++uint8_t* vm_base;
++int g_resv_store_active = 0;
++uint32_t g_ww_lo = 0, g_ww_hi = 0;
++void ppu_resv_break_store(uint64_t ea) { (void)ea; }
++int  spu_coh_is_reserved(uint32_t addr) { (void)addr; return 0; }
++void spu_lockline_lock(void) {}
++void spu_lockline_unlock(void) {}
++void spu_coh_notify_write(uint32_t addr) { (void)addr; }
++void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width) { (void)addr; (void)val; (void)width; }
++}
++static uint32_t g_net_errno_ea = 0;
++static uint32_t s_net_next_fd = 3;
++static unsigned int gcm_guest_alloc(unsigned int size, unsigned int align) { (void)size; (void)align; return 0xF000; }
++#include "../ppu_net_offline.h"
++
++static int fails = 0;
++#define CHECK(c, ...) do { const int ok_ = (c); printf(ok_ ? "[PASS] " : "[FAIL] "); printf(__VA_ARGS__); \
++                           printf("\n"); if (!ok_) fails++; } while (0)
++static ppu_context ctx;
++static int32_t call(void (*f)(ppu_context*), uint64_t a, uint64_t b, uint64_t c)
++{
++    memset(&ctx, 0, sizeof ctx); ctx.gpr[3] = a; ctx.gpr[4] = b; ctx.gpr[5] = c; f(&ctx);
++    return (int32_t)(uint32_t)ctx.gpr[3];
++}
++
++static uint32_t errno_v() { return vm_read32(0xF000); }
++
++int main()
++{
++    static uint8_t mem[1 << 16];
++    vm_base = mem;
++    s_net_next_fd = 5;   /* sockets 3 and 4 are open */
++    /* sockaddr_in at 0x100: len 16, AF_INET, port 8080, 192.168.0.2 */
++    const uint8_t sa[16] = { 16, 2, 0x1F, 0x90, 192, 168, 0, 2 };
++    memcpy(mem + 0x100, sa, 16);
++
++    vm_write32(0x300, 16);
++    CHECK(call(hle_net_getsockname, 3, 0x200, 0x300) == 0 && mem[0x200] == 16 && mem[0x201] == 2 &&
++          mem[0x202] == 0 && mem[0x203] == 0 && vm_read32(0x204) == 0, "an unbound socket reports 0.0.0.0:0");
++    CHECK(call(hle_net_bind, 3, 0x100, 16) == 0, "bind 192.168.0.2:8080");
++    CHECK(call(hle_net_bind, 3, 0x100, 16) == -1 && errno_v() == 22, "a second bind is EINVAL");
++    memset(mem + 0x200, 0xEE, 16);
++    vm_write32(0x300, 16);
++    CHECK(call(hle_net_getsockname, 3, 0x200, 0x300) == 0 && memcmp(mem + 0x200, sa, 16) == 0 &&
++          vm_read32(0x300) == 16, "getsockname reports the bound address and length 16");
++    memcpy(mem + 0x110, sa, 16); mem[0x112] = mem[0x113] = 0;   /* port 0 */
++    CHECK(call(hle_net_bind, 4, 0x110, 16) == 0, "bind with port 0");
++    vm_write32(0x300, 8);
++    memset(mem + 0x200, 0xEE, 16);
++    CHECK(call(hle_net_getsockname, 4, 0x200, 0x300) == 0 && (mem[0x202] << 8 | mem[0x203]) >= 49152 &&
++          mem[0x208] == 0xEE && vm_read32(0x300) == 16,
++          "port 0 gets an ephemeral port; only *addrlen bytes are written; the length says 16");
++    CHECK(call(hle_net_getsockname, 9, 0x200, 0x300) == -1 && errno_v() == 9, "a socket never opened is EBADF");
++    CHECK(call(hle_net_bind, 4, 0, 16) == -1 && errno_v() == 14, "bind with no address is EFAULT");
++    CHECK(call(hle_net_getsockname, 3, 0x200, 0) == -1 && errno_v() == 14, "getsockname with no length is EFAULT");
++
++    struct { const char* text; int ret; uint8_t b[4]; } cases[] = {
++        { "127.0.0.1", 1, { 127, 0, 0, 1 } }, { "255.255.255.255", 1, { 255, 255, 255, 255 } },
++        { "0.0.0.0", 1, { 0, 0, 0, 0 } },     { "256.1.1.1", 0, {} }, { "1.2.3", 0, {} },
++        { "1.2.3.4.5", 0, {} },               { "01.2.3.4", 0, {} },  { "a.b.c.d", 0, {} },
++        { "1.2.3.4 ", 0, {} },                { "", 0, {} },
++    };
++    for (auto& c : cases) {
++        strcpy((char*)mem + 0x400, c.text);
++        memset(mem + 0x500, 0xEE, 4);
++        const int32_t r = call(hle_net_inet_pton, 2, 0x400, 0x500);
++        const bool bytes = c.ret ? memcmp(mem + 0x500, c.b, 4) == 0 : mem[0x500] == 0xEE;
++        CHECK(r == c.ret && bytes, "inet_pton(\"%s\") = %d", c.text, r);
++    }
++    CHECK(call(hle_net_inet_pton, 28, 0x400, 0x500) == -1 && errno_v() == 47, "inet_pton of AF_INET6 is EAFNOSUPPORT");
++    printf("%s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
++    return fails ? 1 : 0;
++}
+diff --git a/tools/test_net_offline.py b/tools/test_net_offline.py
+new file mode 100644
+--- /dev/null
++++ b/tools/test_net_offline.py
+@@ -0,0 +1,49 @@
++#!/usr/bin/env python3
++"""The sys_net offline model's bind, getsockname and inet_pton
++(runtime/ppu/ppu_net_offline.h). Checks the two NIDs are the hashes of their
++names, then builds runtime/ppu/tests/test_net_offline.cpp and runs it.
++"""
++import hashlib
++import os
++import shutil
++import struct
++import subprocess
++import sys
++import tempfile
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++SUFFIX = b"\x67\x59\x65\x99\x04\x25\x04\x90\x56\x64\x27\x49\x94\x89\x74\x1A"
++
++
++def nid(name):
++    return struct.unpack('<I', hashlib.sha1(name.encode() + SUFFIX).digest()[:4])[0]
++
++
++def main():
++    fails = 0
++    for name, want in (("getsockname", 0x13EFE7F5), ("inet_pton", 0x8AF3825E), ("bind", 0xB0A59804)):
++        ok = nid(name) == want
++        fails += not ok
++        print(f"[{'PASS' if ok else 'FAIL'}] {name} hashes to 0x{nid(name):08X} (imported as 0x{want:08X})")
++    cxx = os.environ.get('CXX') or shutil.which('c++') or shutil.which('clang++')
++    if not cxx:
++        print('SKIP: no C++ compiler')
++        return 1 if fails else 0
++    with tempfile.TemporaryDirectory() as tmp:
++        exe = Path(tmp) / 'test_net_offline'
++        r = subprocess.run([cxx, '-std=gnu++17', '-O1', '-w', '-I' + str(ROOT / 'include'),
++                            '-I' + str(ROOT / 'runtime'), '-I' + str(ROOT / 'runtime/ppu'),
++                            str(ROOT / 'runtime/ppu/tests/test_net_offline.cpp'), '-o', str(exe)],
++                           capture_output=True, text=True)
++        if r.returncode:
++            print(r.stdout + r.stderr)
++            print('FAIL: fixture did not build')
++            return 1
++        r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=30)
++        sys.stdout.write(r.stdout + r.stderr)
++        return 1 if (fails or r.returncode) else 0
++
++
++if __name__ == '__main__':
++    sys.exit(main())
+diff --git a/libs/misc/tests/test_key2char.c b/libs/misc/tests/test_key2char.c
+new file mode 100644
+--- /dev/null
++++ b/libs/misc/tests/test_key2char.c
+@@ -0,0 +1,58 @@
++/*
++ * test_key2char - cellKey2char (libs/misc/cellKey2char.c) with the SDK's API.
++ *
++ * The handle is the title's 128-byte buffer. Open(handle) used to be read as
++ * Open(arrangement, handle*), writing an index through the title's second
++ * register. Checks the SDK names hash to the NIDs a title imports, that Open
++ * writes only inside the handle buffer, and RPCS3's argument answers.
++ * Run by tools/test_key2char.py.
++ */
++#include "../cellKey2char.c"
++
++uint8_t* vm_base;
++int g_resv_store_active = 0;
++uint32_t g_ww_lo = 0, g_ww_hi = 0;
++void ppu_resv_break_store(uint64_t ea) { (void)ea; }
++int  spu_coh_is_reserved(uint32_t addr) { (void)addr; return 0; }
++void spu_lockline_lock(void) {}
++void spu_lockline_unlock(void) {}
++void spu_coh_notify_write(uint32_t addr) { (void)addr; }
++void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width) { (void)addr; (void)val; (void)width; }
++
++static int fails = 0;
++#define CHECK(c, ...) do { const int ok_ = (c); printf(ok_ ? "[PASS] " : "[FAIL] "); printf(__VA_ARGS__); \
++                           printf("\n"); if (!ok_) fails++; } while (0)
++
++int main(void)
++{
++    static uint8_t mem[1 << 16], before[1 << 16];
++    vm_base = mem;
++    const u32 h = 0x1000;
++    memcpy(before, mem, sizeof mem);
++    CHECK(cellKey2CharOpen(h) == CELL_OK, "Open");
++    int outside = 0;
++    for (u32 i = 0; i < sizeof mem; i++)
++        if (mem[i] != before[i] && (i < h || i >= h + SCE_KEY2CHAR_HANDLE_SIZE)) outside++;
++    CHECK(outside == 0, "Open writes only inside the 128-byte handle buffer");
++    CHECK(cellKey2CharOpen(h) == (s32)CELL_K2C_ERROR_ALREADY_INITIALIZED, "a second Open is ALREADY_INITIALIZED");
++    CHECK(cellKey2CharOpen(0) == (s32)CELL_K2C_ERROR_INVALID_HANDLE, "Open(NULL) is INVALID_HANDLE");
++    CHECK(cellKey2CharSetArrangement(h, 9) == CELL_OK && mem[h + 1] == 9, "SetArrangement keeps the arrangement");
++    CHECK(cellKey2CharSetArrangement(h, 25) == (s32)CELL_K2C_ERROR_INVALID_PARAMETER, "arrangement 25 is INVALID_PARAMETER");
++    CHECK(cellKey2CharSetArrangement(h, -1) == (s32)CELL_K2C_ERROR_INVALID_PARAMETER, "arrangement -1 is INVALID_PARAMETER");
++    CHECK(cellKey2CharSetMode(h, CELL_KEY2CHAR_MODE_NATIVE) == CELL_OK, "SetMode NATIVE");
++    CHECK(cellKey2CharSetMode(h, 3) == (s32)CELL_K2C_ERROR_INVALID_PARAMETER, "mode 3 is INVALID_PARAMETER");
++    /* kdata at 0x2000: led 0, mkey 0, keycode 0x04 ('a') */
++    vm_write16(0x2008, 0x04);
++    vm_write32(0x3000, 0xEEEEEEEE); mem[0x3010] = 0xEE;
++    CHECK(cellKey2CharGetChar(h, 0x2000, 0x3100, 0x3000, 0x3010) == CELL_OK && vm_read32(0x3000) == 0 &&
++          mem[0x3010] == 0, "GetChar converts nothing (no keyboard): charNum 0, processed false");
++    vm_write16(0x2008, 0);
++    CHECK(cellKey2CharGetChar(h, 0x2000, 0x3100, 0x3000, 0x3010) == (s32)CELL_K2C_ERROR_INVALID_PARAMETER,
++          "GetChar of key code 0 is INVALID_PARAMETER");
++    CHECK(cellKey2CharClose(h) == CELL_OK, "Close");
++    CHECK(cellKey2CharClose(h) == (s32)CELL_K2C_ERROR_UNINITIALIZED, "Close after Close is UNINITIALIZED");
++    CHECK(cellKey2CharSetMode(h, 0) == (s32)CELL_K2C_ERROR_UNINITIALIZED, "SetMode after Close is UNINITIALIZED");
++    CHECK(cellKey2CharSetArrangement(0, 0) == (s32)CELL_K2C_ERROR_INVALID_HANDLE, "SetArrangement(NULL) is INVALID_HANDLE");
++    printf("%s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
++    return fails ? 1 : 0;
++}
+diff --git a/tools/test_key2char.py b/tools/test_key2char.py
+new file mode 100644
+--- /dev/null
++++ b/tools/test_key2char.py
+@@ -0,0 +1,51 @@
++#!/usr/bin/env python3
++"""cellKey2char with the SDK's API (libs/misc/cellKey2char.c). Checks the five
++names a title imports hash to its NIDs (the HLE table registers by the hash of
++the name), then builds libs/misc/tests/test_key2char.c and runs it.
++"""
++import hashlib
++import os
++import shutil
++import struct
++import subprocess
++import sys
++import tempfile
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++SUFFIX = b"\x67\x59\x65\x99\x04\x25\x04\x90\x56\x64\x27\x49\x94\x89\x74\x1A"
++
++
++def nid(name):
++    return struct.unpack('<I', hashlib.sha1(name.encode() + SUFFIX).digest()[:4])[0]
++
++
++def main():
++    fails = 0
++    for name, want in (("cellKey2CharOpen", 0xABF629C1), ("cellKey2CharClose", 0x14BF2DC1),
++                       ("cellKey2CharSetMode", 0xBFC03768), ("cellKey2CharSetArrangement", 0x0DFBADFA),
++                       ("cellKey2CharGetChar", 0x56776C0D)):
++        ok = want is None or nid(name) == want
++        fails += not ok
++        print(f"[{'PASS' if ok else 'FAIL'}] {name} hashes to 0x{nid(name):08X} (imported as {'that' if want is None else f'0x{want:08X}'})")
++    cxx = os.environ.get('CC') or shutil.which('cc') or shutil.which('clang')
++    if not cxx:
++        print('SKIP: no C++ compiler')
++        return 1 if fails else 0
++    with tempfile.TemporaryDirectory() as tmp:
++        exe = Path(tmp) / 'test_key2char'
++        r = subprocess.run([cxx, '-std=gnu17', '-O1', '-w', '-I' + str(ROOT / 'include'),
++                            '-I' + str(ROOT / 'runtime'), '-I' + str(ROOT / 'runtime/ppu'),
++                            str(ROOT / 'libs/misc/tests/test_key2char.c'), '-o', str(exe)],
++                           capture_output=True, text=True)
++        if r.returncode:
++            print(r.stdout + r.stderr)
++            print('FAIL: fixture did not build')
++            return 1
++        r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=30)
++        sys.stdout.write(r.stdout + r.stderr)
++        return 1 if (fails or r.returncode) else 0
++
++
++if __name__ == '__main__':
++    sys.exit(main())
