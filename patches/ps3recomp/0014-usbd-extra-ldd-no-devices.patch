@@ -1,0 +1,308 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] cellUsbd: extra LDDs and SetThreadPriority2, with no device attached
+
+Upstream: not yet submitted; written to be upstreamed (generic, no title names)
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0013)
+
+What: cellUsbdRegisterExtraLdd (0x7FE92C54), cellUsbdRegisterExtraLdd2
+(0xBD554BCB) and cellUsbdSetThreadPriority2 (0x5C832BD7) had no handler, so
+they took the unresolved path and faked CELL_OK; cellUsbdUnregisterExtraLdd
+(0x90460081) had none either. An extra LDD is a driver for one vendor and a
+product id (...2: a product range). Registering one now records its name and
+range, keyed by name as the lv2 USB daemon keeps them: a name already
+registered is LDD_ALREADY_REGISTERED, a NULL driver or an inverted range
+INVALID_PARAM, a full table LDD_NOT_ALLOCATED, any call before cellUsbdInit
+NOT_INITIALIZED, and unregistering a name not registered LDD_NOT_FOUND.
+cellUsbdEnd drops the registrations. No USB device is ever attached, so a
+driver's probe and attach callbacks are never called: a title probing for a
+peripheral finds none. SetThreadPriority2 records the three priorities (the
+runtime runs no USB threads to give them to). Behaviour follows RPCS3, which
+runs libusbd over its sys_usbd with no devices.
+
+The header's error codes are corrected to the SDK's: INVALID_ARGUMENT was
+0x80110003 (NO_MEMORY) and is INVALID_PARAM, 0x80110004; NO_DEVICE was
+0x80110004 and is DEVICE_NOT_FOUND, 0x8011000a; PIPE_NOT_FOUND was 0x80110005
+and is 0x8011000d. The SDK codes used above are added.
+
+Why: a faked registration left a title's driver bookkeeping out of step with
+the library's, and the wrong codes made a title read one failure as another.
+
+Test: tools/test_usbd_extra_ldd.py (new) checks the four names hash to the
+imported NIDs, then builds libs/hardware/tests/test_usbd_extra_ldd.c with
+cellUsbd.c: each answer above, no device listed, and End dropping the table.
+
+diff --git a/libs/hardware/cellUsbd.c b/libs/hardware/cellUsbd.c
+index c359680f..50ab7f94 100644
+--- a/libs/hardware/cellUsbd.c
++++ b/libs/hardware/cellUsbd.c
+@@ -32,10 +32,88 @@ s32 cellUsbdInit(void)
+     return CELL_OK;
+ }
+ 
++/* Extra LDDs: a driver for one vendor and a product range, kept by name as the
++ * lv2 USB daemon keeps them. No USB device is ever attached, so their probe and
++ * attach callbacks are never called. Behaviour follows RPCS3 (libusbd over its
++ * sys_usbd, with no devices). */
++#define MAX_EXTRA_LDD 16
++static struct {
++    u32  ops_ea;
++    char name[64];
++    u16  vendor, product_min, product_max;
++} s_extra[MAX_EXTRA_LDD];
++static int s_extra_count = 0;
++static s32 s_thread_prio[3] = { -1, -1, -1 };   /* event, usbd, callback; -1: the default */
++
++static void ldd_name(u32 ops_ea, char* out, size_t n)
++{
++    const u32 name_ea = vm_read32(ops_ea);
++    out[0] = 0;
++    if (name_ea) { strncpy(out, (const char*)(vm_base + name_ea), n - 1); out[n - 1] = 0; }
++}
++
+ s32 cellUsbdEnd(void)
+ {
+     printf("[cellUsbd] End()\n");
+     s_initialized = 0;
++    s_extra_count = 0;
++    memset(s_extra, 0, sizeof(s_extra));
++    return CELL_OK;
++}
++
++s32 cellUsbdRegisterExtraLdd2(const CellUsbdLddOps* ops, u16 vendorId, u16 productIdMin, u16 productIdMax)
++{
++    const u32 ops_ea = (u32)(uintptr_t)ops;
++    if (!s_initialized) return (s32)CELL_USBD_ERROR_NOT_INITIALIZED;
++    if (!ops_ea) return (s32)CELL_USBD_ERROR_INVALID_PARAM;
++    char name[64];
++    ldd_name(ops_ea, name, sizeof name);
++    for (int i = 0; i < s_extra_count; i++)
++        if (strcmp(s_extra[i].name, name) == 0)   /* the daemon keys LDDs by name */
++            return (s32)CELL_USBD_ERROR_LDD_ALREADY_REGISTERED;
++    if (productIdMin > productIdMax) return (s32)CELL_USBD_ERROR_INVALID_PARAM;
++    if (s_extra_count >= MAX_EXTRA_LDD) return (s32)CELL_USBD_ERROR_LDD_NOT_ALLOCATED;
++    s_extra[s_extra_count].ops_ea = ops_ea;
++    memcpy(s_extra[s_extra_count].name, name, sizeof name);
++    s_extra[s_extra_count].vendor = vendorId;
++    s_extra[s_extra_count].product_min = productIdMin;
++    s_extra[s_extra_count].product_max = productIdMax;
++    s_extra_count++;
++    printf("[cellUsbd] RegisterExtraLdd(%s, vendor 0x%04X, products 0x%04X-0x%04X): no device attached\n",
++           name, vendorId, productIdMin, productIdMax);
++    return CELL_OK;
++}
++
++s32 cellUsbdRegisterExtraLdd(const CellUsbdLddOps* ops, u16 vendorId, u16 productId)
++{
++    return cellUsbdRegisterExtraLdd2(ops, vendorId, productId, productId);
++}
++
++s32 cellUsbdUnregisterExtraLdd(const CellUsbdLddOps* ops)
++{
++    const u32 ops_ea = (u32)(uintptr_t)ops;
++    if (!s_initialized) return (s32)CELL_USBD_ERROR_NOT_INITIALIZED;
++    if (!ops_ea) return (s32)CELL_USBD_ERROR_INVALID_PARAM;
++    char name[64];
++    ldd_name(ops_ea, name, sizeof name);
++    for (int i = 0; i < s_extra_count; i++) {
++        if (strcmp(s_extra[i].name, name) == 0) {
++            memmove(&s_extra[i], &s_extra[i + 1], (size_t)(s_extra_count - i - 1) * sizeof s_extra[0]);
++            s_extra_count--;
++            return CELL_OK;
++        }
++    }
++    return (s32)CELL_USBD_ERROR_LDD_NOT_FOUND;
++}
++
++/* The priorities of the library's event, USB daemon and callback threads. The
++ * runtime runs no such threads (no device ever delivers an event), so they are
++ * only recorded. */
++s32 cellUsbdSetThreadPriority2(s32 eventPriority, s32 usbdPriority, s32 callbackPriority)
++{
++    s_thread_prio[0] = eventPriority;
++    s_thread_prio[1] = usbdPriority;
++    s_thread_prio[2] = callbackPriority;
+     return CELL_OK;
+ }
+ 
+diff --git a/libs/hardware/cellUsbd.h b/libs/hardware/cellUsbd.h
+index 6d8dd233..05224179 100644
+--- a/libs/hardware/cellUsbd.h
++++ b/libs/hardware/cellUsbd.h
+@@ -18,10 +18,17 @@ extern "C" {
+ /* Error codes */
+ #define CELL_USBD_ERROR_NOT_INITIALIZED     0x80110001
+ #define CELL_USBD_ERROR_ALREADY_INITIALIZED 0x80110002
+-#define CELL_USBD_ERROR_INVALID_ARGUMENT    0x80110003
+-#define CELL_USBD_ERROR_NO_DEVICE           0x80110004
+-#define CELL_USBD_ERROR_PIPE_NOT_FOUND      0x80110005
+-#define CELL_USBD_ERROR_TRANSFER            0x80110006
++/* The SDK's values (CELL_USBD_ERROR_*); the older names map onto them. */
++#define CELL_USBD_ERROR_NO_MEMORY              0x80110003
++#define CELL_USBD_ERROR_INVALID_PARAM          0x80110004
++#define CELL_USBD_ERROR_LDD_ALREADY_REGISTERED 0x80110006
++#define CELL_USBD_ERROR_LDD_NOT_ALLOCATED      0x80110007
++#define CELL_USBD_ERROR_LDD_NOT_FOUND          0x80110009
++#define CELL_USBD_ERROR_DEVICE_NOT_FOUND       0x8011000a
++#define CELL_USBD_ERROR_PIPE_NOT_FOUND         0x8011000d
++#define CELL_USBD_ERROR_INVALID_ARGUMENT    CELL_USBD_ERROR_INVALID_PARAM
++#define CELL_USBD_ERROR_NO_DEVICE           CELL_USBD_ERROR_DEVICE_NOT_FOUND
++#define CELL_USBD_ERROR_TRANSFER            0x80110006   /* not an SDK code; unused */
+ 
+ /* Constants */
+ #define CELL_USBD_MAX_PIPES    16
+@@ -62,6 +69,12 @@ s32 cellUsbdEnd(void);
+ s32 cellUsbdRegisterLdd(const CellUsbdLddOps* ops);
+ s32 cellUsbdUnregisterLdd(const CellUsbdLddOps* ops);
+ 
++/* An LDD for one vendor and a product id (or a range, ...2). */
++s32 cellUsbdRegisterExtraLdd(const CellUsbdLddOps* ops, u16 vendorId, u16 productId);
++s32 cellUsbdRegisterExtraLdd2(const CellUsbdLddOps* ops, u16 vendorId, u16 productIdMin, u16 productIdMax);
++s32 cellUsbdUnregisterExtraLdd(const CellUsbdLddOps* ops);
++s32 cellUsbdSetThreadPriority2(s32 eventPriority, s32 usbdPriority, s32 callbackPriority);
++
+ s32 cellUsbdGetDeviceList(CellUsbdDeviceInfo* list, u32 maxDevices,
+                             u32* numDevices);
+ 
+diff --git a/libs/hardware/tests/test_usbd_extra_ldd.c b/libs/hardware/tests/test_usbd_extra_ldd.c
+new file mode 100644
+index 00000000..c8c93504
+--- /dev/null
++++ b/libs/hardware/tests/test_usbd_extra_ldd.c
+@@ -0,0 +1,75 @@
++/*
++ * test_usbd_extra_ldd - cellUsbdRegisterExtraLdd, cellUsbdRegisterExtraLdd2,
++ * cellUsbdUnregisterExtraLdd and cellUsbdSetThreadPriority2
++ * (libs/hardware/cellUsbd.c).
++ *
++ * An extra LDD is a driver for one vendor and a product range. Registering it
++ * records the name and range (as the lv2 USB daemon does); with no USB device
++ * attached, none of its callbacks is ever called. Behaviour follows RPCS3
++ * (libusbd over its sys_usbd, no devices). Run by tools/test_usbd_extra_ldd.py.
++ */
++
++#include "../cellUsbd.c"
++#include <stdlib.h>
++
++/* ppu_memory.h hooks the runtime supplies; inert here. */
++uint8_t* vm_base;
++int g_resv_store_active = 0;
++uint32_t g_ww_lo = 0, g_ww_hi = 0;
++void ppu_resv_break_store(uint64_t ea) { (void)ea; }
++int  spu_coh_is_reserved(uint32_t addr) { (void)addr; return 0; }
++void spu_lockline_lock(void) {}
++void spu_lockline_unlock(void) {}
++void spu_coh_notify_write(uint32_t addr) { (void)addr; }
++void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width) { (void)addr; (void)val; (void)width; }
++
++static int fails = 0;
++#define CHECK(c, ...) do { const int ok_ = (c); printf(ok_ ? "[PASS] " : "[FAIL] "); printf(__VA_ARGS__); \
++                           printf("\n"); if (!ok_) fails++; } while (0)
++#define OPS(ea) ((CellUsbdLddOps*)(uintptr_t)(ea))
++
++/* A guest CellUsbdLddOps at `ea`: the name pointer first (a 4-byte EA), then probe/attach/detach. */
++static void ldd(uint32_t ea, uint32_t name_ea, const char* name)
++{
++    vm_write32(ea, name_ea);
++    vm_write32(ea + 4, 0x10000);   /* callbacks: never called with no device */
++    vm_write32(ea + 8, 0x10008);
++    vm_write32(ea + 12, 0x10010);
++    strcpy((char*)vm_base + name_ea, name);
++}
++
++int main(void)
++{
++    vm_base = calloc(1, 0x20000);
++    ldd(0x1000, 0x1100, "wheel");
++    ldd(0x1200, 0x1300, "wheel2");
++    ldd(0x1400, 0x1500, "wheel");   /* a second driver with a name already registered */
++
++    CHECK((u32)cellUsbdRegisterExtraLdd(OPS(0x1000), 0x046D, 0xC29A) == CELL_USBD_ERROR_NOT_INITIALIZED,
++          "RegisterExtraLdd before cellUsbdInit is NOT_INITIALIZED");
++    CHECK(cellUsbdInit() == CELL_OK, "cellUsbdInit");
++    CHECK(cellUsbdSetThreadPriority2(1000, 1001, 1002) == CELL_OK, "SetThreadPriority2 is CELL_OK");
++    CHECK((u32)cellUsbdRegisterExtraLdd(NULL, 0x046D, 0xC29A) == CELL_USBD_ERROR_INVALID_PARAM,
++          "RegisterExtraLdd(NULL) is INVALID_PARAM (0x%08X)", (unsigned)CELL_USBD_ERROR_INVALID_PARAM);
++    CHECK(cellUsbdRegisterExtraLdd(OPS(0x1000), 0x046D, 0xC29A) == CELL_OK, "RegisterExtraLdd registers");
++    CHECK(cellUsbdRegisterExtraLdd2(OPS(0x1200), 0x046D, 0xC290, 0xC29F) == CELL_OK,
++          "RegisterExtraLdd2 registers a product range");
++    CHECK((u32)cellUsbdRegisterExtraLdd2(OPS(0x1200), 0x046D, 0xC2A0, 0xC290) == CELL_USBD_ERROR_INVALID_PARAM ||
++          (u32)cellUsbdRegisterExtraLdd2(OPS(0x1200), 0x046D, 0xC2A0, 0xC290) == CELL_USBD_ERROR_LDD_ALREADY_REGISTERED,
++          "RegisterExtraLdd2 again is refused");
++    CHECK((u32)cellUsbdRegisterExtraLdd(OPS(0x1400), 0x054C, 0x0001) == CELL_USBD_ERROR_LDD_ALREADY_REGISTERED,
++          "a second LDD with a registered name is LDD_ALREADY_REGISTERED");
++    CHECK(s_extra_count == 2, "two extra LDDs are recorded (%d)", s_extra_count);
++    u32 n = 0xFFFF;
++    CHECK(cellUsbdGetDeviceList(NULL, 0, (u32*)(uintptr_t)0x1800) == CELL_OK && (n = vm_read32(0x1800)) == 0,
++          "no USB device is attached (%u)", n);
++    CHECK(cellUsbdUnregisterExtraLdd(OPS(0x1000)) == CELL_OK, "UnregisterExtraLdd");
++    CHECK((u32)cellUsbdUnregisterExtraLdd(OPS(0x1000)) == CELL_USBD_ERROR_LDD_NOT_FOUND,
++          "UnregisterExtraLdd of one not registered is LDD_NOT_FOUND");
++    CHECK(cellUsbdRegisterExtraLdd(OPS(0x1400), 0x054C, 0x0001) == CELL_OK, "the name is free again");
++    cellUsbdEnd();
++    CHECK(cellUsbdInit() == CELL_OK && s_extra_count == 0, "cellUsbdEnd drops the registrations");
++    if (fails) { printf("%d check(s) failed\n", fails); return 1; }
++    puts("test_usbd_extra_ldd: OK");
++    return 0;
++}
+diff --git a/tools/test_usbd_extra_ldd.py b/tools/test_usbd_extra_ldd.py
+new file mode 100644
+index 00000000..bbf99a86
+--- /dev/null
++++ b/tools/test_usbd_extra_ldd.py
+@@ -0,0 +1,55 @@
++#!/usr/bin/env python3
++"""The extra LDD calls of cellUsbd (libs/hardware/cellUsbd.c).
++
++Titles import cellUsbdRegisterExtraLdd (0x7FE92C54), cellUsbdRegisterExtraLdd2
++(0xBD554BCB) and cellUsbdSetThreadPriority2 (0x5C832BD7). None had a handler,
++so each took the unresolved path and faked CELL_OK. Checks that the names hash
++to those NIDs (the HLE table registers by the hash of the name), then builds
++libs/hardware/tests/test_usbd_extra_ldd.c, which includes cellUsbd.c, and
++runs it.
++"""
++import hashlib
++import os
++import shutil
++import struct
++import subprocess
++import sys
++import tempfile
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++SUFFIX = b"\x67\x59\x65\x99\x04\x25\x04\x90\x56\x64\x27\x49\x94\x89\x74\x1A"
++NIDS = (('cellUsbdRegisterExtraLdd', 0x7FE92C54), ('cellUsbdRegisterExtraLdd2', 0xBD554BCB),
++        ('cellUsbdSetThreadPriority2', 0x5C832BD7), ('cellUsbdUnregisterExtraLdd', 0x90460081))
++
++
++def nid(name):
++    return struct.unpack('<I', hashlib.sha1(name.encode() + SUFFIX).digest()[:4])[0]
++
++
++def main():
++    fails = 0
++    for name, want in NIDS:
++        got = nid(name)
++        fails += got != want
++        print(f"[{'PASS' if got == want else 'FAIL'}] {name} hashes to 0x{got:08X} (imported as 0x{want:08X})")
++    cc = os.environ.get('CC') or shutil.which('cc') or shutil.which('gcc') or shutil.which('clang')
++    if not cc:
++        print('SKIP: no C compiler')
++        return 1 if fails else 0
++    with tempfile.TemporaryDirectory() as tmp:
++        exe = Path(tmp) / 'test_usbd_extra_ldd'
++        r = subprocess.run([cc, '-std=gnu17', '-O1', '-w', '-I' + str(ROOT / 'include'),
++                            str(ROOT / 'libs/hardware/tests/test_usbd_extra_ldd.c'), '-o', str(exe)],
++                           capture_output=True, text=True)
++        if r.returncode:
++            print(r.stdout + r.stderr)
++            print('FAIL: fixture did not build')
++            return 1
++        r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=30)
++        sys.stdout.write(r.stdout + r.stderr)
++        return 1 if (fails or r.returncode) else 0
++
++
++if __name__ == '__main__':
++    sys.exit(main())
