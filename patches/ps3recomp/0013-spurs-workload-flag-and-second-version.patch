@@ -17,7 +17,11 @@ and faked CELL_OK:
   lock: vm_write32 can take that lock again when an SPU holds a reservation
   on the line, which deadlocked the kernel). Initialise sets the flag to all ones and the
   receiver to 0xFF (it wrote all ones over +0x60..+0x67, which are unused,
-  and left the flag word and receiver 0). Setting a receiver while one is set
+  and left the flag word and receiver 0). The flag word is written with one
+  aligned 32-bit store, never two halves, since guest stores and RSX
+  semaphore releases write it without the lock. As in RPCS3, AddWorkload
+  drops a receiver that names the slot it fills, and RemoveWorkload lets the
+  receiver go first (flag back to all ones). Setting a receiver while one is set
   is BUSY, clearing one that is not the caller's PERM; a wid past the
   instance's workloads is INVAL, one not added SRCH, a pending exception STAT,
   NULL and misalignment NULL_POINTER and ALIGN (the policy-module codes,
@@ -25,13 +29,19 @@ and faked CELL_OK:
   pulls the flag to all ones) is added with it.
 - cellSpursInitializeWithAttribute2 (0x30AA96C4): a CellSpurs2. It initialises
   the instance as cellSpursInitializeWithAttribute does, clearing all 8 KB and
-  setting flags1 SF1_32_WORKLOADS, after the NULL and alignment checks.
+  setting flags1 SF1_32_WORKLOADS, after RPCS3's checks in RPCS3's order:
+  attribute NULL, attribute alignment, attribute revision past 2 (INVAL;
+  _cellSpursAttributeInitialize now keeps the revision, in 4 bytes of the
+  host attribute's padding), spurs NULL, spurs alignment.
   Without it the instance was never initialised and its kernel never ran.
 - cellSpursDestroyTaskset2 (0x1EBCF459): destroys as cellSpursDestroyTaskset,
-  after the NULL and 128-byte alignment checks.
-Behaviour and error codes follow RPCS3 (cellSpurs and its SPU kernel). The
-runtime still has 16 workload slots; a CellSpurs2's workloads 16-31 cannot be
-added.
+  after NULL and 128-byte alignment checks. RPCS3 leaves this call
+  unimplemented (CELL_OK with no checks); the checks here are our own, by
+  analogy with the other taskset calls' codes.
+The workload flag, the receiver calls and InitializeWithAttribute2 follow
+RPCS3 (cellSpurs and its SPU kernel). Departures (recorded as D37 in the
+superproject): DestroyTaskset2's checks; the runtime still has 16 workload
+slots, so a CellSpurs2's workloads 16-31 cannot be added.
 
 Why: the faked GetWorkloadFlag left the caller's pointer unwritten, so its
 store to "the flag" went wherever that pointer pointed and the receiver was
@@ -41,26 +51,40 @@ with no kernel.
 Test: tools/test_spurs_workload_flag.py (new) checks the four names are
 registered under the imported NIDs, then builds tests/test_spurs_workload_flag.c
 with the real cellSpurs.c and the SPU runtime, with a manufactured policy
-module: every error code above, the receiver set and cleared, the flag
-address, a flag stored 0 taken by the kernel (the receiver runs and the flag
-reads all ones again, with the policy module holding a reservation on the
-line), the CellSpurs2 cleared with flags1 set and a live
-kernel, and DestroyTaskset2.
+module: every error code above and InitializeWithAttribute2's check order,
+the receiver set and cleared (PERM from a second added workload), the first
+version resetting the flag on set and unset, the receiver cleared by
+RemoveWorkload and AddWorkload, the flag address, the kernel's selection test
+(spurs_wkl_requested: a receiver whose flag reads 0 is requested, so a kick
+pass takes it; the check fails with the flag term removed), a flag stored 0
+taken by the running kernel (the receiver runs and the flag reads all ones
+again, with the policy module holding a reservation on the line), the
+CellSpurs2 cleared with flags1 set and a live kernel, and DestroyTaskset2.
 
 diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
-index f5174fd7..83623bc8 100644
+index f5174fd7..e468f1ad 100644
 --- a/libs/spurs/cellSpurs.c
 +++ b/libs/spurs/cellSpurs.c
-@@ -274,6 +274,8 @@ extern int  spu_coh_is_reserved(uint32_t);
+@@ -274,6 +274,18 @@ extern int  spu_coh_is_reserved(uint32_t);
  extern void spu_coh_notify_write(uint32_t);
  static inline u16 ef_r16(uint32_t a) { const uint8_t* p = vm_base + a; return (u16)((p[0] << 8) | p[1]); }
  static inline void ef_w16(uint32_t a, u16 v) { uint8_t* p = vm_base + a; p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
-+/* A big-endian store for use under spu_lockline_lock (vm_write32 may take that lock itself). */
-+static inline void ef_w32(uint32_t a, u32 v) { ef_w16(a, (u16)(v >> 16)); ef_w16(a + 2, (u16)v); }
++/* A big-endian store for use under spu_lockline_lock (vm_write32 may take that lock itself).
++ * One aligned 32-bit store, never two halves: the word is also written without
++ * the lock (guest stores, an RSX semaphore release), and a store landing
++ * between two halves would leave a torn value. `a` must be 4-byte aligned. */
++static inline void ef_w32(uint32_t a, u32 v)
++{
++#if defined(_MSC_VER)
++    *(volatile uint32_t*)(vm_base + a) = _byteswap_ulong(v);
++#else
++    __atomic_store_n((uint32_t*)(vm_base + a), __builtin_bswap32(v), __ATOMIC_RELAXED);
++#endif
++}
  static inline void ef_line_end(uint32_t ea)
  {
      if (spu_coh_is_reserved(ea & ~127u)) spu_coh_notify_write(ea & ~127u);
-@@ -422,7 +424,10 @@ enum {
+@@ -422,7 +434,10 @@ enum {
      SPURS_WKL_MAXCONT  = 0x50,
      SPURS_WKL_FLAG     = 0x60,
      SPURS_WKL_SIGNAL1  = 0x70,
@@ -71,7 +95,7 @@ index f5174fd7..83623bc8 100644
      SPURS_WKL_STATE1   = 0x80,
      SPURS_WKL_ENABLED  = 0xB0,
      SPURS_SYSSRV_MSG   = 0xBD,
-@@ -433,7 +438,10 @@ enum {
+@@ -433,7 +448,10 @@ enum {
       * clearing 0x2000 here overran the game's 4KB heap block and corrupted
       * the allocator (abort in the job pump's first object destruction). */
      SPURS_INST_SIZE    = 0x1000,
@@ -82,7 +106,7 @@ index f5174fd7..83623bc8 100644
  
  #define MAX_SPURS_INST 4
  struct SpursInst;
-@@ -528,7 +536,7 @@ static void spurs_api_unlock(struct SpursInst* si)
+@@ -528,7 +546,7 @@ static void spurs_api_unlock(struct SpursInst* si)
  
  static DWORD WINAPI spurs_kernel_thread(LPVOID p);
  
@@ -91,7 +115,7 @@ index f5174fd7..83623bc8 100644
  {
      if (!nspus || nspus > 6) return CELL_SPURS_CORE_ERROR_INVAL;
      AcquireSRWLockExclusive(&s_inst_directory_lock);
-@@ -557,9 +565,12 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
+@@ -557,9 +575,12 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
      /* Real BE instance: zero it, then the few live fields. (The global
       * workload table is NOT wiped here — the title may init several SPURS
       * instances before adding workloads to any of them.) */
@@ -106,7 +130,7 @@ index f5174fd7..83623bc8 100644
  
      s32 start_rc = spurs_scheduler_start(si);
      AcquireSRWLockExclusive(&si->lock);
-@@ -567,8 +578,8 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
+@@ -567,8 +588,8 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
      if (start_rc) __atomic_store_n(&si->ea, 0, __ATOMIC_RELEASE);
      ReleaseSRWLockExclusive(&si->lock);
      if (start_rc) return start_rc;
@@ -117,7 +141,7 @@ index f5174fd7..83623bc8 100644
      return CELL_OK;
  }
  
-@@ -578,7 +589,7 @@ s32 cellSpursInitialize(CellSpurs* spurs, s32 nSpus, s32 spuPriority,
+@@ -578,7 +599,7 @@ s32 cellSpursInitialize(CellSpurs* spurs, s32 nSpus, s32 spuPriority,
      (void)spuPriority; (void)ppuPriority; (void)exitIfNoWork;
      if (!spurs)
          return CELL_SPURS_CORE_ERROR_NULL_POINTER;
@@ -126,7 +150,7 @@ index f5174fd7..83623bc8 100644
  }
  
  s32 cellSpursInitializeWithAttribute(CellSpurs* spurs,
-@@ -588,7 +599,22 @@ s32 cellSpursInitializeWithAttribute(CellSpurs* spurs,
+@@ -588,7 +609,29 @@ s32 cellSpursInitializeWithAttribute(CellSpurs* spurs,
          return CELL_SPURS_CORE_ERROR_NULL_POINTER;
      u32 spurs_ea = (u32)(uintptr_t)spurs;
      attr = GUEST_PTR(attr, const CellSpursAttribute*);
@@ -135,26 +159,49 @@ index f5174fd7..83623bc8 100644
 +}
 +
 +/* The second-version initialise: a CellSpurs2 (8 KB, up to 32 workloads; flags1 SF1_32_WORKLOADS). Argument
-+ * checks follow RPCS3: NULL spurs or attribute, then a spurs off its 128-byte or an attribute off its 8-byte
-+ * alignment. NID 0x30AA96C4. */
++ * checks in RPCS3's order: a NULL attribute (NULL_POINTER), an attribute off its 8-byte alignment (ALIGN), an
++ * attribute revision past 2 (INVAL), then a NULL spurs (NULL_POINTER) and a spurs off its 128-byte alignment
++ * (ALIGN). NID 0x30AA96C4. */
 +s32 cellSpursInitializeWithAttribute2(CellSpurs* spurs, const CellSpursAttribute* attr)
 +{
 +    const u32 spurs_ea = (u32)(uintptr_t)spurs;
 +    const u32 attr_ea  = (u32)(uintptr_t)attr;
-+    if (!spurs_ea || !attr_ea)
++    if (!attr_ea)
 +        return CELL_SPURS_CORE_ERROR_NULL_POINTER;
-+    if ((attr_ea & 7u) || (spurs_ea & 127u))
++    if (attr_ea & 7u)
 +        return CELL_SPURS_CORE_ERROR_ALIGN;
 +    attr = GUEST_PTR(attr, const CellSpursAttribute*);
++    if (attr->revision > 2)
++        return CELL_SPURS_CORE_ERROR_INVAL;
++    if (!spurs_ea)
++        return CELL_SPURS_CORE_ERROR_NULL_POINTER;
++    if (spurs_ea & 127u)
++        return CELL_SPURS_CORE_ERROR_ALIGN;
 +    return spurs_initialize_common(spurs_ea, attr->nSpus, (const char*)attr->prefix, 1);
  }
  
  static void spurs_cancel_attached_queues(u32 spurs_ea);  /* defined with the queue table */
-@@ -947,6 +973,16 @@ s32 cellSpursDestroyTaskset(CellSpursTaskset* taskset)
+@@ -644,10 +687,11 @@ s32 _cellSpursAttributeInitialize(CellSpursAttribute* attr, u32 revision,
+                                   u32 sdkVersion, s32 nSpus, s32 spuPriority,
+                                   s32 ppuPriority, u8 exitIfNoWork)
+ {
+-    (void)revision;
+     (void)sdkVersion;
+-    return cellSpursAttributeInitialize(attr, nSpus, spuPriority,
+-                                        ppuPriority, exitIfNoWork);
++    s32 rc = cellSpursAttributeInitialize(attr, nSpus, spuPriority,
++                                          ppuPriority, exitIfNoWork);
++    if (rc == CELL_OK) GUEST_PTR(attr, CellSpursAttribute*)->revision = revision;
++    return rc;
+ }
+ 
+ s32 cellSpursAttributeSetNamePrefix(CellSpursAttribute* attr,
+@@ -947,6 +991,17 @@ s32 cellSpursDestroyTaskset(CellSpursTaskset* taskset)
      return CELL_OK;
  }
  
 +/* CellSpursTaskset2 (the second-version taskset) is destroyed as a taskset is; it must be 128-byte aligned.
++ * RPCS3 leaves this call unimplemented (CELL_OK); the NULL and ALIGN checks are by analogy with the taskset calls.
 + * NID 0x1EBCF459. */
 +s32 cellSpursDestroyTaskset2(CellSpursTaskset* taskset)
 +{
@@ -167,18 +214,64 @@ index f5174fd7..83623bc8 100644
  s32 cellSpursShutdownTaskset(CellSpursTaskset* taskset)
  {
      taskset = GUEST_PTR(taskset, CellSpursTaskset*);
-@@ -1807,7 +1843,9 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+@@ -1405,6 +1460,9 @@ s32 cellSpursAddWorkload(CellSpurs* spurs, CellSpursWorkloadId* wid,
+             vm_base[spurs_ea + SPURS_WKL_CURCONT + i] = 0;
+             ef_w16(spurs_ea + SPURS_WKL_SIGNAL1,
+                    (u16)(vm_read16(spurs_ea + SPURS_WKL_SIGNAL1) & ~(0x8000u >> i)));
++            /* A stale receiver naming this slot is dropped, as RPCS3's AddWorkload does. */
++            if (vm_base[spurs_ea + SPURS_WKL_FLAG_RECEIVER] == i)
++                vm_base[spurs_ea + SPURS_WKL_FLAG_RECEIVER] = 0xFF;
+             ef_line_end(spurs_ea);
+             s_workloads[i].in_use = 1;
+             s_workloads[i].pm = pm;
+@@ -1623,6 +1681,14 @@ s32 cellSpursRemoveWorkload(CellSpurs* spurs, CellSpursWorkloadId wid)
+     if (si->active[wid] || spurs_policy_release_workload(si->ea, wid)) {
+         spurs_api_unlock(si); return CELL_SPURS_CORE_ERROR_BUSY;
+     }
++    /* The receiver is let go first, as RPCS3's RemoveWorkload does through the first-version
++     * _cellSpursWorkloadFlagReceiver: the flag back to all ones, no receiver. */
++    spu_lockline_lock();
++    if (vm_base[si->ea + SPURS_WKL_FLAG_RECEIVER] == wid) {
++        ef_w32(si->ea + SPURS_WKL_FLAG_WORD, 0xFFFFFFFFu);
++        vm_base[si->ea + SPURS_WKL_FLAG_RECEIVER] = 0xFF;
++    }
++    ef_line_end(si->ea);
+     s_workloads[wid].in_use = 0;
+     vm_write8(si->ea + SPURS_WKL_STATE1 + wid, 3);
+     vm_write32(si->ea + SPURS_WKL_ENABLED,
+@@ -1760,6 +1826,19 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
+     return 0;
+ }
+ 
++/* Whether the instance at `ea` asks for workload `wid` to run: a ready count,
++ * its signal bit, or the workload flag (the workload is the flag's receiver
++ * and the flag word reads 0). A requested workload is selected on the next
++ * pass, a kick pass included; others only by the idle back-off probes. */
++static int spurs_wkl_requested(u32 ea, u32 wid)
++{
++    const u32 signal = vm_read16(ea + SPURS_WKL_SIGNAL1);
++    const u32 ready = vm_read8(ea + SPURS_WKL_READY1 + wid);
++    const int flagged = vm_read8(ea + SPURS_WKL_FLAG_RECEIVER) == wid &&
++                        vm_read32(ea + SPURS_WKL_FLAG_WORD) == 0;
++    return ready || (signal & (0x8000u >> wid)) || flagged;
++}
++
+ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+ {
+     struct SpursInst* si = (struct SpursInst*)p;
+@@ -1805,9 +1884,8 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+                 if (!maxcont || si->active[wid] >= maxcont) continue;
+                 WklPm* pm = spurs_resolve_pm(wid);
                  if (!pm) continue;
-                 u32 signal = vm_read16(ea + SPURS_WKL_SIGNAL1);
-                 u32 ready = vm_read8(ea + SPURS_WKL_READY1 + wid);
+-                u32 signal = vm_read16(ea + SPURS_WKL_SIGNAL1);
+-                u32 ready = vm_read8(ea + SPURS_WKL_READY1 + wid);
 -                int kicked = ready || (signal & (0x8000u >> wid));
-+                int flagged = vm_read8(ea + SPURS_WKL_FLAG_RECEIVER) == wid &&
-+                              vm_read32(ea + SPURS_WKL_FLAG_WORD) == 0;
-+                int kicked = ready || (signal & (0x8000u >> wid)) || flagged;
++                u32 signal, ready;
++                int kicked = spurs_wkl_requested(ea, wid);
                  if (kicked) si->idle[wid] = 0;
                  if (!kicked && (kick_pass || (si->pass_no & ((1u << si->idle[wid]) - 1))))
                      continue;
-@@ -1817,6 +1855,9 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+@@ -1817,6 +1895,9 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                  if (ready) vm_base[ea + SPURS_WKL_READY1 + wid] = (u8)(ready - 1);
                  if (signal & (0x8000u >> wid))
                      ef_w16(ea + SPURS_WKL_SIGNAL1, (u16)(signal & ~(0x8000u >> wid)));
@@ -188,7 +281,7 @@ index f5174fd7..83623bc8 100644
                  ef_line_end(ea);
                  slot->fn = pm->fn; slot->image_id = pm->image_id;
                  slot->pm = vm_base + (u32)(uintptr_t)s_workloads[wid].pm;
-@@ -1932,6 +1973,63 @@ s32 cellSpursReadyCountStore(CellSpurs* spurs, CellSpursWorkloadId wid,
+@@ -1932,6 +2013,63 @@ s32 cellSpursReadyCountStore(CellSpurs* spurs, CellSpursWorkloadId wid,
      return CELL_OK;
  }
  
@@ -253,7 +346,7 @@ index f5174fd7..83623bc8 100644
                                   u32* old, u32 compare, u32 value, int conditional)
  {
 diff --git a/libs/spurs/cellSpurs.h b/libs/spurs/cellSpurs.h
-index 07a3d2e4..4242b957 100644
+index 07a3d2e4..d807070d 100644
 --- a/libs/spurs/cellSpurs.h
 +++ b/libs/spurs/cellSpurs.h
 @@ -30,6 +30,15 @@ extern "C" {
@@ -272,7 +365,17 @@ index 07a3d2e4..4242b957 100644
  #define CELL_SPURS_TASK_ERROR_AGAIN             (CELL_ERROR_BASE_SPURS_TASK | 0x01)
  #define CELL_SPURS_TASK_ERROR_INVAL             (CELL_ERROR_BASE_SPURS_TASK | 0x02)
  #define CELL_SPURS_TASK_ERROR_NOSYS             (CELL_ERROR_BASE_SPURS_TASK | 0x03)
-@@ -232,6 +241,7 @@ s32 cellSpursCreateTasksetWithAttribute(CellSpurs* spurs,
+@@ -100,7 +109,8 @@ struct CellSpursAttribute {
+     u32  prefixSize;
+     u32  flags;
+     u32  container;
+-    u8   _padding[128];
++    u32  revision;      /* _cellSpursAttributeInitialize's; checked by InitializeWithAttribute2 */
++    u8   _padding[124];
+ };
+ 
+ /* Main SPURS instance */
+@@ -232,6 +242,7 @@ s32 cellSpursCreateTasksetWithAttribute(CellSpurs* spurs,
                                          CellSpursTaskset* taskset,
                                          const CellSpursTasksetAttribute* attr);
  s32 cellSpursDestroyTaskset(CellSpursTaskset* taskset);
@@ -280,7 +383,7 @@ index 07a3d2e4..4242b957 100644
  s32 cellSpursShutdownTaskset(CellSpursTaskset* taskset);
  s32 cellSpursJoinTaskset(CellSpursTaskset* taskset);
  
-@@ -275,6 +285,10 @@ s32 cellSpursWorkloadAttributeInitialize(CellSpursWorkloadAttribute* attr,
+@@ -275,6 +286,10 @@ s32 cellSpursWorkloadAttributeInitialize(CellSpursWorkloadAttribute* attr,
                                           u32 minContention,
                                           u32 maxContention);
  
@@ -293,10 +396,10 @@ index 07a3d2e4..4242b957 100644
  s32 cellSpursReadyCountSwap(CellSpurs* spurs, CellSpursWorkloadId wid,
 diff --git a/tests/test_spurs_workload_flag.c b/tests/test_spurs_workload_flag.c
 new file mode 100644
-index 00000000..eb4f897a
+index 00000000..b8847af6
 --- /dev/null
 +++ b/tests/test_spurs_workload_flag.c
-@@ -0,0 +1,158 @@
+@@ -0,0 +1,210 @@
 +/* The SPURS workload flag, cellSpursInitializeWithAttribute2 and cellSpursDestroyTaskset2, against the real
 + * libs/spurs/cellSpurs.c with a manufactured policy module (no game code).
 + *
@@ -377,6 +480,17 @@ index 00000000..eb4f897a
 +    assert(_cellSpursAttributeInitialize((CellSpursAttribute*)(uintptr_t)ATTR, 2, 0x400000, 1, 100, 1000, 0) == 0);
 +    CHECK((u32)cellSpursInitializeWithAttribute2(NULL, (CellSpursAttribute*)(uintptr_t)ATTR) ==
 +          CELL_SPURS_CORE_ERROR_NULL_POINTER, "InitializeWithAttribute2: NULL spurs is NULL_POINTER");
++    /* RPCS3's order: attribute NULL, attribute alignment, revision, then spurs NULL and spurs alignment. */
++    CHECK((u32)cellSpursInitializeWithAttribute2(NULL, NULL) == CELL_SPURS_CORE_ERROR_NULL_POINTER,
++          "InitializeWithAttribute2: NULL both is NULL_POINTER");
++    CHECK((u32)cellSpursInitializeWithAttribute2(NULL, (CellSpursAttribute*)(uintptr_t)(ATTR + 4)) ==
++          CELL_SPURS_CORE_ERROR_ALIGN, "InitializeWithAttribute2: the attribute's alignment is checked before spurs");
++    assert(_cellSpursAttributeInitialize((CellSpursAttribute*)(uintptr_t)ATTR, 3, 0x400000, 1, 100, 1000, 0) == 0);
++    CHECK((u32)cellSpursInitializeWithAttribute2(NULL, (CellSpursAttribute*)(uintptr_t)ATTR) ==
++          CELL_SPURS_CORE_ERROR_INVAL, "InitializeWithAttribute2: revision 3 is INVAL, checked before spurs");
++    CHECK((u32)cellSpursInitializeWithAttribute2((CellSpurs*)(uintptr_t)S2, (CellSpursAttribute*)(uintptr_t)ATTR) ==
++          CELL_SPURS_CORE_ERROR_INVAL, "InitializeWithAttribute2: revision 3 is INVAL");
++    assert(_cellSpursAttributeInitialize((CellSpursAttribute*)(uintptr_t)ATTR, 2, 0x400000, 1, 100, 1000, 0) == 0);
 +    CHECK((u32)cellSpursInitializeWithAttribute2((CellSpurs*)(uintptr_t)S2, NULL) ==
 +          CELL_SPURS_CORE_ERROR_NULL_POINTER, "InitializeWithAttribute2: NULL attribute is NULL_POINTER");
 +    CHECK((u32)cellSpursInitializeWithAttribute2((CellSpurs*)(uintptr_t)S2, (CellSpursAttribute*)(uintptr_t)(ATTR + 4)) ==
@@ -423,9 +537,26 @@ index 00000000..eb4f897a
 +          "FlagReceiver2 set: the workload is the receiver (0x%02X)", vm_read8(S1 + 0x77));
 +    CHECK((u32)_cellSpursWorkloadFlagReceiver2((CellSpurs*)(uintptr_t)S1, wid, 1, 0) == PM_BUSY,
 +          "FlagReceiver2 set again while a receiver is set is BUSY");
-+    CHECK((u32)_cellSpursWorkloadFlagReceiver2((CellSpurs*)(uintptr_t)S1, wid + 1, 0, 0) == PM_PERM ||
-+          (u32)_cellSpursWorkloadFlagReceiver2((CellSpurs*)(uintptr_t)S1, wid + 1, 0, 0) == PM_SRCH,
-+          "FlagReceiver2 unset by another workload is refused");
++    /* a second workload (maxContention 0 keeps it from ever running) that is not the receiver */
++    assert(cellSpursAddWorkload((CellSpurs*)(uintptr_t)S1, (u32*)(uintptr_t)OUT, (void*)0x9000, 16, 0, NULL, 1, 1) == 0);
++    u32 wid2 = vm_read32(OUT);
++    vm_write8(S1 + 0x50 + wid2, 0);
++    CHECK((u32)_cellSpursWorkloadFlagReceiver2((CellSpurs*)(uintptr_t)S1, wid2, 0, 0) == PM_PERM &&
++          vm_read8(S1 + 0x77) == wid, "FlagReceiver2 unset by another (added) workload is PERM; the receiver stays");
++
++    /* The kernel's selection test, on a copy of the instance's first line that no kernel serves: the receiver is
++     * requested when the flag word reads 0, so a kick pass (which serves only requested workloads) selects it. */
++    {
++        const u32 L = 0xA000u;
++        memset(vm_base + L, 0, 128);
++        vm_write8(L + 0x77, (u8)wid); vm_write32(L + 0x6C, 0xFFFFFFFFu);
++        CHECK(!spurs_wkl_requested(L, wid), "a receiver whose flag is all ones is not requested");
++        vm_write32(L + 0x6C, 0);
++        CHECK(spurs_wkl_requested(L, wid), "a receiver whose flag is 0 is requested (taken on a kick pass)");
++        CHECK(!spurs_wkl_requested(L, wid2), "a flag of 0 requests only the receiver");
++        vm_write8(L + 0x77, 0xFF);
++        CHECK(!spurs_wkl_requested(L, wid), "a flag of 0 with no receiver requests nothing");
++    }
 +
 +    /* The PPU stores 0 into the flag: the kernel selects the receiver and pulls the flag back to all ones. */
 +    vm_write32(S1 + 0x6C, 0);
@@ -439,8 +570,32 @@ index 00000000..eb4f897a
 +    CHECK((u32)_cellSpursWorkloadFlagReceiver2((CellSpurs*)(uintptr_t)S1, wid, 0, 0) == PM_STAT,
 +          "FlagReceiver2 with an exception pending is STAT");
 +    vm_write32(S1 + 0xD6C, 0);
-+    CHECK(_cellSpursWorkloadFlagReceiver2((CellSpurs*)(uintptr_t)S1, wid, 0, 0) == 0 && vm_read8(S1 + 0x77) == 0xFF,
-+          "FlagReceiver2 unset by the receiver clears it");
++    vm_write32(S1 + 0x6C, 0x1234u);   /* not 0: no request, and the second version leaves it alone */
++    CHECK(_cellSpursWorkloadFlagReceiver2((CellSpurs*)(uintptr_t)S1, wid, 0, 0) == 0 && vm_read8(S1 + 0x77) == 0xFF &&
++          vm_read32(S1 + 0x6C) == 0x1234u, "FlagReceiver2 unset by the receiver clears it, the flag untouched");
++
++    /* The first version pulls the flag to all ones on set and on unset (RPCS3). */
++    CHECK(_cellSpursWorkloadFlagReceiver((CellSpurs*)(uintptr_t)S1, wid, 1) == 0 && vm_read8(S1 + 0x77) == wid &&
++          vm_read32(S1 + 0x6C) == 0xFFFFFFFFu, "FlagReceiver set: receiver set, flag all ones (0x%08X)", vm_read32(S1 + 0x6C));
++    CHECK((u32)_cellSpursWorkloadFlagReceiver((CellSpurs*)(uintptr_t)S1, wid2, 0) == PM_PERM,
++          "FlagReceiver unset by another workload is PERM");
++    vm_write32(S1 + 0x6C, 0x1234u);
++    CHECK(_cellSpursWorkloadFlagReceiver((CellSpurs*)(uintptr_t)S1, wid, 0) == 0 && vm_read8(S1 + 0x77) == 0xFF &&
++          vm_read32(S1 + 0x6C) == 0xFFFFFFFFu, "FlagReceiver unset: no receiver, flag all ones (0x%08X)", vm_read32(S1 + 0x6C));
++
++    /* RemoveWorkload lets the receiver go (flag back to all ones); AddWorkload drops a stale receiver naming the
++     * slot it fills (RPCS3). */
++    assert(_cellSpursWorkloadFlagReceiver2((CellSpurs*)(uintptr_t)S1, wid2, 1, 0) == 0);
++    vm_write32(S1 + 0x6C, 0x1234u);
++    s32 rrc = -1;
++    for (unsigned i = 0; i < 3000 && (rrc = cellSpursRemoveWorkload((CellSpurs*)(uintptr_t)S1, wid2)) != 0; i++) Sleep(1);
++    CHECK(rrc == 0 && vm_read8(S1 + 0x77) == 0xFF && vm_read32(S1 + 0x6C) == 0xFFFFFFFFu,
++          "RemoveWorkload of the receiver clears it and the flag (rc 0x%X, receiver 0x%02X, flag 0x%08X)",
++          (u32)rrc, vm_read8(S1 + 0x77), vm_read32(S1 + 0x6C));
++    vm_write8(S1 + 0x77, (u8)wid2);   /* stale: names the free slot */
++    assert(cellSpursAddWorkload((CellSpurs*)(uintptr_t)S1, (u32*)(uintptr_t)OUT, (void*)0x9000, 16, 0, NULL, 1, 1) == 0);
++    CHECK(vm_read32(OUT) == wid2 && vm_read8(S1 + 0x77) == 0xFF,
++          "AddWorkload into the receiver's slot drops the receiver (wid %u, receiver 0x%02X)", vm_read32(OUT), vm_read8(S1 + 0x77));
 +    vm_write8(S1 + 0x80 + wid, 3);
 +    finalize(S1);
 +
