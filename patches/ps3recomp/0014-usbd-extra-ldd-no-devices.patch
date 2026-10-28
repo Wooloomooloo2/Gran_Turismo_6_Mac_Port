@@ -10,83 +10,129 @@ What: cellUsbdRegisterExtraLdd (0x7FE92C54), cellUsbdRegisterExtraLdd2
 they took the unresolved path and faked CELL_OK; cellUsbdUnregisterExtraLdd
 (0x90460081) had none either. An extra LDD is a driver for one vendor and a
 product id (...2: a product range). Registering one now records its name and
-range, keyed by name as the lv2 USB daemon keeps them: a name already
-registered is LDD_ALREADY_REGISTERED, a NULL driver or an inverted range
-INVALID_PARAM, a full table LDD_NOT_ALLOCATED, any call before cellUsbdInit
-NOT_INITIALIZED, and unregistering a name not registered LDD_NOT_FOUND.
-cellUsbdEnd drops the registrations. No USB device is ever attached, so a
-driver's probe and attach callbacks are never called: a title probing for a
-peripheral finds none. SetThreadPriority2 records the three priorities (the
-runtime runs no USB threads to give them to). Behaviour follows RPCS3, which
-runs libusbd over its sys_usbd with no devices.
+range, keyed by name as the lv2 USB daemon keeps them. Codes follow RPCS3's
+lv2 sys_usbd_register_extra_ldd / sys_usbd_unregister_extra_ldd (RPCS3's HLE
+libusbd calls are CELL_OK stubs): any call before cellUsbdInit is EINVAL, a
+name already registered EEXIST, unregistering a name not registered ESRCH;
+there is no limit on their number, no check of the product range, and the
+whole name is kept. A NULL driver, which the console would read through,
+answers EINVAL. cellUsbdEnd drops the registrations. No USB device is ever
+attached, so a driver's probe and attach callbacks are never called: a title
+probing for a peripheral finds none. SetThreadPriority2 records the three
+priorities (the runtime runs no USB threads to give them to). The table and
+the priorities are guarded by a mutex (guest threads are host threads).
 
 The header's error codes are corrected to the SDK's: INVALID_ARGUMENT was
 0x80110003 (NO_MEMORY) and is INVALID_PARAM, 0x80110004; NO_DEVICE was
 0x80110004 and is DEVICE_NOT_FOUND, 0x8011000a; PIPE_NOT_FOUND was 0x80110005
-and is 0x8011000d. The SDK codes used above are added.
+and is 0x8011000d. TRANSFER, not an SDK code, had LDD_ALREADY_REGISTERED's
+value and is FATAL, 0x801100ff. The SDK codes are added.
 
 Why: a faked registration left a title's driver bookkeeping out of step with
 the library's, and the wrong codes made a title read one failure as another.
 
 Test: tools/test_usbd_extra_ldd.py (new) checks the four names hash to the
 imported NIDs, then builds libs/hardware/tests/test_usbd_extra_ldd.c with
-cellUsbd.c: each answer above, no device listed, and End dropping the table.
+cellUsbd.c: each answer above, a 99-byte name, 43 drivers registered, no
+device listed, End dropping the table, and no two error names sharing a value.
 
 diff --git a/libs/hardware/cellUsbd.c b/libs/hardware/cellUsbd.c
-index c359680f..50ab7f94 100644
+index c359680f..22883e7e 100644
 --- a/libs/hardware/cellUsbd.c
 +++ b/libs/hardware/cellUsbd.c
-@@ -32,10 +32,88 @@ s32 cellUsbdInit(void)
+@@ -9,6 +9,7 @@
+ #include "cellUsbd.h"
+ #include <stdio.h>
+ #include <string.h>
++#include <stdlib.h>
+ #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_read/vm_write: guest EA -> host */
+ 
+ /* Internal state */
+@@ -32,10 +33,129 @@ s32 cellUsbdInit(void)
      return CELL_OK;
  }
  
 +/* Extra LDDs: a driver for one vendor and a product range, kept by name as the
 + * lv2 USB daemon keeps them. No USB device is ever attached, so their probe and
-+ * attach callbacks are never called. Behaviour follows RPCS3 (libusbd over its
-+ * sys_usbd, with no devices). */
-+#define MAX_EXTRA_LDD 16
-+static struct {
-+    u32  ops_ea;
-+    char name[64];
-+    u16  vendor, product_min, product_max;
-+} s_extra[MAX_EXTRA_LDD];
-+static int s_extra_count = 0;
++ * attach callbacks are never called. Behaviour and codes follow RPCS3's lv2
++ * sys_usbd_register_extra_ldd / sys_usbd_unregister_extra_ldd (RPCS3's HLE
++ * libusbd calls are CELL_OK stubs): EINVAL before cellUsbdInit, EEXIST for a
++ * name already registered, ESRCH to unregister one that is not, no limit on
++ * their number and no check of the product range. A NULL ops (which the
++ * console would read through) answers EINVAL here. */
++#define USBD_EINVAL 0x80010002u
++#define USBD_ESRCH  0x80010005u
++#define USBD_EEXIST 0x80010014u
++struct ExtraLdd {
++    u32   ops_ea;
++    char* name;
++    u16   vendor, product_min, product_max;
++};
++static struct ExtraLdd* s_extra = NULL;
++static int s_extra_count = 0, s_extra_cap = 0;
 +static s32 s_thread_prio[3] = { -1, -1, -1 };   /* event, usbd, callback; -1: the default */
++/* s_extra, s_extra_count and s_thread_prio: guest threads are host threads. */
++#ifdef _WIN32
++#include <windows.h>
++static SRWLOCK s_extra_lock = SRWLOCK_INIT;
++static void extra_lock(void)   { AcquireSRWLockExclusive(&s_extra_lock); }
++static void extra_unlock(void) { ReleaseSRWLockExclusive(&s_extra_lock); }
++#else
++#include <pthread.h>
++static pthread_mutex_t s_extra_lock = PTHREAD_MUTEX_INITIALIZER;
++static void extra_lock(void)   { pthread_mutex_lock(&s_extra_lock); }
++static void extra_unlock(void) { pthread_mutex_unlock(&s_extra_lock); }
++#endif
 +
-+static void ldd_name(u32 ops_ea, char* out, size_t n)
++/* The driver's name, from the C string its ops point at first (an empty name for none). */
++static char* ldd_name(u32 ops_ea)
 +{
 +    const u32 name_ea = vm_read32(ops_ea);
-+    out[0] = 0;
-+    if (name_ea) { strncpy(out, (const char*)(vm_base + name_ea), n - 1); out[n - 1] = 0; }
++    const char* src = name_ea ? (const char*)(vm_base + name_ea) : "";
++    const size_t n = strlen(src);
++    char* out = (char*)malloc(n + 1);
++    if (out) memcpy(out, src, n + 1);
++    return out;
++}
++
++static void extra_clear_locked(void)
++{
++    for (int i = 0; i < s_extra_count; i++) free(s_extra[i].name);
++    s_extra_count = 0;
 +}
 +
  s32 cellUsbdEnd(void)
  {
      printf("[cellUsbd] End()\n");
      s_initialized = 0;
-+    s_extra_count = 0;
-+    memset(s_extra, 0, sizeof(s_extra));
++    extra_lock();
++    extra_clear_locked();
++    extra_unlock();
 +    return CELL_OK;
 +}
 +
 +s32 cellUsbdRegisterExtraLdd2(const CellUsbdLddOps* ops, u16 vendorId, u16 productIdMin, u16 productIdMax)
 +{
 +    const u32 ops_ea = (u32)(uintptr_t)ops;
-+    if (!s_initialized) return (s32)CELL_USBD_ERROR_NOT_INITIALIZED;
-+    if (!ops_ea) return (s32)CELL_USBD_ERROR_INVALID_PARAM;
-+    char name[64];
-+    ldd_name(ops_ea, name, sizeof name);
++    if (!s_initialized || !ops_ea) return (s32)USBD_EINVAL;
++    char* name = ldd_name(ops_ea);
++    if (!name) return (s32)CELL_USBD_ERROR_NO_MEMORY;
++    extra_lock();
 +    for (int i = 0; i < s_extra_count; i++)
-+        if (strcmp(s_extra[i].name, name) == 0)   /* the daemon keys LDDs by name */
-+            return (s32)CELL_USBD_ERROR_LDD_ALREADY_REGISTERED;
-+    if (productIdMin > productIdMax) return (s32)CELL_USBD_ERROR_INVALID_PARAM;
-+    if (s_extra_count >= MAX_EXTRA_LDD) return (s32)CELL_USBD_ERROR_LDD_NOT_ALLOCATED;
-+    s_extra[s_extra_count].ops_ea = ops_ea;
-+    memcpy(s_extra[s_extra_count].name, name, sizeof name);
-+    s_extra[s_extra_count].vendor = vendorId;
-+    s_extra[s_extra_count].product_min = productIdMin;
-+    s_extra[s_extra_count].product_max = productIdMax;
-+    s_extra_count++;
++        if (strcmp(s_extra[i].name, name) == 0) {   /* the daemon keys LDDs by name */
++            extra_unlock(); free(name);
++            return (s32)USBD_EEXIST;
++        }
++    if (s_extra_count == s_extra_cap) {
++        const int cap = s_extra_cap ? s_extra_cap * 2 : 16;
++        struct ExtraLdd* grown = (struct ExtraLdd*)realloc(s_extra, (size_t)cap * sizeof *grown);
++        if (!grown) { extra_unlock(); free(name); return (s32)CELL_USBD_ERROR_NO_MEMORY; }
++        s_extra = grown; s_extra_cap = cap;
++    }
++    struct ExtraLdd* e = &s_extra[s_extra_count++];
++    e->ops_ea = ops_ea; e->name = name;
++    e->vendor = vendorId; e->product_min = productIdMin; e->product_max = productIdMax;
++    extra_unlock();
 +    printf("[cellUsbd] RegisterExtraLdd(%s, vendor 0x%04X, products 0x%04X-0x%04X): no device attached\n",
 +           name, vendorId, productIdMin, productIdMax);
 +    return CELL_OK;
@@ -100,18 +146,23 @@ index c359680f..50ab7f94 100644
 +s32 cellUsbdUnregisterExtraLdd(const CellUsbdLddOps* ops)
 +{
 +    const u32 ops_ea = (u32)(uintptr_t)ops;
-+    if (!s_initialized) return (s32)CELL_USBD_ERROR_NOT_INITIALIZED;
-+    if (!ops_ea) return (s32)CELL_USBD_ERROR_INVALID_PARAM;
-+    char name[64];
-+    ldd_name(ops_ea, name, sizeof name);
++    if (!s_initialized || !ops_ea) return (s32)USBD_EINVAL;
++    char* name = ldd_name(ops_ea);
++    if (!name) return (s32)CELL_USBD_ERROR_NO_MEMORY;
++    s32 rc = (s32)USBD_ESRCH;
++    extra_lock();
 +    for (int i = 0; i < s_extra_count; i++) {
 +        if (strcmp(s_extra[i].name, name) == 0) {
++            free(s_extra[i].name);
 +            memmove(&s_extra[i], &s_extra[i + 1], (size_t)(s_extra_count - i - 1) * sizeof s_extra[0]);
 +            s_extra_count--;
-+            return CELL_OK;
++            rc = CELL_OK;
++            break;
 +        }
 +    }
-+    return (s32)CELL_USBD_ERROR_LDD_NOT_FOUND;
++    extra_unlock();
++    free(name);
++    return rc;
 +}
 +
 +/* The priorities of the library's event, USB daemon and callback threads. The
@@ -119,14 +170,16 @@ index c359680f..50ab7f94 100644
 + * only recorded. */
 +s32 cellUsbdSetThreadPriority2(s32 eventPriority, s32 usbdPriority, s32 callbackPriority)
 +{
++    extra_lock();
 +    s_thread_prio[0] = eventPriority;
 +    s_thread_prio[1] = usbdPriority;
 +    s_thread_prio[2] = callbackPriority;
++    extra_unlock();
      return CELL_OK;
  }
  
 diff --git a/libs/hardware/cellUsbd.h b/libs/hardware/cellUsbd.h
-index 6d8dd233..05224179 100644
+index 6d8dd233..a574799a 100644
 --- a/libs/hardware/cellUsbd.h
 +++ b/libs/hardware/cellUsbd.h
 @@ -18,10 +18,17 @@ extern "C" {
@@ -147,7 +200,7 @@ index 6d8dd233..05224179 100644
 +#define CELL_USBD_ERROR_PIPE_NOT_FOUND         0x8011000d
 +#define CELL_USBD_ERROR_INVALID_ARGUMENT    CELL_USBD_ERROR_INVALID_PARAM
 +#define CELL_USBD_ERROR_NO_DEVICE           CELL_USBD_ERROR_DEVICE_NOT_FOUND
-+#define CELL_USBD_ERROR_TRANSFER            0x80110006   /* not an SDK code; unused */
++#define CELL_USBD_ERROR_TRANSFER            0x801100ff   /* not an SDK code: FATAL */
  
  /* Constants */
  #define CELL_USBD_MAX_PIPES    16
@@ -166,10 +219,10 @@ index 6d8dd233..05224179 100644
  
 diff --git a/libs/hardware/tests/test_usbd_extra_ldd.c b/libs/hardware/tests/test_usbd_extra_ldd.c
 new file mode 100644
-index 00000000..c8c93504
+index 00000000..0a5141ac
 --- /dev/null
 +++ b/libs/hardware/tests/test_usbd_extra_ldd.c
-@@ -0,0 +1,75 @@
+@@ -0,0 +1,92 @@
 +/*
 + * test_usbd_extra_ldd - cellUsbdRegisterExtraLdd, cellUsbdRegisterExtraLdd2,
 + * cellUsbdUnregisterExtraLdd and cellUsbdSetThreadPriority2
@@ -177,8 +230,9 @@ index 00000000..c8c93504
 + *
 + * An extra LDD is a driver for one vendor and a product range. Registering it
 + * records the name and range (as the lv2 USB daemon does); with no USB device
-+ * attached, none of its callbacks is ever called. Behaviour follows RPCS3
-+ * (libusbd over its sys_usbd, no devices). Run by tools/test_usbd_extra_ldd.py.
++ * attached, none of its callbacks is ever called. Codes follow RPCS3's lv2
++ * sys_usbd_register_extra_ldd / _unregister_extra_ldd: EINVAL, EEXIST, ESRCH;
++ * no limit and no range check. Run by tools/test_usbd_extra_ldd.py.
 + */
 +
 +#include "../cellUsbd.c"
@@ -210,37 +264,53 @@ index 00000000..c8c93504
 +    strcpy((char*)vm_base + name_ea, name);
 +}
 +
++#define EINVAL_ 0x80010002u
++#define ESRCH_  0x80010005u
++#define EEXIST_ 0x80010014u
++
 +int main(void)
 +{
 +    vm_base = calloc(1, 0x20000);
 +    ldd(0x1000, 0x1100, "wheel");
 +    ldd(0x1200, 0x1300, "wheel2");
 +    ldd(0x1400, 0x1500, "wheel");   /* a second driver with a name already registered */
++    /* a name longer than 63 bytes is kept whole */
++    char longname[100]; memset(longname, 'L', 99); longname[99] = 0;
++    ldd(0x1600, 0x1700, longname);
 +
-+    CHECK((u32)cellUsbdRegisterExtraLdd(OPS(0x1000), 0x046D, 0xC29A) == CELL_USBD_ERROR_NOT_INITIALIZED,
-+          "RegisterExtraLdd before cellUsbdInit is NOT_INITIALIZED");
++    CHECK((u32)cellUsbdRegisterExtraLdd(OPS(0x1000), 0x046D, 0xC29A) == EINVAL_,
++          "RegisterExtraLdd before cellUsbdInit is EINVAL");
++    CHECK((u32)cellUsbdUnregisterExtraLdd(OPS(0x1000)) == EINVAL_, "UnregisterExtraLdd before cellUsbdInit is EINVAL");
 +    CHECK(cellUsbdInit() == CELL_OK, "cellUsbdInit");
 +    CHECK(cellUsbdSetThreadPriority2(1000, 1001, 1002) == CELL_OK, "SetThreadPriority2 is CELL_OK");
-+    CHECK((u32)cellUsbdRegisterExtraLdd(NULL, 0x046D, 0xC29A) == CELL_USBD_ERROR_INVALID_PARAM,
-+          "RegisterExtraLdd(NULL) is INVALID_PARAM (0x%08X)", (unsigned)CELL_USBD_ERROR_INVALID_PARAM);
++    CHECK((u32)cellUsbdRegisterExtraLdd(NULL, 0x046D, 0xC29A) == EINVAL_, "RegisterExtraLdd(NULL) is EINVAL");
 +    CHECK(cellUsbdRegisterExtraLdd(OPS(0x1000), 0x046D, 0xC29A) == CELL_OK, "RegisterExtraLdd registers");
 +    CHECK(cellUsbdRegisterExtraLdd2(OPS(0x1200), 0x046D, 0xC290, 0xC29F) == CELL_OK,
 +          "RegisterExtraLdd2 registers a product range");
-+    CHECK((u32)cellUsbdRegisterExtraLdd2(OPS(0x1200), 0x046D, 0xC2A0, 0xC290) == CELL_USBD_ERROR_INVALID_PARAM ||
-+          (u32)cellUsbdRegisterExtraLdd2(OPS(0x1200), 0x046D, 0xC2A0, 0xC290) == CELL_USBD_ERROR_LDD_ALREADY_REGISTERED,
-+          "RegisterExtraLdd2 again is refused");
-+    CHECK((u32)cellUsbdRegisterExtraLdd(OPS(0x1400), 0x054C, 0x0001) == CELL_USBD_ERROR_LDD_ALREADY_REGISTERED,
-+          "a second LDD with a registered name is LDD_ALREADY_REGISTERED");
-+    CHECK(s_extra_count == 2, "two extra LDDs are recorded (%d)", s_extra_count);
++    CHECK((u32)cellUsbdRegisterExtraLdd2(OPS(0x1200), 0x046D, 0xC2A0, 0xC290) == EEXIST_,
++          "RegisterExtraLdd2 again is EEXIST (the range is not checked first)");
++    CHECK((u32)cellUsbdRegisterExtraLdd(OPS(0x1400), 0x054C, 0x0001) == EEXIST_,
++          "a second LDD with a registered name is EEXIST");
++    CHECK(cellUsbdRegisterExtraLdd2(OPS(0x1600), 0x054C, 0x0200, 0x0100) == CELL_OK && s_extra_count == 3 &&
++          strlen(s_extra[2].name) == 99, "an inverted range and a 99-byte name register (no range check)");
++    /* no limit on their number */
++    int all = 1;
++    for (int i = 0; i < 40; i++) {
++        char nm[16]; snprintf(nm, sizeof nm, "ldd%02d", i);
++        ldd(0x2000 + i * 0x40, 0x4000 + i * 0x20, nm);
++        all &= cellUsbdRegisterExtraLdd(OPS(0x2000 + i * 0x40), 0x1234, (u16)i) == CELL_OK;
++    }
++    CHECK(all && s_extra_count == 43, "43 extra LDDs register (%d)", s_extra_count);
 +    u32 n = 0xFFFF;
 +    CHECK(cellUsbdGetDeviceList(NULL, 0, (u32*)(uintptr_t)0x1800) == CELL_OK && (n = vm_read32(0x1800)) == 0,
 +          "no USB device is attached (%u)", n);
 +    CHECK(cellUsbdUnregisterExtraLdd(OPS(0x1000)) == CELL_OK, "UnregisterExtraLdd");
-+    CHECK((u32)cellUsbdUnregisterExtraLdd(OPS(0x1000)) == CELL_USBD_ERROR_LDD_NOT_FOUND,
-+          "UnregisterExtraLdd of one not registered is LDD_NOT_FOUND");
++    CHECK((u32)cellUsbdUnregisterExtraLdd(OPS(0x1000)) == ESRCH_,
++          "UnregisterExtraLdd of one not registered is ESRCH");
 +    CHECK(cellUsbdRegisterExtraLdd(OPS(0x1400), 0x054C, 0x0001) == CELL_OK, "the name is free again");
 +    cellUsbdEnd();
 +    CHECK(cellUsbdInit() == CELL_OK && s_extra_count == 0, "cellUsbdEnd drops the registrations");
++    CHECK(CELL_USBD_ERROR_TRANSFER != CELL_USBD_ERROR_LDD_ALREADY_REGISTERED, "no two error names share a value");
 +    if (fails) { printf("%d check(s) failed\n", fails); return 1; }
 +    puts("test_usbd_extra_ldd: OK");
 +    return 0;
