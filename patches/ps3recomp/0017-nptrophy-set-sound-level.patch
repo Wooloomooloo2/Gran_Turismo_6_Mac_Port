@@ -10,24 +10,29 @@ unresolved path and faked CELL_OK whatever its arguments. It sets the volume
 of the trophy-unlock sound for a context, 20 to 100. There is no unlock sound
 to play, so a valid call only succeeds. The checks follow RPCS3's order: a
 level outside 20-100 is INVALID_ARGUMENT, any option NOT_SUPPORTED (none is
-defined; the PS3 SDK's 0x80022903 is added for it), then the library must be
-initialised and the context and handle must exist (the module's
-NOT_INITIALIZED, INVALID_CONTEXT and INVALID_HANDLE).
+defined), then the library must be initialised (NOT_INITIALIZED), and the
+context and handle are looked up as RPCS3 does: an id out of range is
+INVALID_ARGUMENT, a context or handle not open UNKNOWN_CONTEXT or
+UNKNOWN_HANDLE.
 
-The module's other error values (0x805516xx) are not the PS3 SDK's
-(0x800229xx, as RPCS3 has them); that is left for its own change.
+The module's error values were not the PS3 SDK's (0x805516xx where the SDK
+and RPCS3 have 0x800229xx). Every name with an SDK code now has the SDK's
+value, and UNKNOWN_CONTEXT and UNKNOWN_HANDLE are added; only the numbers
+change, not which error any call returns. ALREADY_EXISTS, NOT_FOUND,
+CONTEXT_ALREADY_REG, PROCESSING and UNKNOWN have no SDK code and keep theirs.
 
 Why: a faked success hid a level out of range from the caller.
 
 Test: tools/test_trophy_sound_level.py (new) checks the name hashes to the
 imported NID, then builds libs/network/tests/test_trophy_sound_level.c with
-sceNpTrophy.c: each refusal above and the two ends of the range.
+sceNpTrophy.c: each refusal above, the two ends of the range, and the SDK
+values of the codes it returns.
 
 diff --git a/libs/network/sceNpTrophy.c b/libs/network/sceNpTrophy.c
-index d956e6dd..950c7868 100644
+index d956e6dd..0825dcf6 100644
 --- a/libs/network/sceNpTrophy.c
 +++ b/libs/network/sceNpTrophy.c
-@@ -388,6 +388,27 @@ s32 sceNpTrophyGetRequiredDiskSpace(SceNpTrophyContext context,
+@@ -388,6 +388,29 @@ s32 sceNpTrophyGetRequiredDiskSpace(SceNpTrophyContext context,
      return CELL_OK;
  }
  
@@ -35,7 +40,8 @@ index d956e6dd..950c7868 100644
 + * unlock sound, 20 to 100. There is no unlock sound to play, so a valid call
 + * only succeeds. Checks in RPCS3's order: the level (INVALID_ARGUMENT), the
 + * options, of which none are defined (NOT_SUPPORTED), then initialisation,
-+ * the context and the handle. NID 0x27DEDA93. */
++ * the context and the handle (out of range INVALID_ARGUMENT, not open
++ * UNKNOWN_CONTEXT / UNKNOWN_HANDLE). NID 0x27DEDA93. */
 +s32 sceNpTrophySetSoundLevel(SceNpTrophyContext context, SceNpTrophyHandle handle, u32 level, u64 options)
 +{
 +    if (level < 20 || level > 100)
@@ -44,10 +50,11 @@ index d956e6dd..950c7868 100644
 +        return SCE_NP_TROPHY_ERROR_NOT_SUPPORTED;
 +    if (!s_trophy_initialized)
 +        return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
-+    if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS || !s_contexts[context].in_use)
-+        return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
-+    if (handle <= 0 || handle > SCE_NP_TROPHY_MAX_HANDLES || !s_handles[handle].in_use)
-+        return SCE_NP_TROPHY_ERROR_INVALID_HANDLE;
++    /* RPCS3's context lookup: an id out of range is INVALID_ARGUMENT, one not open UNKNOWN_*. */
++    if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS) return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
++    if (!s_contexts[context].in_use) return SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT;
++    if (handle <= 0 || handle > SCE_NP_TROPHY_MAX_HANDLES) return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
++    if (!s_handles[handle].in_use) return SCE_NP_TROPHY_ERROR_UNKNOWN_HANDLE;
 +    printf("[sceNpTrophy] SetSoundLevel(ctx=%d, level=%u)\n", context, level);
 +    return CELL_OK;
 +}
@@ -56,18 +63,49 @@ index d956e6dd..950c7868 100644
                             SceNpTrophyHandle handle,
                             SceNpTrophyGameDetails* details,
 diff --git a/libs/network/sceNpTrophy.h b/libs/network/sceNpTrophy.h
-index 48faefdc..b7ddafa3 100644
+index 48faefdc..44c4932e 100644
 --- a/libs/network/sceNpTrophy.h
 +++ b/libs/network/sceNpTrophy.h
-@@ -34,6 +34,7 @@ extern "C" {
+@@ -18,21 +18,27 @@ extern "C" {
+ /* ---------------------------------------------------------------------------
+  * Error codes
+  * -----------------------------------------------------------------------*/
+-#define SCE_NP_TROPHY_ERROR_NOT_INITIALIZED         0x80551601
+-#define SCE_NP_TROPHY_ERROR_ALREADY_INITIALIZED     0x80551602
+-#define SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT        0x80551603
+-#define SCE_NP_TROPHY_ERROR_OUT_OF_MEMORY           0x80551604
+-#define SCE_NP_TROPHY_ERROR_INVALID_CONTEXT         0x80551605
+-#define SCE_NP_TROPHY_ERROR_INVALID_HANDLE          0x80551606
+-#define SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED  0x80551607
++/* The PS3 SDK's values (0x800229xx), which RPCS3 uses too. The names after the
++ * blank line have no SDK code of their own and keep this library's values. */
++#define SCE_NP_TROPHY_ERROR_ALREADY_INITIALIZED     0x80022901
++#define SCE_NP_TROPHY_ERROR_NOT_INITIALIZED         0x80022902
++#define SCE_NP_TROPHY_ERROR_NOT_SUPPORTED           0x80022903
++#define SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED  0x80022904
++#define SCE_NP_TROPHY_ERROR_OUT_OF_MEMORY           0x80022905
++#define SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT        0x80022906
++#define SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT         0x8002290a
++#define SCE_NP_TROPHY_ERROR_INVALID_CONTEXT         0x8002290e
++#define SCE_NP_TROPHY_ERROR_ABORT                   0x80022910
++#define SCE_NP_TROPHY_ERROR_UNKNOWN_HANDLE          0x80022911
++#define SCE_NP_TROPHY_ERROR_PLATINUM_CANNOT_UNLOCK  0x80022914
++#define SCE_NP_TROPHY_ERROR_ALREADY_UNLOCKED        0x80022915
++#define SCE_NP_TROPHY_ERROR_INVALID_HANDLE          0x80022917
++#define SCE_NP_TROPHY_ERROR_INSUFFICIENT_SPACE      0x80022928
++
+ #define SCE_NP_TROPHY_ERROR_ALREADY_EXISTS          0x80551608
+ #define SCE_NP_TROPHY_ERROR_NOT_FOUND               0x80551609
+-#define SCE_NP_TROPHY_ERROR_ALREADY_UNLOCKED        0x8055160A
+-#define SCE_NP_TROPHY_ERROR_PLATINUM_CANNOT_UNLOCK  0x8055160B
+ #define SCE_NP_TROPHY_ERROR_CONTEXT_ALREADY_REG     0x8055160C
+-#define SCE_NP_TROPHY_ERROR_INSUFFICIENT_SPACE      0x8055160D
  #define SCE_NP_TROPHY_ERROR_PROCESSING              0x8055160E
- #define SCE_NP_TROPHY_ERROR_ABORT                   0x8055160F
+-#define SCE_NP_TROPHY_ERROR_ABORT                   0x8055160F
  #define SCE_NP_TROPHY_ERROR_UNKNOWN                 0x805516FF
-+#define SCE_NP_TROPHY_ERROR_NOT_SUPPORTED           0x80022903   /* the PS3 SDK's value */
  
  /* ---------------------------------------------------------------------------
-  * Constants
-@@ -110,6 +111,7 @@ typedef struct SceNpTrophyFlagArray {
+@@ -110,6 +116,7 @@ typedef struct SceNpTrophyFlagArray {
  
  s32 sceNpTrophyInit(void* poolPtr, u32 poolSize, u32 containerId, u64 options);
  s32 sceNpTrophyTerm(void);
@@ -77,10 +115,10 @@ index 48faefdc..b7ddafa3 100644
                               const SceNpCommunicationId* commId,
 diff --git a/libs/network/tests/test_trophy_sound_level.c b/libs/network/tests/test_trophy_sound_level.c
 new file mode 100644
-index 00000000..b7ad9888
+index 00000000..ea1ae100
 --- /dev/null
 +++ b/libs/network/tests/test_trophy_sound_level.c
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,54 @@
 +/*
 + * test_trophy_sound_level - sceNpTrophySetSoundLevel (libs/network/sceNpTrophy.c).
 + *
@@ -119,8 +157,16 @@ index 00000000..b7ad9888
 +    CHECK(sceNpTrophySetSoundLevel(ctx, h, 19, 0) == (s32)SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT, "level 19: INVALID_ARGUMENT");
 +    CHECK(sceNpTrophySetSoundLevel(ctx, h, 101, 0) == (s32)SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT, "level 101: INVALID_ARGUMENT");
 +    CHECK(sceNpTrophySetSoundLevel(ctx, h, 50, 1) == (s32)SCE_NP_TROPHY_ERROR_NOT_SUPPORTED, "options: NOT_SUPPORTED");
-+    CHECK(sceNpTrophySetSoundLevel(ctx + 1, h, 50, 0) == (s32)SCE_NP_TROPHY_ERROR_INVALID_CONTEXT, "an unknown context");
-+    CHECK(sceNpTrophySetSoundLevel(ctx, h + 1, 50, 0) == (s32)SCE_NP_TROPHY_ERROR_INVALID_HANDLE, "an unknown handle");
++    CHECK(sceNpTrophySetSoundLevel(ctx + 1, h, 50, 0) == (s32)SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT,
++          "a context not open: UNKNOWN_CONTEXT");
++    CHECK(sceNpTrophySetSoundLevel(ctx, h + 1, 50, 0) == (s32)SCE_NP_TROPHY_ERROR_UNKNOWN_HANDLE,
++          "a handle not open: UNKNOWN_HANDLE");
++    CHECK(sceNpTrophySetSoundLevel(0, h, 50, 0) == (s32)SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT &&
++          sceNpTrophySetSoundLevel(ctx, 0x7FFFFFFF, 50, 0) == (s32)SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT,
++          "an id out of range: INVALID_ARGUMENT");
++    CHECK(SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT == 0x80022906u && SCE_NP_TROPHY_ERROR_NOT_INITIALIZED == 0x80022902u &&
++          SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT == 0x8002290au && SCE_NP_TROPHY_ERROR_UNKNOWN_HANDLE == 0x80022911u,
++          "the codes are the SDK's");
 +    CHECK(sceNpTrophySetSoundLevel(ctx, h, 20, 0) == CELL_OK && sceNpTrophySetSoundLevel(ctx, h, 100, 0) == CELL_OK,
 +          "levels 20 and 100 are CELL_OK");
 +    if (fails) { printf("%d check(s) failed\n", fails); return 1; }
