@@ -217,8 +217,8 @@ Run outputs are in `$GT6_TREE/reference/rpcs3-20261028-000710/`: `timeline.md`,
 per launch. RPCS3 0.0.43-20410 ran with firmware 4.50 on a fresh APFS clone of the verified
 `dev_hdd0/game/BCES01977`, as in the section below. It used a copy of the owner's config with
 every Cell log channel at Trace, in a window. The window was screenshotted every 10 s.
-RPCS3's log was read in place, and only through a filter that drops any line with 32 or more hex digits (once separators and
-`0x` are removed) or a key word. The log was deleted afterwards.
+RPCS3's log was read in place, and only through a filter that drops any line with 32 or more
+hex digits (once separators and `0x` are removed) or a key word. The log was deleted afterwards.
 
 **Timeline** (seconds from launch; full detail in `timeline.md`):
 
@@ -296,6 +296,24 @@ RPCS3's log was read in place, and only through a filter that drops any line wit
 - `games.yml` was pointed at `$GT6_TREE/dev_bdvd` for the run and then restored. The SHA-256
   of `config.yml` and `games.yml` match the values taken before the run.
 - RPCS3's GT6 playtime grew from 946,248 ms to 3,572,157 ms, about 44 minutes added.
+
+**How to put RPCS3 back** to its state before this run. Quit RPCS3 first. Paths are under
+`~/Library/Application Support/rpcs3/` unless they start with `~`.
+
+1. Delete everything this run added:
+   - `dev_hdd0/game/BCES01977` (the post-install game folder);
+   - `dev_hdd0/game/＄locks/BCES01977_v01.00` (a 0-byte lock marker; the `＄locks` folder
+     existed before);
+   - `dev_hdd0/home/00000001/trophy/NPWR04712_00`;
+   - `dev_hdd1/caches/BCES01977_BCES01977`;
+   - `~/Library/Caches/rpcs3/cache/BCES01977` (GT6's PPU and SPU caches). The other `cache/`
+     entries are firmware caches that existed before the run, and `ppu_progs` and `spu_progs`
+     are still empty, so this run created nothing else there.
+2. Restore the playtime: copy
+   `$GT6_TREE/reference/rpcs3-save-backup-20261028-000710/persistent_settings.dat.before` over
+   `GuiConfigs/persistent_settings.dat`.
+3. `games.yml` and `config.yml` need nothing. `games.yml` was restored from `games.yml.orig` in
+   the same folder, and `sha256-before.txt` there holds the hashes to check both files against.
 
 ## Where GT6's run-time SPU images come from (2026-10-27)
 
