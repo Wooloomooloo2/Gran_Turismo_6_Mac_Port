@@ -17,7 +17,7 @@ inside a git work tree. The run stops when:
 - with --until flip (the default), the first guest flip (milestone key gcm:flip) appeared
   5 s ago: outcome first_frame if at least one frame was dumped, otherwise flip_no_frame;
   with --until time a flip does not stop the run, and a run that reaches --seconds without
-  crashing is timeout, its frames kept;
+  crashing is timeout, its frames kept (one that ends by itself first is exited);
 - the process exits on its own (exited, or crashed if a signal ended it);
 - stdout, stderr and the milestone log all stopped growing for --idle seconds: hung
   (ps3recomp logs only the first occurrence of each key, so growth of any of the three counts);
@@ -107,11 +107,15 @@ def parse_milestones(text):
 def classify(returncode, timed_out, hung, keys, frames, until="flip"):
     """One of OUTCOMES. returncode is None when the harness killed the process. A first
     frame needs both the flip key and at least one dumped frame. With until="time" a run
-    that reached its time limit is timeout whatever it showed (its frames are kept)."""
+    that reached its time limit is timeout whatever it showed (its frames are kept), and one
+    that ended by itself before that is exited: the run was meant to last."""
     if returncode is not None and (returncode < 0 or returncode > 128):
         return "crashed"
-    if until == "time" and timed_out:
-        return "timeout"
+    if until == "time":
+        if timed_out:
+            return "timeout"
+        if returncode is not None:
+            return "exited"
     if FLIP_KEY in keys:
         return "first_frame" if frames >= 1 else "flip_no_frame"
     if hung:
@@ -249,7 +253,13 @@ def _dump_check(frames_dir, frame_bytes):
 
 
 def _stop_dumps(frames_dir, reason):
-    (Path(frames_dir) / STOP_NAME).write_text(reason + "\n")
+    """Ask the renderer to stop dumping. Never raises: a STOP file that cannot be written
+    (disk full, frames/ gone) is reported, and the run goes on to write its report."""
+    try:
+        (Path(frames_dir) / STOP_NAME).write_text(reason + "\n")
+    except OSError as e:
+        print(f"warning: could not write {Path(frames_dir) / STOP_NAME} ({e}); "
+              f"the renderer may keep dumping", file=sys.stderr)
     print(f"note: frame dumps stopped ({reason}: "
           + ("frames/ passed its size cap" if reason == "bytes"
              else f"less than {FREE_FLOOR // 1024**3} GB of free disk space") + ")",
@@ -281,10 +291,14 @@ def prune_runs(runs, keep=PRUNE_KEEP):
                        if RUN_RE.fullmatch(p.name) and p.is_dir() and not p.is_symlink())
     except OSError:
         return []
-    old = found[:-keep] if keep > 0 else found
-    for p in old:
-        shutil.rmtree(p)
-    return old
+    removed = []
+    for p in (found[:-keep] if keep > 0 else found):
+        try:
+            shutil.rmtree(p)
+            removed.append(p)
+        except OSError as e:
+            print(f"warning: could not delete {p}: {e}", file=sys.stderr)
+    return removed
 
 
 def _sample(pid, path):

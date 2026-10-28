@@ -112,8 +112,8 @@ cmake --build "$GT6_TREE/port-build" --target gt6
 Options for long runs (D35):
 
 - `--until time` runs to `--seconds` instead of stopping 5 s after the first flip; a run that
-  reaches the limit without crashing is `timeout`, with its frames kept (`--until flip`, the
-  default, is the old behaviour).
+  reaches the limit without crashing is `timeout`, with its frames kept, and one that ends by
+  itself first is `exited` (`--until flip`, the default, is the old behaviour).
 - `--frame-every N` dumps presented frame 1 and every N-th after it (default 60).
 - `--frame-max N` dumps at most N frames per run (default 300). Dumps also stop by themselves
   when `frames/` passes 2 GB or the disk has less than 20 GB free (`dump_stopped` in

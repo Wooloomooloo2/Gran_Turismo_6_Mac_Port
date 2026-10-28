@@ -175,8 +175,9 @@ def test_refuses_unprepared_play_folder(tree, tmp_path):
     (None, True, ["gcm:flip"], 3, "timeout"),     # ran to the end: frames kept, still timeout
     (None, True, ["a"], 0, "timeout"),
     (-11, False, ["gcm:flip"], 3, "crashed"),
-    (0, False, ["gcm:flip"], 3, "first_frame"),   # ended by itself after its first frame
-    (0, False, ["gcm:flip"], 0, "flip_no_frame"),
+    (0, False, ["gcm:flip"], 3, "exited"),        # ended by itself before the time was up
+    (0, False, ["gcm:flip"], 0, "exited"),
+    (0, False, ["a"], 0, "exited"),
 ])
 def test_classify_time_mode(rc, to, keys, frames, want):
     assert boot_game.classify(rc, to, False, keys, frames, until="time") == want
@@ -291,6 +292,49 @@ def test_prune_flag_runs_after_the_boot(tree, tmp_path, monkeypatch):
     assert boot_game.main([str(tree), "--gt6", str(fake("flip", tmp_path)), "--prune"]) == 0
     runs = sorted(p.name for p in (tree / "runs").iterdir())
     assert len(runs) == 10 and not runs[-1].startswith("2000")   # the new run is kept
+
+
+def test_stop_file_write_failure_is_not_fatal(tree, tmp_path, monkeypatch):
+    real = Path.write_text
+    def failing(self, *a, **k):
+        if self.name == boot_game.STOP_NAME:
+            raise OSError(28, "No space left on device")
+        return real(self, *a, **k)
+    monkeypatch.setattr(Path, "write_text", failing)
+    rep = boot_game.boot(fake("series", tmp_path), tree, seconds=2, idle=30, until="time",
+                         frame_every=1, frame_bytes=200)
+    assert rep["dump_stopped"] == "bytes"
+    assert rep["outcome"] == "timeout"
+    assert (Path(rep["run"]) / "report.json").is_file()
+    assert not (Path(rep["run"]) / "frames" / boot_game.STOP_NAME).exists()
+
+
+def test_prune_skips_symlinks_and_files(tree, tmp_path):
+    runs = tree / "runs"
+    names = [f"202610{d:02d}-120000" for d in range(1, 13)]
+    for n in names:
+        (runs / n).mkdir(parents=True)
+    target = tmp_path / "elsewhere"
+    target.mkdir()
+    (target / "keep.txt").write_text("x")
+    (runs / "20000101-000000").symlink_to(target)        # run-like name, a symlink
+    (runs / "20000102-000000").write_text("not a run")   # run-like name, a regular file
+    removed = boot_game.prune_runs(runs, keep=10)
+    assert sorted(p.name for p in removed) == names[:2]
+    assert (runs / "20000101-000000").is_symlink() and (target / "keep.txt").is_file()
+    assert (runs / "20000102-000000").read_text() == "not a run"
+
+
+def test_prune_survives_rmtree_errors(tree, monkeypatch, capsys):
+    runs = tree / "runs"
+    for d in range(1, 13):
+        (runs / f"202610{d:02d}-120000").mkdir(parents=True)
+    def boom(path, *a, **k):
+        raise OSError(13, "Permission denied")
+    monkeypatch.setattr(boot_game.shutil, "rmtree", boom)
+    assert boot_game.prune_runs(runs, keep=10) == []
+    assert "could not delete" in capsys.readouterr().err
+    assert len(list(runs.iterdir())) == 12
 
 
 def test_group_killed_on_timeout_in_time_mode(tree, tmp_path, monkeypatch):

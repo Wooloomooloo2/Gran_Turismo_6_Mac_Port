@@ -20,7 +20,9 @@ never sees half a frame. The draw engine counts, per frame, the BEGIN_END
 groups that held a draw command (drawn or not) and the CLEAR_SURFACE
 methods (any mask), and latches them before the backend's present callback
 (rsx_draw_engine_frame_counts); the engine presents once per guest flip, so
-these are the counts since the last flip. The policy and the PPM/stats
+these are the counts since the last flip. A present with no surface to show
+does not reset them, so its draws and clears carry into the next present. The
+policy and the PPM/stats
 writers are plain C in libs/video/rsx_frame_series.h; rsx_metal_backend.m
 shares one readback helper between them and the single-file
 PS3RECOMP_METAL_FRAME_DUMP, whose behaviour (every 120th frame, one file
@@ -28,8 +30,8 @@ overwritten) is unchanged. The legacy vtable path is not covered.
 
 Why: one overwritten dump cannot show how a title's screen changes over a
 long unattended run, and a black frame cannot tell "cleared to black" from
-"nothing drawn". Gran Turismo 6's first frame under the port is all black;
-the counts beside each numbered frame answer which.
+"nothing drawn". The counts beside each numbered frame answer which, for any
+title whose first frames come out black.
 
 Test: tools/test_frame_series.py (new; builds libs/video/tests/
 test_frame_series.c for the policy, names, caps, stop file and the PPM and
