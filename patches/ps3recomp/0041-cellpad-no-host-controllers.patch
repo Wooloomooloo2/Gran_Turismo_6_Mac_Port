@@ -1,0 +1,111 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] cellPad: PAD_NO_HOST=1 reads no host controller
+
+Upstream: not yet submitted; written to be upstreamed (generic, no title names)
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0040)
+
+What: with PAD_NO_HOST set (and not "0"), cellPad initialises no host pad
+backend and polls none (SDL2 GameController, XInput, the Windows keyboard
+fallback). Injected input (PAD_SCRIPT, PAD_FILE, PAD_STICK, ...) still
+works, and port 0 reads as when no controller is attached. A controller
+paired with the machine otherwise reaches the title even with its window in
+the background (the background-events hint and the HIDAPI drivers), so an
+unattended harness run could take presses from whoever was using it.
+Tests: libs/input/tests/test_pad_file_reports.c, new mode no-host (a host
+controller holding Circle is not read, an injected Cross is; fails on the
+old code).
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -693,6 +693,23 @@ static unsigned long long pad_now_ms(void)
+ #endif
+ }
+ 
++/* PAD_NO_HOST=1: read no host controller (and, on Windows, no keyboard). A pad
++ * paired with the machine reaches the title even when its window is in the
++ * background (see pad_init_backend), so an unattended run -- a test harness
++ * driving the title with PAD_SCRIPT/PAD_FILE -- could otherwise take presses
++ * from whoever is using that pad. Injected input still works; port 0 reads as a
++ * connected pad with nothing held, as when no controller is attached. */
++static int pad_host_disabled(void)
++{
++    static int off = -1;
++    if (off < 0) {
++        const char* e = getenv("PAD_NO_HOST");
++        off = (e && *e && *e != '0') ? 1 : 0;
++        if (off) { printf("[cellPad] PAD_NO_HOST: host controllers are not read\n"); fflush(stdout); }
++    }
++    return off;
++}
++
+ static void pad_poll_backend(void)
+ {
+     static unsigned long long s_last_ms = 0;
+@@ -705,14 +722,16 @@ static void pad_poll_backend(void)
+      * every port. cellPadGetData hands each one out exactly once. */
+     for (int _i = 0; _i < PAD_MAX_HOST_PORTS; _i++) s_data_fresh[_i] = 1;
+ 
++    if (!pad_host_disabled()) {
+ #if PAD_BACKEND_XINPUT
+-    pad_poll_xinput();
++        pad_poll_xinput();
+ #elif PAD_BACKEND_SDL2
+-    pad_poll_sdl2();
++        pad_poll_sdl2();
+ #endif
+ #ifdef _WIN32
+-    if (!s_host_state[0].connected) pad_poll_keyboard();
++        if (!s_host_state[0].connected) pad_poll_keyboard();
+ #endif
++    }
+     pad_track_assign();
+     pad_unlock();
+ }
+@@ -742,7 +761,7 @@ s32 cellPadInit(u32 max_connect)
+         pad_host_release(&s_host_state[i]);
+ 
+     pad_lock();
+-    pad_init_backend();
++    if (!pad_host_disabled()) pad_init_backend();
+     pad_unlock();
+ 
+     /* Do an initial poll to detect connected controllers */
+diff --git a/libs/input/tests/test_pad_file_reports.c b/libs/input/tests/test_pad_file_reports.c
+--- a/libs/input/tests/test_pad_file_reports.c
++++ b/libs/input/tests/test_pad_file_reports.c
+@@ -70,6 +70,7 @@ int main(int argc,char** argv)
+     if(strcmp(mode,"other-inputs"))setenv("PAD_FILE",path,1);
+     else{setenv("PAD_SCRIPT","0:0x0020",1);setenv("PAD_STICK","140,150,160,170",1);}
+     if(!strcmp(mode,"always"))setenv("PAD_ALWAYS_CHANGE","1",1);
++    if(!strcmp(mode,"no-host"))setenv("PAD_NO_HOST","1",1);
+     vm_base=mmap(NULL,0x10000,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0);
+     assert(vm_base!=MAP_FAILED);ppu_vm_size=0x10000;
+     publish(path,"");s_pad_initialized=1;s_max_connect=7;
+@@ -103,6 +104,14 @@ int main(int argc,char** argv)
+         held_reports(2,CELL_PAD_CTRL_CROSS|CELL_PAD_CTRL_CIRCLE,CELL_PAD_CTRL_CIRCLE);
+         device_buttons=0;next_report();assert(read_pad(0)>0 && !buttons());
+         attached=0;next_report();assert(read_pad(0)>0 && !buttons());
++    }else if(!strcmp(mode,"no-host")){
++        /* PAD_NO_HOST: a host controller holding Circle is not read; the
++         * injected Cross still is. */
++        s_sdl_controllers[0]=(SDL_GameController*)&device;attached=1;
++        device_buttons=CELL_PAD_CTRL_CIRCLE;
++        publish(path,"0x4000 2\n");assert(read_pad(0)==0);
++        held_reports(2,CELL_PAD_CTRL_CROSS,0);
++        next_report();assert(read_pad(0)>=0 && !buttons());
+     }else if(!strcmp(mode,"pressure-sensor")){
+         s_port_setting[0]=CELL_PAD_SETTING_PRESS_ON|CELL_PAD_SETTING_SENSOR_ON;
+         publish(path,"0x4000 2\n");assert(read_pad(0)==0);drains(100);
+diff --git a/tools/test_pad_file_reports.py b/tools/test_pad_file_reports.py
+--- a/tools/test_pad_file_reports.py
++++ b/tools/test_pad_file_reports.py
+@@ -15,7 +15,7 @@ b=subprocess.run(cmd,capture_output=True,text=True,timeout=30)
+ assert not b.returncode,b.stdout+b.stderr
+ env={k:v for k,v in os.environ.items() if not k.startswith(('PAD_','YDKJ_'))}
+ ok=True
+-for mode in ('drains','default','ports-clear','physical','pressure-sensor','always','other-inputs'):
++for mode in ('drains','default','ports-clear','physical','no-host','pressure-sensor','always','other-inputs'):
+     with tempfile.TemporaryDirectory(prefix='pad-reports-') as d:
+         argv=[str(o/'fixture'),mode,str(pathlib.Path(d)/'pad.txt')]
+         (o/(mode+'.argv.json')).write_text(json.dumps(argv)+'\n')

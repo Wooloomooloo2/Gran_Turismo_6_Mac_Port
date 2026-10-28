@@ -46,6 +46,8 @@ own presses: the port hands image N the script in GT6_PAD_SCRIPT_IMAGE<N> and cl
 PAD_SCRIPT when there is none. BUTTON is a CELL_PAD_CTRL_* name: cross, circle, triangle,
 square, start, select, up, down, left, right, l1, l2, l3, r1, r2, r3. report.json records
 them in "presses".
+Host controllers (a pad paired with the Mac) are ignored unless --host-pad is given (D65):
+cellPad is told PAD_NO_HOST=1, so only --press drives the game's pad.
 The run is recorded in <tree>/play/prepare.json as "booted": <run>. A play folder an earlier
 run used is not clean (the game's first run changes it): the boot still runs, but warns,
 names the earlier run in report.json ("play_reused") and summary.md, and points at
@@ -306,8 +308,13 @@ def images_env(tree, commit=None, patches=None):
     return ";".join(f"{sha}={gt6}|{elf}|{patches}" for sha, gt6, elf in current)
 
 
-def build_env(tree, run, headless, env, frame_every=60, frame_max=300, play=None):
+def build_env(tree, run, headless, env, frame_every=60, frame_max=300, play=None, host_pad=False):
     e = dict(os.environ)
+    # D65: an unattended run reads no host controller. A pad paired with this Mac (the
+    # owner's DualSense) reaches the game even with its window in the background, so a
+    # run's outcome could depend on what someone did with it; only --press drives the pad.
+    if not host_pad:
+        e["PAD_NO_HOST"] = "1"
     images = images_env(tree)
     if images:
         e["GT6_IMAGES"] = images
@@ -574,7 +581,7 @@ def _summary(rep, tree):
 
 
 def boot(gt6, tree, seconds=300, idle=60, headless=True, env=None, until="flip",
-         frame_every=60, frame_max=300, frame_bytes=FRAME_BYTES, play="play"):
+         frame_every=60, frame_max=300, frame_bytes=FRAME_BYTES, play="play", host_pad=False):
     if until not in UNTIL:
         raise ValueError(f"until must be one of {UNTIL}, not {until!r}")
     gt6 = Path(gt6).expanduser().resolve()
@@ -627,7 +634,7 @@ def boot(gt6, tree, seconds=300, idle=60, headless=True, env=None, until="flip",
     frames_dir = run / "frames"
     frames_dir.mkdir()
     child_env = build_env(tree, run, headless, env, frame_every, frame_max,
-                          play=None if play == "play" else play_dir)
+                          play=None if play == "play" else play_dir, host_pad=host_pad)
     dump_stopped = _dump_check(frames_dir, frame_bytes)
     if dump_stopped:
         _stop_dumps(frames_dir, dump_stopped)
@@ -779,6 +786,8 @@ def main(argv=None):
     ap.add_argument("--play", default="play", metavar="play-SUFFIX",
                     help="run on <tree>/play-SUFFIX (from prepare_play.py --name) instead of "
                          "<tree>/play (D49)")
+    ap.add_argument("--host-pad", action="store_true",
+                    help="let a controller paired with this Mac reach the game (default: ignored, D65)")
     ap.add_argument("--press", action="append", default=[], metavar="[IMAGE@]SECONDS:BUTTON",
                     help="press a pad button SECONDS after image IMAGE (default 1; 2 is the "
                          "first exit-spawned one) first polls the pad (repeatable), "
@@ -795,7 +804,7 @@ def main(argv=None):
     gt6 = Path(args.gt6) if args.gt6 else tree / GT6_REL
     rep = boot(gt6, tree, args.seconds, args.idle, headless=not args.window, until=args.until,
                frame_every=args.frame_every, frame_max=args.frame_max, env=env,
-               play=args.play)
+               play=args.play, host_pad=args.host_pad)
     run = Path(rep["run"])
     if presses:
         rep["presses"] = [{"image": i, "seconds": t, "button": b}

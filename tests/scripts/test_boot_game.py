@@ -159,6 +159,13 @@ def test_default_environment(tree, tmp_path, monkeypatch):
     assert "PS3RECOMP_METAL_HEADLESS" not in boot_game.build_env(tree, tmp_path, False, None)
 
 
+def test_host_pads_are_ignored_unless_asked(tree, tmp_path, monkeypatch):
+    """D65: an unattended run reads no controller paired with the Mac; --host-pad allows it."""
+    monkeypatch.delenv("PAD_NO_HOST", raising=False)
+    assert boot_game.build_env(tree, tmp_path, True, None)["PAD_NO_HOST"] == "1"
+    assert "PAD_NO_HOST" not in boot_game.build_env(tree, tmp_path, True, None, host_pad=True)
+
+
 def test_play_option_runs_on_a_sibling_folder(tree, tmp_path):
     """D49: play="play-x" checks and marks <tree>/play-x and points both file layers there."""
     (tree / "play-x").mkdir()

@@ -1,0 +1,158 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] SPU: an interpreted indirect callee stops at its own return point
+
+Upstream: not yet submitted; written to be upstreamed (generic, no title names)
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0039)
+
+What: a lifted indirect call (bisl) now goes through spu_indirect_call(ctx,
+return_pc), which makes return_pc the innermost return point (drain_ret_pc)
+while the callee is dispatched, then drains to it as before. A callee with
+no lifted code is run by the interpreter inside that dispatch, before
+spu_drain_call has set drain_ret_pc, and the interpreter stops at
+drain_ret_pc. It used to see the PREVIOUS call's return point, so it ran on
+past its own return through the caller's code until the next lifted entry;
+the caller's later returns then met drain loops waiting for other return
+points (each one a restart at depth 0), and a SPURS policy module's run could
+end in the middle of a job, leaving the job's pipeline record in flight for
+ever (a job queue's fence that never passes). Seen with a sort job whose
+comparator, reached only through a function pointer, has no lifted code.
+The lifter emits the new call; its standalone selftest and the interpreter
+diff test get the matching stub.
+Behaviour reference: SPU ISA (bisl: link, then branch; the callee returns
+through the link); no emulator code.
+Tests: runtime/spu/tests/test_spu_interpreter_handoff.c, new mode
+nested-return-indirect-call (an unlifted callee dispatched at once inside the
+call bracket, returning to an unlifted return point: the interpreter stops
+there and the host frame continues; with the old bracket the interpreter
+runs on into the caller's code and the check fails).
+diff --git a/runtime/spu/spu_drain.c b/runtime/spu/spu_drain.c
+--- a/runtime/spu/spu_drain.c
++++ b/runtime/spu/spu_drain.c
+@@ -628,3 +628,20 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
+     }
+ #undef SPU_DRAIN_POP_IRQ
+ }
++
++/* A lifted indirect call (bisl): dispatch the callee, then drain until it
++ * returns to return_pc. While the callee is dispatched, return_pc is already
++ * the innermost return point: a callee with no lifted code runs in the
++ * interpreter inside spu_indirect_branch, before spu_drain_call has set it,
++ * and stops there (spu_smc_microstep). Before, it stopped at the previous
++ * call's return point, so it ran on past its own return through the caller's
++ * code to the next lifted entry, and the caller's later returns met drain
++ * loops waiting for other return points. */
++void spu_indirect_call(spu_context* ctx, uint32_t return_pc)
++{
++    const uint32_t outer_ret_pc = ctx->drain_ret_pc;
++    ctx->drain_ret_pc = return_pc & SPU_LS_MASK;
++    spu_indirect_branch(ctx);
++    ctx->drain_ret_pc = outer_ret_pc;   /* spu_drain_call keeps the outer one for its exit */
++    spu_drain_call(ctx, return_pc);
++}
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -923,6 +923,10 @@ void spu_irqwait_diag(spu_context* ctx);
+ 
+ /* Drain a translated call up to its explicit architectural return PC. */
+ void spu_drain_call(spu_context* ctx, uint32_t return_pc);
++/* A lifted indirect call (bisl): spu_indirect_branch to ctx->pc with return_pc
++ * already the innermost return point (an interpreted callee stops there), then
++ * spu_drain_call(ctx, return_pc). spu_drain.c. */
++void spu_indirect_call(spu_context* ctx, uint32_t return_pc);
+ /* SPU_PCHIST=1: bucket SPU execution by the GPU module's own symbols.
+  *
+  * SPU_VRAMPC showed 3.7M VRAM writes from Host2Local_Body and ZERO from
+diff --git a/tools/spu_lifter.py b/tools/spu_lifter.py
+--- a/tools/spu_lifter.py
++++ b/tools/spu_lifter.py
+@@ -994,7 +994,7 @@ class SPULifter:
+             return (f"{{ uint32_t _tg = {g(tgt_reg)}._u32[0]; {g(link_rt)} = spu_link(0x{(addr + 4) & 0x3FFFC:X}); "
+                     f"int32_t _si = (int32_t)ctx->image_id; "
+                     f"{_ied}ctx->pc = _tg; ctx->host_depth++; "
+-                    f"spu_indirect_branch(ctx); spu_drain_call(ctx, 0x{addr + 4:X}); "
++                    f"spu_indirect_call(ctx, 0x{addr + 4:X}); "
+                     f"ctx->host_depth--; spu_img_restore(ctx, _si); }}")
+         # bisled: set link, branch to RA only if an external event is pending.
+         if mn in ("bisled",):
+diff --git a/tools/spu_lift_selftest.py b/tools/spu_lift_selftest.py
+--- a/tools/spu_lift_selftest.py
++++ b/tools/spu_lift_selftest.py
+@@ -115,6 +115,7 @@ void spu_drain_call(spu_context* c, uint32_t ret){
+         void (*f)(spu_context*) = g_spu_trampoline_fn; g_spu_trampoline_fn = 0; f(c);
+     }
+ }
++void spu_indirect_call(spu_context* c, uint32_t ret){ spu_indirect_branch(c); spu_drain_call(c, ret); }
+ '''
+ 
+ 
+diff --git a/runtime/spu/tests/spu_interp_diff_test.c b/runtime/spu/tests/spu_interp_diff_test.c
+--- a/runtime/spu/tests/spu_interp_diff_test.c
++++ b/runtime/spu/tests/spu_interp_diff_test.c
+@@ -360,6 +360,7 @@ void spu_indirect_branch(spu_context* c) { g_lc_called = 1; g_lc_target = c->pc
+ void spu_stop(spu_context* c) { (void)c; }
+ void spu_halt(spu_context* c) { (void)c; }
+ void spu_drain_call(spu_context* c, uint32_t r) { (void)c; (void)r; }
++void spu_indirect_call(spu_context* c, uint32_t r) { (void)c; (void)r; }
+ void spu_img_restore(spu_context* c, int32_t sv) { (void)c; (void)sv; }
+ #ifdef LIFTED_CASES_INC
+ #include LIFTED_CASES_INC       /* generated by gen_lifted_cases.py: g_lc_cases[], LC_NCASES */
+diff --git a/runtime/spu/tests/test_spu_interpreter_handoff.c b/runtime/spu/tests/test_spu_interpreter_handoff.c
+--- a/runtime/spu/tests/test_spu_interpreter_handoff.c
++++ b/runtime/spu/tests/test_spu_interpreter_handoff.c
+@@ -38,14 +38,21 @@ static void wrong_continuation(spu_context* c) {
+ static void tail_entry(spu_context* c) {
+     c->pc = 0x4000; g_spu_trampoline_fn = spu_indirect_branch;
+ }
+-static int queued_call;
++static int queued_call, indirect_call;
+ static void nested_entry(spu_context* c) {
+     c->gpr[0] = spu_link(0x204);
+     c->host_depth++;
+     c->pc = 0x4000;
+-    if (queued_call) g_spu_trampoline_fn = spu_indirect_branch;
+-    else spu_indirect_branch(c);
+-    spu_drain_call(c, 0x204);
++    if (indirect_call) {
++        /* The lifted bisl bracket: the callee is dispatched at once, and an
++         * unlifted one is interpreted inside that dispatch, before any drain
++         * of this call has run. It must still stop at 0x204. */
++        spu_indirect_call(c, 0x204);
++    } else {
++        if (queued_call) g_spu_trampoline_fn = spu_indirect_branch;
++        else spu_indirect_branch(c);
++        spu_drain_call(c, 0x204);
++    }
+     c->host_depth--;
+     c->gpr[20]._u32[0]++;
+     finish(c);
+@@ -59,7 +66,7 @@ int main(int argc, char** argv) {
+     ctx.status = SPU_STATUS_RUNNING;
+     spu_begin_image(77);
+     spu_register_function(0x200, helper);
+-    if (strcmp(mode, "nested-return-unlifted"))
++    if (strcmp(mode, "nested-return-unlifted") && strcmp(mode, "nested-return-indirect-call"))
+         spu_register_function(0x204, wrong_continuation);
+     spu_register_function(0x240, finish);
+     if (!strcmp(mode, "top-zero")) spu_register_function(0, finish);
+@@ -76,6 +83,7 @@ int main(int argc, char** argv) {
+         word(0x4004, 0x30004800); /* bra 0x240 */
+     } else if (!strncmp(mode, "nested-return", 13)) {
+         entry = nested_entry; queued_call = 1;
++        if (!strcmp(mode, "nested-return-indirect-call")) { queued_call = 0; indirect_call = 1; }
+         word(0x204, 0x1C004A95); /* ai $21,$21,1: must NOT be interpreted */
+         word(0x208, 0x30004800); /* bra 0x240 */
+         word(0x4004, 0x35000000); /* bi $0 -> 0x204 */
+diff --git a/tools/test_spu_interpreter_handoff.py b/tools/test_spu_interpreter_handoff.py
+--- a/tools/test_spu_interpreter_handoff.py
++++ b/tools/test_spu_interpreter_handoff.py
+@@ -23,7 +23,7 @@ with tempfile.TemporaryDirectory(prefix='spu-interp-handoff-') as tmp:
+                     str(root/'runtime/platform/win32_compat.c'), '-pthread', '-lm',
+                     '-o', str(binary)], check=True)
+     failed = []
+-    for mode in ['top', 'top-zero', 'nested-return', 'nested-return-unlifted', 'nested-calls', 'stop-zero',
++    for mode in ['top', 'top-zero', 'nested-return', 'nested-return-unlifted', 'nested-return-indirect-call', 'nested-calls', 'stop-zero',
+                  'nested-stop', 'stop-code', 'halt', 'smc', 'smc-ldst', 'smc-ldst-diag', 'pure-interpreter', 'stepcap', 'negative-stepcap']:
+         env = {k: v for k, v in os.environ.items()
+                if not k.startswith(('SPU_', 'SPURS_', 'YDKJ_', 'LBP_', 'GH3_'))}

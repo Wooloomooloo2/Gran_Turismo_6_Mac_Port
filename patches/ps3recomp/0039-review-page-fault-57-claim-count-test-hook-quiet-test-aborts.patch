@@ -1,0 +1,373 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] Page-fault 57 re-checks the slot's owner before each CAS, its test hook is test-only; deliberate test aborts leave no crash report
+
+Upstream: not yet submitted; written to be upstreamed (generic, no title names)
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0038)
+
+What (1), lv2 57: a fault slot's state word now carries a claim count above
+its state byte; each claim moves it on. 57 re-reads the slot's thread id
+after reading the state word and makes its CAS against that word, so a slot
+freed and claimed again by another thread between 57's read and its CAS
+(a duplicate 57 for the same thread, then a new fault) is no longer answered
+for the wrong thread. Before, the CAS compared the state alone (WAITING
+again) and 57 answered the new thread's fault before its pager mapped the
+page.
+What (2): the 57 test hook (ps3_pf_test_57_hook) exists only in builds with
+PS3_PF_TEST (the unit test); a title's build has no hook.
+What (3), tests: the children that abort on purpose (the page-fault test's
+destroyed-queue cases, the SPU registry allocation failures, the
+SPU_MISS_FATAL dispatch miss) end through a SIGABRT handler with exit status
+128 + SIGABRT instead of dying by the signal, so macOS writes no crash
+report for them; the runners check that status.
+Behaviour reference: lv2 page-fault notification as RPCS3 models it (read
+only, no code from it).
+Tests: tests/test_mmapper_page_fault.c (new forced case: the slot is freed
+and reclaimed by another thread between 57's read and its CAS; 57 answers
+EINVAL and the other thread still waits for its own 57; two checks fail on
+the old code).
+diff --git a/runtime/syscalls/sys_mmapper_pf.c b/runtime/syscalls/sys_mmapper_pf.c
+--- a/runtime/syscalls/sys_mmapper_pf.c
++++ b/runtime/syscalls/sys_mmapper_pf.c
+@@ -80,7 +80,10 @@ typedef struct pf_area {
+ /* A fault slot's state. One word, changed by compare-and-swap, so a 57 that
+  * lands while a host thread detaches does not leave the slot taken
+  * (batch 7 review I-1; batch 8 review I-1). A free slot (tid 0) may hold any state; the thread
+- * that claims it sets WAITING. */
++ * that claims it sets WAITING. The low byte is the state; the bits above it
++ * count claims (PF_GEN), so a CAS made against a word read before the slot was
++ * freed and claimed again fails even when the new claim is WAITING too
++ * (batch 9 review m3). */
+ enum {
+     PF_WAITING   = 0,   /* the thread waits for 57 */
+     PF_RECOVERED = 1,   /* 57 answered; the waiting thread frees the slot */
+@@ -88,6 +91,8 @@ enum {
+     PF_ORPHANED  = 3,   /* its queue was destroyed with the event in it */
+     PF_FREEING   = 4,   /* being freed by a 57 or a destroy */
+ };
++#define PF_STATE(w) ((w) & 0xFF)
++#define PF_GEN      0x100
+ typedef struct pf_fault {
+     volatile uint64_t tid;        /* 0 = free slot */
+     volatile uint32_t addr;
+@@ -268,11 +273,25 @@ static void pf_nap_ms(void)
+ #endif
+ }
+ 
++#ifdef PS3_PF_TEST
+ void (*ps3_pf_test_57_hook)(int where);
++#define PF_TEST_HOOK(w) do { if (ps3_pf_test_57_hook) ps3_pf_test_57_hook(w); } while (0)
++#else
++#define PF_TEST_HOOK(w) do { } while (0)
++#endif
++
++/* Move the slot from the word `seen` (as read) to state `to`, keeping its
++ * claim count. Fails if anything changed the word since it was read. */
++static int pf_cas_word(pf_fault* f, int seen, int to)
++{
++    return __atomic_compare_exchange_n(&f->state, &seen, (seen & ~0xFF) | to, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
++}
+ 
++/* Move the slot from state `from` to `to` within its current claim. */
+ static int pf_cas_state(pf_fault* f, int from, int to)
+ {
+-    return __atomic_compare_exchange_n(&f->state, &from, to, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
++    int w = __atomic_load_n(&f->state, __ATOMIC_ACQUIRE);
++    return PF_STATE(w) == from && pf_cas_word(f, w, to);
+ }
+ 
+ static void pf_free(pf_fault* f) { __atomic_store_n(&f->tid, 0, __ATOMIC_RELEASE); }
+@@ -340,7 +359,11 @@ static LONG WINAPI pf_veh(EXCEPTION_POINTERS* ep)
+     }
+     f->addr = addr;
+     __atomic_store_n(&f->qid, 0, __ATOMIC_RELEASE);
+-    __atomic_store_n(&f->state, PF_WAITING, __ATOMIC_RELEASE);
++    /* A new claim: the next claim count, WAITING. Only the claimant writes a
++     * slot whose tid it has just taken; a scanner holding a word from before
++     * the free cannot CAS it any more. */
++    __atomic_store_n(&f->state, (int)((__atomic_load_n(&f->state, __ATOMIC_RELAXED) & ~0xFF) + PF_GEN) | PF_WAITING,
++                     __ATOMIC_RELEASE);
+     /* A full queue refuses the event: wait and send again, as RPCS3 models
+      * lv2 (every 1 ms, RPCS3's interval). Never map zeros. A queue that is gone can never be
+      * answered: stop the process, naming the page, rather than hand out data
+@@ -368,7 +391,7 @@ static LONG WINAPI pf_veh(EXCEPTION_POINTERS* ep)
+     const ULONGLONG wait_t0 = GetTickCount64();
+     ULONGLONG wait_said = wait_t0;
+     for (;;) {
+-        int st = __atomic_load_n(&f->state, __ATOMIC_ACQUIRE);
++        int st = PF_STATE(__atomic_load_n(&f->state, __ATOMIC_ACQUIRE));
+         if (st == PF_RECOVERED) break;
+         /* A host thread also goes on once the page is mapped, whoever asked.
+          * Its event is still queued and the pager will answer it with 57, which
+@@ -458,12 +481,19 @@ int64_t sys_ppu_thread_recover_page_fault(ppu_context* ctx)
+      * event was sent first, and the pager answers events in order. */
+     if (!tid) return (int64_t)(int32_t)CELL_EINVAL;
+     for (int pass = 0; pass < 2; pass++) {
+-        if (pass && ps3_pf_test_57_hook) ps3_pf_test_57_hook(0);
++        if (pass) PF_TEST_HOOK(0);
+         for (int i = 0; i < PF_FAULT_MAX; i++) {
+             pf_fault* f = &s_fault[i];
+             if ((__atomic_load_n(&f->tid, __ATOMIC_ACQUIRE) & 0xFFFFFFFFull) != tid) continue;
++            /* Each CAS below is made against a word read AFTER the tid was seen
++             * to match again (batch 9 review m3). A claimant stores its tid
++             * before its WAITING word (release), so a word read here that is a
++             * newer claim's shows that claim's tid on the re-read; and a free and
++             * re-claim after the read moves the claim count, so the CAS fails. */
+             if (!pass) {   /* detached: nobody waits on it, free the slot */
+-                if (pf_cas_state(f, PF_DETACHED, PF_FREEING)) { pf_free(f); return CELL_OK; }
++                int w = __atomic_load_n(&f->state, __ATOMIC_ACQUIRE);
++                if ((__atomic_load_n(&f->tid, __ATOMIC_ACQUIRE) & 0xFFFFFFFFull) != tid) continue;
++                if (PF_STATE(w) == PF_DETACHED && pf_cas_word(f, w, PF_FREEING)) { pf_free(f); return CELL_OK; }
+                 continue;
+             }
+             /* Pass 1 takes a waiting slot, or a detached one: its host thread
+@@ -472,12 +502,13 @@ int64_t sys_ppu_thread_recover_page_fault(ppu_context* ctx)
+              * moved (WAITING to DETACHED or ORPHANED): look again. Bounded:
+              * a slot's state only moves forward until it is freed. */
+             for (;;) {
+-                int st = __atomic_load_n(&f->state, __ATOMIC_ACQUIRE);
+-                if (ps3_pf_test_57_hook) ps3_pf_test_57_hook(1);
++                int w = __atomic_load_n(&f->state, __ATOMIC_ACQUIRE), st = PF_STATE(w);
++                if ((__atomic_load_n(&f->tid, __ATOMIC_ACQUIRE) & 0xFFFFFFFFull) != tid) break;
++                PF_TEST_HOOK(1);
+                 if (st == PF_WAITING) {
+-                    if (pf_cas_state(f, PF_WAITING, PF_RECOVERED)) return CELL_OK;
++                    if (pf_cas_word(f, w, PF_RECOVERED)) return CELL_OK;
+                 } else if (st == PF_DETACHED) {
+-                    if (pf_cas_state(f, PF_DETACHED, PF_FREEING)) { pf_free(f); return CELL_OK; }
++                    if (pf_cas_word(f, w, PF_FREEING)) { pf_free(f); return CELL_OK; }
+                 } else {
+                     break;     /* recovered, orphaned or being freed: not ours to answer */
+                 }
+diff --git a/runtime/syscalls/sys_mmapper_pf.h b/runtime/syscalls/sys_mmapper_pf.h
+--- a/runtime/syscalls/sys_mmapper_pf.h
++++ b/runtime/syscalls/sys_mmapper_pf.h
+@@ -42,10 +42,13 @@ int ps3_pf_page_unmapped(uint32_t addr);
+ /* sys_event_queue_destroy tells the page-fault areas their queue is gone. */
+ void ps3_pf_queue_destroyed(uint32_t queue_id);
+ 
+-/* Tests only (NULL otherwise): lv2 57 calls it between its two scans (0) and
+- * in its second scan between reading a slot's state and its CAS (1), so a
+- * test can force a host thread's detach into exactly those windows. */
++#ifdef PS3_PF_TEST
++/* Test builds only (built with -DPS3_PF_TEST; not in a title's build): lv2 57
++ * calls it between its two scans (0) and in its second scan between reading a
++ * slot's state and its CAS (1), so a test can force a host thread's detach
++ * into exactly those windows. */
+ extern void (*ps3_pf_test_57_hook)(int where);
++#endif
+ 
+ void sys_mmapper_pf_init(lv2_syscall_table* tbl);
+ 
+diff --git a/tests/test_mmapper_page_fault.c b/tests/test_mmapper_page_fault.c
+--- a/tests/test_mmapper_page_fault.c
++++ b/tests/test_mmapper_page_fault.c
+@@ -52,6 +52,11 @@ PVOID AddVectoredExceptionHandler(ULONG first, PVECTORED_EXCEPTION_HANDLER h)
+     return (PVOID)h;
+ }
+ 
++/* An abort this test expects ends the process with exit status 128 + SIGABRT
++ * from a handler instead of dying by the signal, so macOS's crash reporter
++ * writes no report for it (it reports every death by SIGABRT/SIGSEGV). */
++static void quiet_abort(int sig) { _exit(128 + sig); }
++
+ static int fails;
+ #define CHECK(c, ...) do { const int ok_ = (c); printf(ok_ ? "[PASS] " : "[FAIL] "); printf(__VA_ARGS__); \
+                            printf("\n"); if (!ok_) fails++; } while (0)
+@@ -208,6 +213,39 @@ static void* ppu_round(void* arg)
+     return NULL;
+ }
+ 
++/* Batch 9 review m3, forced: PPU threads T (tid 21) and U (tid 22) fault on
++ * their own unmapped pages. The hook runs inside 57(T) between its state read
++ * and its CAS: it maps T's page, answers T with a second 57, waits for T to
++ * free its slot, then starts U and waits for U's event (U has claimed a slot,
++ * the one T freed: the lowest free one). */
++static uint32_t g_aba_page_t, g_aba_page_u, g_aba_tid;
++static volatile uint32_t g_aba_seen_t = 0xFFFFFFFFu, g_aba_seen_u = 0xFFFFFFFFu;
++static int g_aba_fired;
++static pthread_t g_aba_t, g_aba_u;
++static void* aba_ppu(void* arg)
++{
++    ppu_context self; memset(&self, 0, sizeof self);
++    self.thread_id = (uint32_t)(uintptr_t)arg;
++    g_active_ctx = &self;
++    __asm__ volatile("" ::: "memory");
++    uint32_t page = self.thread_id == 21 ? g_aba_page_t : g_aba_page_u;
++    uint32_t v = *(volatile uint32_t*)vm_to_host(page + 0x10);
++    if (self.thread_id == 21) g_aba_seen_t = v; else g_aba_seen_u = v;
++    return NULL;
++}
++static void hook_aba(int where)
++{
++    if (where != 1 || g_aba_fired) return;
++    g_aba_fired = 1;
++    ps3_mm_map(g_aba_page_t, ps3_mm_object_create(0x10000));
++    *(volatile uint32_t*)vm_to_host(g_aba_page_t + 0x10) = 0x7A7Au;
++    if (recover(21) != CELL_OK) return;          /* the duplicate 57 for T */
++    pthread_join(g_aba_t, NULL);                 /* T read its page and freed its slot */
++    pthread_create(&g_aba_u, NULL, aba_ppu, (void*)(uintptr_t)22);
++    uint64_t e[4];
++    if (receive_into(g_q4, e) == CELL_OK && (e[2] & 0xFFFFFFFFu) == 22) g_aba_fired = 2;
++}
++
+ /* Batch 8 review I-1, forced: the hook runs inside 57 at the window under
+  * test; it maps the page and waits until the host thread has detached (it
+  * returns from its fault only after the WAITING to DETACHED CAS). */
+@@ -350,6 +388,7 @@ int main(void)
+         fflush(stdout);
+         pid_t pid = fork();
+         if (pid == 0) {
++            signal(SIGABRT, quiet_abort);
+             ppu_context self; memset(&self, 0, sizeof self);
+             self.thread_id = 12;
+             g_active_ctx = &self;
+@@ -360,7 +399,7 @@ int main(void)
+         }
+         int st = 0;
+         waitpid(pid, &st, 0);
+-        CHECK(WIFSIGNALED(st) && WTERMSIG(st) == SIGABRT, "a fault after that stops the process (status 0x%X), new queue %u%s", st, qn,
++        CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 128 + SIGABRT, "a fault after that stops the process (status 0x%X), new queue %u%s", st, qn,
+               qn == g_q3 ? " reused the id" : "");
+         uint64_t stray[4];
+         memset(&c, 0, sizeof c);
+@@ -420,11 +459,38 @@ int main(void)
+         }
+     }
+ 
++    {   /* Batch 9 review m3: between 57(T)'s state read and its CAS, a second 57
++         * for T answers the slot, T frees it, and another thread U claims the
++         * same slot (WAITING again). The first 57 must not answer U's fault: it
++         * finds no slot of T's and is EINVAL, and U still waits for its own 57. */
++        g_aba_page_t = g_area4 + 0x780000u;
++        g_aba_page_u = g_area4 + 0x790000u;
++        g_aba_tid = 21; g_aba_fired = 0;
++        pthread_create(&g_aba_t, NULL, aba_ppu, (void*)(uintptr_t)21);
++        uint64_t e[4];
++        if (receive_into(g_q4, e) != CELL_OK || (e[2] & 0xFFFFFFFFu) != 21) {
++            CHECK(0, "m3: T's event received");
++        } else {
++            ps3_pf_test_57_hook = hook_aba;
++            int64_t rc = recover(21);
++            ps3_pf_test_57_hook = NULL;
++            CHECK(g_aba_fired == 2, "m3: the hook ran the second 57 and U claimed a slot (%d)", g_aba_fired);
++            CHECK((uint32_t)rc == CELL_EINVAL, "m3: the first 57 for T does not answer U's reused slot (rc=0x%llX)", (unsigned long long)rc);
++            CHECK(g_aba_seen_u == 0xFFFFFFFFu, "m3: U is still waiting (seen 0x%X)", g_aba_seen_u);
++            ps3_mm_map(g_aba_page_u, ps3_mm_object_create(0x10000));
++            *(volatile uint32_t*)vm_to_host(g_aba_page_u + 0x10) = 0xAB0Au;
++            CHECK(recover(22) == CELL_OK, "m3: U's own 57 answers it");
++            pthread_join(g_aba_u, NULL);
++            CHECK(g_aba_seen_u == 0xAB0Au, "m3: and U reads the pager's data (0x%X)", g_aba_seen_u);
++        }
++    }
++
+     {   /* M-2: a destroy with a PPU thread's event still queued stops the process;
+          * afterwards 327 can arm the area again. */
+         fflush(stdout);
+         pid_t pid = fork();
+         if (pid == 0) {
++            signal(SIGABRT, quiet_abort);
+             g_round_addr = g_area4 + 0x800010u;
+             pthread_t t;
+             pthread_create(&t, NULL, ppu_round, NULL);
+@@ -437,7 +503,7 @@ int main(void)
+         }
+         int st = 0;
+         waitpid(pid, &st, 0);
+-        CHECK(WIFSIGNALED(st) && WTERMSIG(st) == SIGABRT, "M-2: the waiting thread takes the abort path (status 0x%X)", st);
++        CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 128 + SIGABRT, "M-2: the waiting thread takes the abort path (status 0x%X)", st);
+         ppu_context c; memset(&c, 0, sizeof c);
+         c.gpr[3] = g_q4; c.gpr[4] = 0;
+         CHECK(sys_event_queue_destroy(&c) == CELL_OK, "M-2: the area's queue is destroyed");
+diff --git a/tools/test_mmapper_page_fault.py b/tools/test_mmapper_page_fault.py
+--- a/tools/test_mmapper_page_fault.py
++++ b/tools/test_mmapper_page_fault.py
+@@ -25,7 +25,7 @@ def main():
+     with tempfile.TemporaryDirectory(prefix='mmapper-page-fault-') as tmp:
+         exe = Path(tmp) / 'test_mmapper_page_fault'
+         link = ['-Wl,-undefined,dynamic_lookup'] if platform.system() == 'Darwin' else ['-Wl,--unresolved-symbols=ignore-all']
+-        r = subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-w', '-pthread',
++        r = subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-w', '-pthread', '-DPS3_PF_TEST',
+                             '-I' + str(ROOT / 'include'), '-I' + str(ROOT / 'runtime'),
+                             str(ROOT / 'tests/test_mmapper_page_fault.c'),
+                             *(str(ROOT / 'runtime/syscalls' / f) for f in ('sys_event.c', 'sys_memory.c', 'sys_mmapper_pf.c')),
+diff --git a/runtime/spu/tests/test_spu_registry_allocation.c b/runtime/spu/tests/test_spu_registry_allocation.c
+--- a/runtime/spu/tests/test_spu_registry_allocation.c
++++ b/runtime/spu/tests/test_spu_registry_allocation.c
+@@ -1,4 +1,6 @@
++#include <signal.h>
+ #include <stdlib.h>
++#include <unistd.h>
+ #include <string.h>
+ #include <stdint.h>
+ static int fail_allocation;
+@@ -9,8 +11,14 @@ static void* registry_malloc(size_t n) { return fail_allocation ? NULL : malloc(
+ #undef malloc
+ uint8_t* vm_base;
+ uint32_t ppu_vm_size;
++/* An abort this test expects ends the process with exit status 128 + SIGABRT
++ * from a handler instead of dying by the signal, so macOS's crash reporter
++ * writes no report for it (it reports every death by SIGABRT/SIGSEGV). */
++static void quiet_abort(int sig) { _exit(128 + sig); }
++
+ int main(int argc, char** argv)
+ {
++    signal(SIGABRT, quiet_abort);
+     spu_context* ctx = calloc(1, sizeof(*ctx));
+     if (!ctx || argc != 2) return 2;
+     fail_allocation = 1;
+diff --git a/tools/test_spu_context_registries.py b/tools/test_spu_context_registries.py
+--- a/tools/test_spu_context_registries.py
++++ b/tools/test_spu_context_registries.py
+@@ -32,7 +32,7 @@ with tempfile.TemporaryDirectory(prefix='spu-context-registry-') as tmp:
+                                      ('coh', 'cannot register reservation holder')]:
+                 result = subprocess.run([str(binary), mode], timeout=10,
+                                         capture_output=True, text=True)
+-                assert result.returncode == -signal.SIGABRT, result
++                assert result.returncode == 128 + signal.SIGABRT, result   # quiet_abort: no crash report
+                 assert diagnostic in result.stderr, result.stderr
+                 print(name + '/' + mode + ': PASS (visible allocation failure)')
+             continue
+diff --git a/tests/test_spu_dispatch_miss.c b/tests/test_spu_dispatch_miss.c
+--- a/tests/test_spu_dispatch_miss.c
++++ b/tests/test_spu_dispatch_miss.c
+@@ -4,10 +4,12 @@
+  * async paths, and with SPU_MISS_FATAL=1 the process aborts at the first miss.
+  * The Python driver (tools/test_spu_dispatch_miss.py) checks stderr and the
+  * exit status; this program only drives the dispatches. */
++#include <signal.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <unistd.h>
+ #include "spu_workload.h"
+ 
+ uint8_t* vm_base;
+@@ -31,8 +33,14 @@ void ydkj_wake_all_event_flags(void) { abort(); }
+ uint64_t spurs_pm_build_context(uint8_t* ls, uint32_t a, uint32_t b, uint32_t c, uint32_t d)
+ { (void)ls; (void)a; (void)b; (void)c; (void)d; abort(); }
+ 
++/* An abort this test expects ends the process with exit status 128 + SIGABRT
++ * from a handler instead of dying by the signal, so macOS's crash reporter
++ * writes no report for it (it reports every death by SIGABRT/SIGSEGV). */
++static void quiet_abort(int sig) { _exit(128 + sig); }
++
+ int main(void)
+ {
++    signal(SIGABRT, quiet_abort);
+     static uint8_t a[256], b[256];
+     memset(a, 0x11, sizeof a);   /* two distinct, never-registered programs */
+     memset(b, 0x22, sizeof b);
+diff --git a/tools/test_spu_dispatch_miss.py b/tools/test_spu_dispatch_miss.py
+--- a/tools/test_spu_dispatch_miss.py
++++ b/tools/test_spu_dispatch_miss.py
+@@ -38,7 +38,7 @@ with tempfile.TemporaryDirectory(prefix='spu-dispatch-miss-') as tmp:
+     assert all('DROPPED' in l for l in errors), errors
+ 
+     p=subprocess.run([str(out)],env={**env,'SPU_MISS_FATAL':'1'},capture_output=True,text=True,timeout=15)
+-    assert p.returncode==-signal.SIGABRT, (p.returncode, p.stderr)
++    assert p.returncode==128+signal.SIGABRT, (p.returncode, p.stderr)   # quiet_abort: no crash report
+     assert 'dispatch-miss: done' not in p.stderr, p.stderr
+     errors=[l for l in p.stderr.splitlines() if '[spu_workload] ERROR:' in l]
+     assert len(errors)==1 and 'sync dispatch' in errors[0], p.stderr
