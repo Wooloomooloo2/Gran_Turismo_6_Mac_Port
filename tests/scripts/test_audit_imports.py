@@ -185,11 +185,25 @@ def test_cli_writes_json(tmp_path):
 
 @pytest.mark.skipif(not os.environ.get("GT6_TREE"), reason="GT6_TREE not set (needs the built v1.22 tree)")
 def test_real_tree_counts_match_latest_run():
-    """On the real tree, every NID the newest run logged unresolved is counted unhandled... or was
-    handled since (then the patches changed after that run)."""
+    """On the real tree, every EMAIN NID a run logged unresolved (the newest run, then every older
+    one) is counted unhandled, or listed in unresolved_but_handled for that run (handled since)."""
     tree = Path(os.environ["GT6_TREE"])
     imports = json.loads((tree / "recomp" / "loader" / "EMAIN.SELF.imports.json").read_text())
     result = audit_imports.audit(imports, audit_imports.registrations(SUB),
                                  runs=audit_imports.load_runs(tree / "runs"))
-    assert result["summary"]["imports"] == len({(i["library"], int(i["nid"], 16)) for i in imports})
-    assert result["summary"]["handled"] + result["summary"]["unhandled"] == result["summary"]["imports"]
+    runs = audit_imports.load_runs(tree / "runs")
+    if not runs:
+        pytest.skip("no runs in the tree")
+    rows = {int(r["nid"], 16): r for r in result["rows"]}
+    stale = {int(s["nid"], 16): s["runs"] for s in result["unresolved_but_handled"]}
+    checked = 0
+    # The newest run first, then every older one (the newest may log none once all are handled).
+    for run in sorted(runs, reverse=True):
+        logged = {int(k.rsplit(":", 1)[1], 16) for k in runs[run] if k.startswith("hle:unresolved:0x")}
+        for nid in sorted(logged & rows.keys()):   # EBOOT's own imports are logged too; only EMAIN's are audited
+            row = rows[nid]
+            assert run in row["unresolved_in"], f"0x{nid:08X}: run {run} not recorded as unresolved"
+            assert (not row["handled"]) or run in stale.get(nid, ()), \
+                f"0x{nid:08X} logged unresolved in {run} but counted handled and not in unresolved_but_handled"
+            checked += 1
+    assert checked or not any(k.startswith("hle:unresolved:") for keys in runs.values() for k in keys)
