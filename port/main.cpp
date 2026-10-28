@@ -308,6 +308,7 @@ static DWORD WINAPI frame_clock(LPVOID)
 static char s_hdd0_mapping[1024];
 static char s_hdd1_root[1100];
 static char s_hdd1_mapping[1110];
+static char s_gamedata_root[1100];
 
 static bool configure_vfs_roots(void)
 {
@@ -360,6 +361,20 @@ static bool configure_vfs_roots(void)
     snprintf(s_hdd1_mapping, sizeof s_hdd1_mapping, "%s/", hdd1);
     cellfs_add_path_mapping("/dev_hdd1/", s_hdd1_mapping);
     printf("[boot] /dev_hdd1: %s\n", hdd1);
+
+    /* Saves and trophies (D50): cellSaveData keeps saves in $PS3_GAMEDATA_ROOT/dev_hdd0/home/
+     * 00000001/savedata and sceNpTrophy its state in $PS3_GAMEDATA_ROOT/trophies; unset, both
+     * are relative to the current folder (the repository, when run from there). The root is
+     * the play folder, the one holding dev_hdd0, so saves land where lv2 keeps them
+     * (/dev_hdd0/home/<user>/savedata) and prepare_play.py --force discards them with the
+     * rest of the folder. An explicit $PS3_GAMEDATA_ROOT overrides. */
+    const char* gd = getenv("PS3_GAMEDATA_ROOT");
+    if (!gd || !*gd) {
+        snprintf(s_gamedata_root, sizeof s_gamedata_root, "%s/..", hdd0);
+        setenv("PS3_GAMEDATA_ROOT", s_gamedata_root, 1);
+        gd = getenv("PS3_GAMEDATA_ROOT");
+    }
+    printf("[boot] saves and trophies: %s\n", gd);
     return true;
 }
 

@@ -228,7 +228,7 @@ def test_real_port_builds(tmp_path):
     # With the play folder prepared, the guest command line is the launch contract (D31).
     if (tree / "play" / "prepare.json").is_file():
         env = {k: v for k, v in os.environ.items()
-               if k not in ("PS3_HDD0_ROOT", "PS3_BOOT_PATH", "PS3_ARGV")}
+               if k not in ("PS3_HDD0_ROOT", "PS3_BOOT_PATH", "PS3_ARGV", "PS3_GAMEDATA_ROOT")}
         p = subprocess.run([str(exe), str(tmp_path / "no-such.elf")], capture_output=True,
                            text=True, timeout=60, env=env)
         out = p.stdout + p.stderr
@@ -238,6 +238,8 @@ def test_real_port_builds(tmp_path):
         # /dev_hdd1 is the play folder's dev_hdd1, beside dev_hdd0, never the disc layer (D39).
         assert f"[boot] /dev_hdd1: {tree}/play/dev_hdd0/../dev_hdd1" in out, out[-2000:]
         assert (tree / "play" / "dev_hdd1").is_dir()
+        # Saves and trophies go into the play folder, not the current folder (D50).
+        assert f"[boot] saves and trophies: {tree}/play/dev_hdd0/.." in out, out[-2000:]
 
 
 def test_port_runs_on_the_play_folder():

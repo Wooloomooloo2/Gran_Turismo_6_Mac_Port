@@ -190,7 +190,7 @@ NO_BUILD_RE = re.compile(r"\[image\] no-matching-build sha256=([0-9a-f]{64})")
 STALE_RE = re.compile(r"\[image\] stale-build (\S+)")
 
 
-from prepare_play import disc_layer_writable   # noqa: E402  (D46)
+from prepare_play import disc_layer_writable, play_folder   # noqa: E402  (D46, D49)
 
 
 def image_info(gt6):
@@ -256,11 +256,19 @@ def images_env(tree, commit=None, patches=None):
     return ";".join(f"{sha}={gt6}|{elf}|{patches}" for sha, gt6, elf in current)
 
 
-def build_env(tree, run, headless, env, frame_every=60, frame_max=300):
+def build_env(tree, run, headless, env, frame_every=60, frame_max=300, play=None):
     e = dict(os.environ)
     images = images_env(tree)
     if images:
         e["GT6_IMAGES"] = images
+    # D50: saves (<root>/dev_hdd0/home/00000001/savedata) and trophies (<root>/trophies) go
+    # into the play folder, never the folder the harness was started from.
+    e["PS3_GAMEDATA_ROOT"] = str(Path(play) if play is not None else Path(tree) / "play")
+    if play is not None:
+        # D49: run on <tree>/play-<suffix>; both file layers take their roots from here, so
+        # the folder whose prepare.json was checked is the one the game writes to.
+        e["PS3_HDD0_ROOT"] = str(Path(play) / "dev_hdd0")
+        e["PS3_HDD1_ROOT"] = str(Path(play) / "dev_hdd1")
     e["PS3_MILESTONE_OUT"] = str(run / "milestones.log")
     # The numbered series (patch 0010) replaces milestone 2's single overwritten dump.
     e.pop("PS3RECOMP_METAL_FRAME_DUMP", None)
@@ -516,7 +524,7 @@ def _summary(rep, tree):
 
 
 def boot(gt6, tree, seconds=300, idle=60, headless=True, env=None, until="flip",
-         frame_every=60, frame_max=300, frame_bytes=FRAME_BYTES):
+         frame_every=60, frame_max=300, frame_bytes=FRAME_BYTES, play="play"):
     if until not in UNTIL:
         raise ValueError(f"until must be one of {UNTIL}, not {until!r}")
     gt6 = Path(gt6).expanduser().resolve()
@@ -524,8 +532,9 @@ def boot(gt6, tree, seconds=300, idle=60, headless=True, env=None, until="flip",
     if in_git_work_tree(tree):
         raise SystemExit(f"error: {tree} is inside a git work tree; run logs and frame dumps "
                          f"are derived from the game and must live outside it")
-    if not (tree / "play" / "prepare.json").is_file():
-        raise SystemExit(f"error: {tree}/play/prepare.json is missing: "
+    play_dir = play_folder(tree, play)
+    if not (play_dir / "prepare.json").is_file():
+        raise SystemExit(f"error: {play_dir}/prepare.json is missing: "
                          f"run scripts/prepare_play.py first")
     info = image_info(gt6)
     _, problems = check_images(tree)
@@ -543,16 +552,18 @@ def boot(gt6, tree, seconds=300, idle=60, headless=True, env=None, until="flip",
         raise SystemExit(f"error: ELF not found: {elf}")
     if not gt6.is_file():
         raise SystemExit(f"error: gt6 binary not found: {gt6}")
-    reused = _mark_booted(tree / "play" / "prepare.json", None)
+    reused = _mark_booted(play_dir / "prepare.json", None)
     run = _new_run(tree / "runs")
-    _mark_booted(tree / "play" / "prepare.json", run.name)
+    _mark_booted(play_dir / "prepare.json", run.name)
     if reused:
-        print(f"warning: {tree}/play was already used by run {reused}; the game's first run "
-              f"changes it. For a clean boot run: scripts/prepare_play.py \"{tree}\" --force",
+        print(f"warning: {play_dir} was already used by run {reused}; the game's first run "
+              f"changes it. For a clean boot run: scripts/prepare_play.py \"{tree}\" --force"
+              + ("" if play == "play" else f" --name {play}"),
               file=sys.stderr)
     frames_dir = run / "frames"
     frames_dir.mkdir()
-    child_env = build_env(tree, run, headless, env, frame_every, frame_max)
+    child_env = build_env(tree, run, headless, env, frame_every, frame_max,
+                          play=None if play == "play" else play_dir)
     dump_stopped = _dump_check(frames_dir, frame_bytes)
     if dump_stopped:
         _stop_dumps(frames_dir, dump_stopped)
@@ -561,8 +572,10 @@ def boot(gt6, tree, seconds=300, idle=60, headless=True, env=None, until="flip",
     backtraces = ""
     returncode = None
     with open(run / "stdout.log", "wb") as so, open(run / "stderr.log", "wb") as se:
+        # cwd: anything the runtime still writes relative to its folder lands in the run
+        # folder, never the repository (D50).
         proc = subprocess.Popen([str(gt6), str(elf)], stdout=so, stderr=se, env=child_env,
-                                stdin=subprocess.DEVNULL, start_new_session=True)
+                                stdin=subprocess.DEVNULL, start_new_session=True, cwd=run)
         try:
             last_sizes, last_growth, flip_at = _sizes(run), start, None
             while True:
@@ -622,6 +635,7 @@ def boot(gt6, tree, seconds=300, idle=60, headless=True, env=None, until="flip",
         "drawn_frames": drawn,
         "first_drawn": first_drawn,
         "dump_stopped": dump_stopped,
+        "play": str(play_dir),
         "play_reused": reused,
         "backtraces": backtraces,
         "pid": proc.pid,
@@ -697,6 +711,9 @@ def main(argv=None):
                     help="convert the dumped frames to frames_png/*.png (sips) for viewing")
     ap.add_argument("--prune", action="store_true",
                     help=f"after the run, delete all but the newest {PRUNE_KEEP} runs")
+    ap.add_argument("--play", default="play", metavar="play-SUFFIX",
+                    help="run on <tree>/play-SUFFIX (from prepare_play.py --name) instead of "
+                         "<tree>/play (D49)")
     ap.add_argument("--press", action="append", default=[], metavar="[IMAGE@]SECONDS:BUTTON",
                     help="press a pad button SECONDS after image IMAGE (default 1; 2 is the "
                          "first exit-spawned one) first polls the pad (repeatable), "
@@ -712,7 +729,8 @@ def main(argv=None):
     tree = Path(args.tree).expanduser()
     gt6 = Path(args.gt6) if args.gt6 else tree / GT6_REL
     rep = boot(gt6, tree, args.seconds, args.idle, headless=not args.window, until=args.until,
-               frame_every=args.frame_every, frame_max=args.frame_max, env=env)
+               frame_every=args.frame_every, frame_max=args.frame_max, env=env,
+               play=args.play)
     run = Path(rep["run"])
     if presses:
         rep["presses"] = [{"image": i, "seconds": t, "button": b}

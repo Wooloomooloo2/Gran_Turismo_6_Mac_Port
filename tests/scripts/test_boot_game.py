@@ -158,6 +158,25 @@ def test_default_environment(tree, tmp_path, monkeypatch):
     assert "PS3RECOMP_METAL_HEADLESS" not in boot_game.build_env(tree, tmp_path, False, None)
 
 
+def test_play_option_runs_on_a_sibling_folder(tree, tmp_path):
+    """D49: play="play-x" checks and marks <tree>/play-x and points both file layers there."""
+    (tree / "play-x").mkdir()
+    (tree / "play-x" / "prepare.json").write_text("{}")
+    rep = boot_game.boot(fake("crash", tmp_path), tree, seconds=30, idle=20, play="play-x")
+    assert json.loads((tree / "play-x" / "prepare.json").read_text())["booted"] == Path(rep["run"]).name
+    assert json.loads((tree / "play" / "prepare.json").read_text()) == {}
+    assert rep["play"] == str((tree / "play-x").resolve())
+    env = boot_game.build_env(tree, tmp_path, True, None, play=tree / "play-x")
+    assert env["PS3_HDD0_ROOT"] == str(tree / "play-x" / "dev_hdd0")
+    assert env["PS3_HDD1_ROOT"] == str(tree / "play-x" / "dev_hdd1")
+    assert env["PS3_GAMEDATA_ROOT"] == str(tree / "play-x")
+    (tree / "play-x" / "prepare.json").unlink()
+    with pytest.raises(SystemExit, match="play-x/prepare.json is missing"):
+        boot_game.boot(fake("crash", tmp_path), tree, play="play-x")
+    with pytest.raises(SystemExit, match="play folder name"):
+        boot_game.boot(fake("crash", tmp_path), tree, play="../elsewhere")
+
+
 def test_refuses_tree_inside_repo():
     with pytest.raises(SystemExit) as e:
         boot_game.boot(Path("/bin/true"), REPO / "x")
@@ -402,7 +421,11 @@ def test_press_reaches_the_game_and_the_report(tree, tmp_path):
                          "--seconds", "2", "--press", "45:cross", "--press", "5:start"])
     run = sorted((tree / "runs").iterdir())[-1]
     assert rc == 0
-    assert "PAD_SCRIPT=5:0x0008,45:0x4000" in (run / "stdout.log").read_text()
+    out = (run / "stdout.log").read_text()
+    assert "PAD_SCRIPT=5:0x0008,45:0x4000" in out
+    # D50: saves and trophies go into the play folder; the port runs in the run folder.
+    assert f"PS3_GAMEDATA_ROOT={tree.resolve() / 'play'}" in out
+    assert f"CWD={run.resolve()}" in out
     rep = json.loads((run / "report.json").read_text())
     assert rep["presses"] == [{"image": 1, "seconds": 5.0, "button": "start"},
                               {"image": 1, "seconds": 45.0, "button": "cross"}]

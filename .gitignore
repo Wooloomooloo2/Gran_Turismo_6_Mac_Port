@@ -13,3 +13,6 @@ keys.local/
 .venv/
 __pycache__/
 .pytest_cache/
+
+# Saves and trophies the runtime writes relative to its folder when no root is set (D50).
+gamedata/

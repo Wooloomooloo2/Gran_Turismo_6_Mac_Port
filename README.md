@@ -135,6 +135,10 @@ Options for long runs (D35):
   `report.json`).
 - `--png` copies the dumped frames to `frames_png/` as PNG (with macOS `sips`) for viewing.
 - `--prune` deletes all but the newest 10 runs in `$GT6_TREE/runs` after this one.
+- `--play play-SUFFIX` runs on `$GT6_TREE/play-SUFFIX`, made with `prepare_play.py --name
+  play-SUFFIX`, instead of `$GT6_TREE/play` (D49). Saves and trophies stay inside the play
+  folder (`dev_hdd0/home/00000001/savedata`, `trophies/`), and the port runs in the run folder
+  (D50).
 - `--press SECONDS:BUTTON` (repeatable) presses a pad button that many seconds after the game
   first polls the pad, e.g. `--press 480:cross` for GT6's "Installation complete." dialog.
   Buttons: cross, circle, triangle, square, start, select, the d-pad, l1-l3, r1-r3 (D40).

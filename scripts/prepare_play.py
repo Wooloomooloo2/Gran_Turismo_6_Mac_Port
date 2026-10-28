@@ -3,7 +3,7 @@
 """Make the play folder the port runs on (dev-only, never shipped).
 
 Usage:
-    .venv/bin/python scripts/prepare_play.py <tree> [--force]
+    .venv/bin/python scripts/prepare_play.py <tree> [--force] [--name play-NAME]
 
 <tree> is a verified gt6unpack build tree. The game never runs on it: EMAIN's first
 run moves thousands of files inside dev_hdd0 (FINDINGS, "What the 1.22 EBOOT leaves
@@ -201,8 +201,23 @@ def _ours(folder):
     return (Path(folder) / STAGING_MARK).is_file() or _made_by_us(folder)
 
 
+PLAY_NAME = re.compile(r"play(-[A-Za-z0-9_.-]+)?")
+
+
+def play_folder(tree, name=None):
+    """<tree>/<name> for a play folder name (default "play"). Only a plain folder name made of
+    "play" and an optional "-suffix" is accepted, so --name can only pick a sibling of the
+    default play folder inside the tree, never another place on the disk (D49)."""
+    name = name or "play"
+    if not PLAY_NAME.fullmatch(name) or name in (".", ".."):
+        raise SystemExit(f"error: play folder name {name!r} must be 'play' or 'play-<suffix>' "
+                         "(letters, digits, '.', '_', '-'), a folder directly inside the tree")
+    return Path(tree).expanduser().resolve() / name
+
+
 def prepare(tree, out=None, force=False):
-    """Make the play folder (default <tree>/play; out= is for tests only, the CLI has none).
+    """Make the play folder (default <tree>/play; the CLI's --name picks <tree>/play-<suffix>
+    through play_folder(); any other out= is for tests only).
 
     The folder is built in a staging folder beside it and renamed into place only after
     prepare.json is written, so an interrupted run never leaves a play folder without the
@@ -285,8 +300,11 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("tree", type=Path, help="verified gt6unpack build tree")
     ap.add_argument("--force", action="store_true", help="delete an existing play folder first")
+    ap.add_argument("--name", default="play", metavar="play-SUFFIX",
+                    help="make <tree>/play-SUFFIX instead of <tree>/play (D49); boot_game.py "
+                         "--play runs on it")
     args = ap.parse_args(argv)
-    rec = prepare(args.tree, force=args.force)
+    rec = prepare(args.tree, out=play_folder(args.tree, args.name), force=args.force)
     guard = disc_layer_writable(args.tree)
     if guard:
         print(f"WARNING: {guard} (D46). The game's file calls cannot write there, but a stray "

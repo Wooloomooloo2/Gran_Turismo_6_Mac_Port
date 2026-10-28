@@ -178,6 +178,42 @@ def test_cli_has_no_out_option(tmp_path):
     assert not (tmp_path / "x").exists()
 
 
+def test_cli_name_makes_a_sibling_play_folder(tmp_path):
+    """D49: --name play-SUFFIX makes <tree>/play-SUFFIX and leaves <tree>/play alone."""
+    tree = tmp_path / "tree"
+    make_tree(tree)
+    r = subprocess.run([sys.executable, str(SCRIPT), str(tree)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    before = (tree / "play" / "prepare.json").read_text()
+    r = subprocess.run([sys.executable, str(SCRIPT), str(tree), "--name", "play-fresh-1"],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert json.loads((tree / "play-fresh-1" / "prepare.json").read_text())["tool"] == prepare_play.TOOL
+    assert (tree / "play-fresh-1" / "dev_hdd0").is_dir()
+    assert (tree / "play" / "prepare.json").read_text() == before
+    r = subprocess.run([sys.executable, str(SCRIPT), str(tree), "--name", "play-fresh-1"],
+                       capture_output=True, text=True)
+    assert r.returncode != 0 and "--force" in r.stderr
+
+
+@pytest.mark.parametrize("name", ["../play-x", "/tmp/play-x", "play/x", "other", "playx",
+                                  "play-", "", "dev_hdd0", "play-a/../../x"])
+def test_name_must_be_a_play_folder_name(tmp_path, name):
+    tree = tmp_path / "tree"
+    make_tree(tree)
+    with pytest.raises(SystemExit, match="play folder name"):
+        prepare_play.play_folder(tree, name or "x y")
+    r = subprocess.run([sys.executable, str(SCRIPT), str(tree), "--name", name or "x y"],
+                       capture_output=True, text=True)
+    assert r.returncode != 0 and "play folder name" in r.stderr
+    assert sorted(p.name for p in tree.iterdir()) == ["build.json", "dev_hdd0"]
+
+
+def test_play_folder_default(tmp_path):
+    assert prepare_play.play_folder(tmp_path) == tmp_path.resolve() / "play"
+    assert prepare_play.play_folder(tmp_path, "play-b4.1") == tmp_path.resolve() / "play-b4.1"
+
+
 def test_refuses_output_inside_a_git_work_tree(tmp_path):
     tree = tmp_path / "tree"
     make_tree(tree)
@@ -248,3 +284,18 @@ def test_leftovers_of_a_killed_run_are_ours_only_with_prepare_json_or_marker(tmp
     (old / "prepare.json").write_text('{"tool": "scripts/prepare_play.py"}')
     prepare_play.prepare(tree, force=True)
     assert not old.exists() and not staging.exists()
+
+
+def test_force_discards_saves_and_trophies(tmp_path):
+    """D50: saves and trophies live in the play folder, so --force starts with none."""
+    tree = tmp_path / "tree"
+    make_tree(tree)
+    prepare_play.prepare(tree)
+    save = tree / "play" / "dev_hdd0" / "home" / "00000001" / "savedata" / "X-GAME6" / "D"
+    save.parent.mkdir(parents=True)
+    save.write_text("s")
+    (tree / "play" / "trophies").mkdir()
+    (tree / "play" / "trophies" / "NPWR00000.json").write_text("{}")
+    prepare_play.prepare(tree, force=True)
+    assert not (tree / "play" / "dev_hdd0" / "home").exists()
+    assert not (tree / "play" / "trophies").exists()
