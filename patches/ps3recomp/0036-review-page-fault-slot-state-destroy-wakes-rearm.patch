@@ -1,0 +1,368 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] page-fault slots change state by CAS; a queue destroy wakes the waiters it strands and disarms its area for 327
+
+Upstream: not yet submitted; written to be upstreamed (generic, no title names)
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0035)
+
+What (fixes to 0033 and 0035, from their review, I-1, M-2 and M-4):
+- I-1: a fault slot's "detached" and "recovered" flags become one state word
+  (waiting, recovered, detached, orphaned, freeing) changed by
+  compare-and-swap. A 57 that lands while a host thread detaches (the
+  pager's normal order: map, then 57 at once) left the slot taken for ever;
+  now the thread sees "recovered" and frees it. The claim loop prints a line
+  every 5 s while every slot is taken.
+- M-2: sys_event_queue_destroy calls the page-fault hook before it drops the
+  queue's events. A thread whose event is still queued there takes the abort
+  path (a host thread whose page is mapped goes on), and a detached slot is
+  freed; an event the pager already received is left alone. The area is left
+  disarmed, and 327 for it arms it again with the new queue. The retry lines
+  print the queue id they used.
+- M-4: the "still waiting" seconds come from a monotonic clock
+  (GetTickCount64), not a count of nominal 20 us naps.
+Behaviour reference: RPCS3 sys_mmapper.cpp and Thread.cpp (GPL-2.0, read
+only, no code from them). What lv2 does to a fault whose queue is destroyed
+is not known (D59).
+Tests: tests/test_mmapper_page_fault.c (100 rounds of map-then-57 against a
+detaching host thread, each slot freed; a destroy with a queued PPU fault
+aborts; 327 re-arms the disarmed area, then EBUSY).
+
+diff --git a/runtime/syscalls/sys_event.c b/runtime/syscalls/sys_event.c
+--- a/runtime/syscalls/sys_event.c
++++ b/runtime/syscalls/sys_event.c
+@@ -281,8 +281,9 @@ int64_t sys_event_queue_destroy(ppu_context* ctx)
+     }
+     q->active = 0;
+     q->cancelled = 1;
+-    q->count = 0;
++    /* Before the events are dropped: the hook finds the page faults still queued. */
+     if (g_evt_queue_destroy_hook) g_evt_queue_destroy_hook(queue_id);   /* page-fault areas (sys_mmapper_pf.c) */
++    q->count = 0;
+ #ifdef _WIN32
+     WakeAllConditionVariable(&q->not_empty);
+     LeaveCriticalSection(&q->lock);
+diff --git a/runtime/syscalls/sys_mmapper_pf.c b/runtime/syscalls/sys_mmapper_pf.c
+--- a/runtime/syscalls/sys_mmapper_pf.c
++++ b/runtime/syscalls/sys_mmapper_pf.c
+@@ -40,8 +40,10 @@
+  * or that id is recovered. The page is never committed empty. Every such fault
+  * is reported on stderr. A full queue is retried every 1 ms (RPCS3's interval;
+  * lv2 retries, its interval is not documented); a queue that is gone, or
+- * destroyed since 327 named it, stops the process, naming the page. A thread
+- * still waiting prints a line every 5 s.
++ * destroyed since 327 named it, stops the process, naming the page, and so
++ * does a destroy while a thread waits on an event queued there. A destroyed
++ * queue leaves its area disarmed, and 327 may arm it again. A thread still
++ * waiting, for its page or for a free fault slot, prints a line every 5 s.
+  */
+ #include "sys_mmapper_pf.h"
+ #include "sys_memory.h"
+@@ -75,11 +77,22 @@ typedef struct pf_area {
+     uint8_t* mapped;      /* one byte per 64 KB page: 1 = an object is mapped */
+ } pf_area;
+ 
++/* A fault slot's state. One word, changed by compare-and-swap, so a 57 that
++ * lands while a host thread detaches cannot leave the slot taken for ever
++ * (batch 7 review I-1). A free slot (tid 0) may hold any state; the thread
++ * that claims it sets WAITING. */
++enum {
++    PF_WAITING   = 0,   /* the thread waits for 57 */
++    PF_RECOVERED = 1,   /* 57 answered; the waiting thread frees the slot */
++    PF_DETACHED  = 2,   /* its host thread went on; the event is still the pager's */
++    PF_ORPHANED  = 3,   /* its queue was destroyed with the event in it */
++    PF_FREEING   = 4,   /* being freed by a 57 or a destroy */
++};
+ typedef struct pf_fault {
+     volatile uint64_t tid;        /* 0 = free slot */
+     volatile uint32_t addr;
+-    volatile int      recovered;
+-    volatile int      detached;   /* its host thread went on; the event is still the pager's */
++    volatile uint32_t qid;        /* the queue its event went to */
++    volatile int      state;
+ } pf_fault;
+ 
+ static mm_object s_obj[MM_OBJ_MAX];
+@@ -255,6 +268,13 @@ static void pf_nap_ms(void)
+ #endif
+ }
+ 
++static int pf_cas_state(pf_fault* f, int from, int to)
++{
++    return __atomic_compare_exchange_n(&f->state, &from, to, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
++}
++
++static void pf_free(pf_fault* f) { __atomic_store_n(&f->tid, 0, __ATOMIC_RELEASE); }
++
+ static int pf_queue_alive(uint32_t qid)
+ {
+     return qid && qid <= SYS_EVENT_QUEUE_MAX && g_sys_event_queues[qid - 1].active;
+@@ -299,6 +319,8 @@ static LONG WINAPI pf_veh(EXCEPTION_POINTERS* ep)
+     }
+ 
+     pf_fault* f = NULL;
++    const ULONGLONG claim_t0 = GetTickCount64();
++    ULONGLONG claim_said = claim_t0;
+     for (;;) {
+         for (int i = 0; i < PF_FAULT_MAX && !f; i++) {
+             uint64_t z = 0;
+@@ -306,17 +328,24 @@ static LONG WINAPI pf_veh(EXCEPTION_POINTERS* ep)
+                 f = &s_fault[i];
+         }
+         if (f) break;
++        ULONGLONG now = GetTickCount64();
++        if (now - claim_said >= 5000) {
++            claim_said = now;
++            fprintf(stderr, "[pf] page 0x%08X (fault id 0x%08llX) waits for one of the %d fault slots, all taken, for %llu s\n",
++                    page, (unsigned long long)tid, PF_FAULT_MAX, (unsigned long long)((now - claim_t0) / 1000));
++        }
+         pf_nap();
+     }
+     f->addr = addr;
+-    __atomic_store_n(&f->detached, 0, __ATOMIC_RELEASE);
+-    __atomic_store_n(&f->recovered, 0, __ATOMIC_RELEASE);
++    __atomic_store_n(&f->qid, 0, __ATOMIC_RELEASE);
++    __atomic_store_n(&f->state, PF_WAITING, __ATOMIC_RELEASE);
+     /* A full queue refuses the event: wait and send again, as RPCS3 models
+      * lv2 (every 1 ms, RPCS3's interval). Never map zeros. A queue that is gone can never be
+      * answered: stop the process, naming the page, rather than hand out data
+      * the pager never filled. */
+     for (int tries = 0;; tries++) {
+         uint32_t qid = __atomic_load_n(&a->queue_id, __ATOMIC_ACQUIRE);
++        __atomic_store_n(&f->qid, qid, __ATOMIC_RELEASE);
+         if (qid && sys_event_queue_push_by_id(qid, SYS_MEMORY_PAGE_FAULT_EVENT_KEY, addr,
+                                        (SYS_MEMORY_PAGE_FAULT_TYPE_PPU_THREAD << 32) | (tid & 0xFFFFFFFFull),
+                                        SYS_MEMORY_PAGE_FAULT_CAUSE_NON_MAPPED) == 0)
+@@ -328,28 +357,44 @@ static LONG WINAPI pf_veh(EXCEPTION_POINTERS* ep)
+         }
+         if (tries == 0)
+             fprintf(stderr, "[pf] page fault at 0x%08X (fault id 0x%08llX): queue %u is full; retrying every 1 ms\n",
+-                    addr, (unsigned long long)tid, a->queue_id);
++                    addr, (unsigned long long)tid, qid);
+         pf_nap_ms();
+     }
+     if (getenv("PS3_PFLOG"))
+-        fprintf(stderr, "[pf] tid 0x%llX faulted at 0x%08X -> queue %u\n", (unsigned long long)tid, addr, a->queue_id);
+-    /* pf_nap is about 20 us, so 250000 naps is about 5 s. */
+-    for (unsigned long naps = 1;; naps++) {
+-        if (__atomic_load_n(&f->recovered, __ATOMIC_ACQUIRE)) break;
++        fprintf(stderr, "[pf] tid 0x%llX faulted at 0x%08X -> queue %u\n", (unsigned long long)tid, addr,
++                __atomic_load_n(&f->qid, __ATOMIC_ACQUIRE));
++    const ULONGLONG wait_t0 = GetTickCount64();
++    ULONGLONG wait_said = wait_t0;
++    for (;;) {
++        int st = __atomic_load_n(&f->state, __ATOMIC_ACQUIRE);
++        if (st == PF_RECOVERED) break;
+         /* A host thread also goes on once the page is mapped, whoever asked.
+          * Its event is still queued and the pager will answer it with 57, which
+          * lv2 would accept (the thread it names is suspended there until then).
+-         * The slot stays, detached, until that 57 takes it (review M-1). */
++         * The slot stays, detached, until that 57 takes it (review M-1). A 57
++         * that came first leaves RECOVERED, and the loop frees the slot. */
+         if (host && !ps3_pf_page_unmapped(page)) {
+-            __atomic_store_n(&f->detached, 1, __ATOMIC_RELEASE);
+-            return EXCEPTION_CONTINUE_EXECUTION;
++            if (st == PF_ORPHANED) break;          /* nobody will answer: free it */
++            if (st == PF_WAITING && pf_cas_state(f, PF_WAITING, PF_DETACHED))
++                return EXCEPTION_CONTINUE_EXECUTION;
++            continue;                              /* the state moved: look again */
++        }
++        if (st == PF_ORPHANED) {
++            fprintf(stderr, "[pf] FATAL: page fault at 0x%08X (fault id 0x%08llX): its queue %u was destroyed "
++                    "with the event in it; no pager can map it\n", addr, (unsigned long long)tid,
++                    __atomic_load_n(&f->qid, __ATOMIC_ACQUIRE));
++            abort();
++        }
++        ULONGLONG now = GetTickCount64();
++        if (now - wait_said >= 5000) {
++            wait_said = now;
++            fprintf(stderr, "[pf] still waiting for page 0x%08X (fault id 0x%08llX, %s thread), %llu s\n",
++                    page, (unsigned long long)tid, host ? "NON-PPU" : "PPU",
++                    (unsigned long long)((now - wait_t0) / 1000));
+         }
+-        if (naps % 250000 == 0)
+-            fprintf(stderr, "[pf] still waiting for page 0x%08X (fault id 0x%08llX, %s thread), about %lu s\n",
+-                    page, (unsigned long long)tid, host ? "NON-PPU" : "PPU", naps / 50000);
+         pf_nap();
+     }
+-    __atomic_store_n(&f->tid, 0, __ATOMIC_RELEASE);
++    pf_free(f);
+     return EXCEPTION_CONTINUE_EXECUTION;       /* re-run the access */
+ }
+ 
+@@ -368,7 +413,17 @@ int64_t sys_mmapper_enable_page_fault_notification(ppu_context* ctx)
+     mm_lock();
+     pf_area* slot = NULL;
+     for (int i = 0; i < PF_AREA_MAX; i++) {
+-        if (s_area[i].end && s_area[i].start == start) { mm_unlock(); return (int64_t)(int32_t)CELL_EBUSY; }
++        if (s_area[i].end && s_area[i].start == start) {
++            /* Disarmed by its queue's destroy: arm it again with the new queue
++             * (batch 7 review M-2). Its pages keep their mapped state. */
++            if (!__atomic_load_n(&s_area[i].queue_id, __ATOMIC_ACQUIRE)) {
++                __atomic_store_n(&s_area[i].queue_id, qid, __ATOMIC_RELEASE);
++                mm_unlock();
++                fprintf(stderr, "[pf] page-fault notification for 0x%08X re-armed -> queue %u\n", start, qid);
++                return CELL_OK;
++            }
++            mm_unlock(); return (int64_t)(int32_t)CELL_EBUSY;
++        }
+         if (!s_area[i].end && !slot) slot = &s_area[i];
+     }
+     if (!slot) { mm_unlock(); return (int64_t)(int32_t)CELL_EAGAIN; }
+@@ -399,18 +454,17 @@ int64_t sys_ppu_thread_recover_page_fault(ppu_context* ctx)
+     uint64_t tid = LV2_ARG_U64(ctx, 0) & 0xFFFFFFFFull;
+     /* A detached slot (its host thread already went on) answers first: its
+      * event was sent first, and the pager answers events in order. */
++    if (!tid) return (int64_t)(int32_t)CELL_EINVAL;
+     for (int pass = 0; pass < 2; pass++)
+-        for (int i = 0; i < PF_FAULT_MAX; i++)
+-            if (tid && (__atomic_load_n(&s_fault[i].tid, __ATOMIC_ACQUIRE) & 0xFFFFFFFFull) == tid &&
+-                !__atomic_load_n(&s_fault[i].recovered, __ATOMIC_ACQUIRE) &&
+-                __atomic_load_n(&s_fault[i].detached, __ATOMIC_ACQUIRE) == !pass) {
+-                if (!pass) {   /* nobody waits on it: free the slot */
+-                    __atomic_store_n(&s_fault[i].detached, 0, __ATOMIC_RELEASE);
+-                    __atomic_store_n(&s_fault[i].tid, 0, __ATOMIC_RELEASE);
+-                } else
+-                    __atomic_store_n(&s_fault[i].recovered, 1, __ATOMIC_RELEASE);
++        for (int i = 0; i < PF_FAULT_MAX; i++) {
++            pf_fault* f = &s_fault[i];
++            if ((__atomic_load_n(&f->tid, __ATOMIC_ACQUIRE) & 0xFFFFFFFFull) != tid) continue;
++            if (!pass) {   /* detached: nobody waits on it, free the slot */
++                if (pf_cas_state(f, PF_DETACHED, PF_FREEING)) { pf_free(f); return CELL_OK; }
++            } else if (pf_cas_state(f, PF_WAITING, PF_RECOVERED)) {
+                 return CELL_OK;
+             }
++        }
+     return (int64_t)(int32_t)CELL_EINVAL;
+ }
+ 
+@@ -422,6 +476,28 @@ void ps3_pf_queue_destroyed(uint32_t queue_id)
+     for (int i = 0; i < PF_AREA_MAX; i++)
+         if (__atomic_load_n(&s_area[i].end, __ATOMIC_ACQUIRE) && s_area[i].queue_id == queue_id)
+             __atomic_store_n(&s_area[i].queue_id, 0, __ATOMIC_RELEASE);
++    /* Threads whose events are still queued there wait for a 57 that cannot
++     * come: a waiting one takes the abort path (or goes on, a host thread whose
++     * page is mapped); a detached slot is freed (batch 7 review M-2). An event
++     * the pager has already received is left alone: its 57 may still come.
++     * Called by the destroy with the queue's lock held, before its events are
++     * dropped. */
++    if (!queue_id || queue_id > SYS_EVENT_QUEUE_MAX) return;
++    const sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
++    for (int i = 0; i < PF_FAULT_MAX; i++) {
++        pf_fault* f = &s_fault[i];
++        uint64_t tid = __atomic_load_n(&f->tid, __ATOMIC_ACQUIRE);
++        if (!tid || __atomic_load_n(&f->qid, __ATOMIC_ACQUIRE) != queue_id) continue;
++        int queued = 0;
++        for (int k = 0; k < q->count && q->capacity > 0 && !queued; k++) {
++            const sys_event_t* e = &q->buffer[(q->head + k) % q->capacity];
++            queued = e->source == SYS_MEMORY_PAGE_FAULT_EVENT_KEY && e->data1 == f->addr &&
++                     (e->data2 & 0xFFFFFFFFull) == (tid & 0xFFFFFFFFull);
++        }
++        if (!queued) continue;
++        if (!pf_cas_state(f, PF_WAITING, PF_ORPHANED) && pf_cas_state(f, PF_DETACHED, PF_FREEING))
++            pf_free(f);
++    }
+ }
+ 
+ /* lv2 198: sys_spu_thread_recover_page_fault(u32 id). No SPU thread is ever
+diff --git a/tests/test_mmapper_page_fault.c b/tests/test_mmapper_page_fault.c
+--- a/tests/test_mmapper_page_fault.c
++++ b/tests/test_mmapper_page_fault.c
+@@ -182,6 +182,32 @@ static int64_t receive_into(uint32_t q, uint64_t* out)
+     return rc;
+ }
+ 
++
++/* Batch 7 review I-1: the pager's normal order -- map the page, then 57 at
++ * once -- races the host thread's own "page mapped, go on". Whichever wins,
++ * the slot must come free; 100 rounds on a 64-slot table would run out. */
++static uint32_t g_area4, g_q4;
++static volatile uint32_t g_round_addr, g_round_seen;
++static void* host_round(void* arg)
++{
++    (void)arg;
++    g_active_ctx = NULL;
++    __asm__ volatile("" ::: "memory");
++    g_round_seen = *(volatile uint32_t*)vm_to_host(g_round_addr);
++    return NULL;
++}
++static void* ppu_round(void* arg)
++{
++    (void)arg;
++    ppu_context self; memset(&self, 0, sizeof self);
++    self.thread_id = 13;
++    g_active_ctx = &self;
++    __asm__ volatile("" ::: "memory");
++    g_round_seen = *(volatile uint32_t*)vm_to_host(g_round_addr);
++    _exit(0);                             /* reached only if the fault was answered */
++    return NULL;
++}
++
+ int main(void)
+ {
+     setvbuf(stdout, NULL, _IONBF, 0);
+@@ -328,6 +354,65 @@ int main(void)
+         (void)stray;
+     }
+ 
++    {   /* I-1: 100 host-thread faults, each mapped and recovered at once. */
++        ppu_context c; memset(&c, 0, sizeof c);
++        c.gpr[3] = 0x1000000; c.gpr[4] = 0; c.gpr[5] = 0x10000000; c.gpr[6] = SCRATCH;
++        assert(sys_mmapper_allocate_address(&c) == CELL_OK);
++        g_area4 = rd32(SCRATCH);
++        memset(&c, 0, sizeof c);
++        c.gpr[3] = SCRATCH + 8; c.gpr[4] = 0; c.gpr[5] = 0x777B; c.gpr[6] = 8;
++        assert(sys_event_queue_create(&c) == CELL_OK);
++        g_q4 = rd32(SCRATCH + 8);
++        assert(enable(g_area4, g_q4) == CELL_OK);
++        int good = 0, second_einval = 0;
++        for (int r = 0; r < 100; r++) {
++            g_round_addr = g_area4 + (uint32_t)(r + 1) * 0x10000u + 0x10;
++            g_round_seen = 0xFFFFFFFFu;
++            pthread_t t;
++            pthread_create(&t, NULL, host_round, NULL);
++            uint64_t e[4];
++            if (receive_into(g_q4, e) != CELL_OK) break;
++            uint32_t page = (uint32_t)e[1] & ~0xFFFFu;
++            if (ps3_mm_map(page, ps3_mm_object_create(0x10000)) != CELL_OK) break;
++            *(volatile uint32_t*)vm_to_host(page + 0x10) = 0x1000u + (uint32_t)r;
++            int64_t rc = recover(e[2] & 0xFFFFFFFFu);   /* straight after the map */
++            pthread_join(t, NULL);
++            if (rc == CELL_OK && g_round_seen == 0x1000u + (uint32_t)r) good++;
++            if ((uint32_t)recover(e[2] & 0xFFFFFFFFu) == CELL_EINVAL) second_einval++;
++        }
++        CHECK(good == 100, "I-1: 100 rounds of map-then-57 against a detaching host thread all complete (%d)", good);
++        CHECK(second_einval == 100, "I-1: every slot came free, a second 57 is EINVAL each time (%d)", second_einval);
++    }
++
++    {   /* M-2: a destroy with a PPU thread's event still queued stops the process;
++         * afterwards 327 can arm the area again. */
++        fflush(stdout);
++        pid_t pid = fork();
++        if (pid == 0) {
++            g_round_addr = g_area4 + 0x800010u;
++            pthread_t t;
++            pthread_create(&t, NULL, ppu_round, NULL);
++            usleep(50000);                /* its event is queued, nobody receives it */
++            ppu_context c; memset(&c, 0, sizeof c);
++            c.gpr[3] = g_q4; c.gpr[4] = 0;
++            sys_event_queue_destroy(&c);
++            pthread_join(t, NULL);
++            _exit(0);
++        }
++        int st = 0;
++        waitpid(pid, &st, 0);
++        CHECK(WIFSIGNALED(st) && WTERMSIG(st) == SIGABRT, "M-2: the waiting thread takes the abort path (status 0x%X)", st);
++        ppu_context c; memset(&c, 0, sizeof c);
++        c.gpr[3] = g_q4; c.gpr[4] = 0;
++        CHECK(sys_event_queue_destroy(&c) == CELL_OK, "M-2: the area's queue is destroyed");
++        memset(&c, 0, sizeof c);
++        c.gpr[3] = SCRATCH + 8; c.gpr[4] = 0; c.gpr[5] = 0x777C; c.gpr[6] = 8;
++        assert(sys_event_queue_create(&c) == CELL_OK);
++        uint32_t qn = rd32(SCRATCH + 8);
++        CHECK(enable(g_area4, qn) == CELL_OK, "M-2: 327 arms the disarmed area again with a new queue");
++        CHECK((uint32_t)enable(g_area4, qn) == CELL_EBUSY, "M-2: and a second 327 for it is EBUSY");
++    }
++
+     if (fails) { printf("%d check(s) failed\n", fails); return 1; }
+     puts("test_mmapper_page_fault: OK");
+     return 0;
