@@ -29,7 +29,7 @@ sceNpTrophy.c: each refusal above, the two ends of the range, and the SDK
 values of the codes it returns.
 
 diff --git a/libs/network/sceNpTrophy.c b/libs/network/sceNpTrophy.c
-index d956e6dd..0825dcf6 100644
+index d956e6d..0825dcf 100644
 --- a/libs/network/sceNpTrophy.c
 +++ b/libs/network/sceNpTrophy.c
 @@ -388,6 +388,29 @@ s32 sceNpTrophyGetRequiredDiskSpace(SceNpTrophyContext context,
@@ -63,7 +63,7 @@ index d956e6dd..0825dcf6 100644
                             SceNpTrophyHandle handle,
                             SceNpTrophyGameDetails* details,
 diff --git a/libs/network/sceNpTrophy.h b/libs/network/sceNpTrophy.h
-index 48faefdc..44c4932e 100644
+index 48faefd..44c4932 100644
 --- a/libs/network/sceNpTrophy.h
 +++ b/libs/network/sceNpTrophy.h
 @@ -18,21 +18,27 @@ extern "C" {
@@ -115,7 +115,7 @@ index 48faefdc..44c4932e 100644
                               const SceNpCommunicationId* commId,
 diff --git a/libs/network/tests/test_trophy_sound_level.c b/libs/network/tests/test_trophy_sound_level.c
 new file mode 100644
-index 00000000..ea1ae100
+index 0000000..4224943
 --- /dev/null
 +++ b/libs/network/tests/test_trophy_sound_level.c
 @@ -0,0 +1,54 @@
@@ -124,8 +124,8 @@ index 00000000..ea1ae100
 + *
 + * Sets the volume of the trophy-unlock sound for a context, 20 to 100. The
 + * checks follow RPCS3's order: the level, then the options (none are
-+ * defined), then initialisation, the context and the handle; the module's own
-+ * codes are used for the last three. Run by tools/test_trophy_sound_level.py.
++ * defined), then initialisation, the context and the handle, each with the
++ * SDK's 0x800229xx code (D37). Run by tools/test_trophy_sound_level.py.
 + */
 +#include "../sceNpTrophy.c"
 +#include <assert.h>
@@ -175,7 +175,7 @@ index 00000000..ea1ae100
 +}
 diff --git a/tools/test_trophy_sound_level.py b/tools/test_trophy_sound_level.py
 new file mode 100644
-index 00000000..64167e77
+index 0000000..64167e7
 --- /dev/null
 +++ b/tools/test_trophy_sound_level.py
 @@ -0,0 +1,52 @@
