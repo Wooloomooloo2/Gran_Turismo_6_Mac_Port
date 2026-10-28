@@ -53,7 +53,7 @@ Shortcuts taken, with the proper fix logged. Priority order: 1) Stability, 2) Pe
 - SPU interrupts with no br/bra at LS 0: the interpreter executes LS 0 (D61), the lifted path's `spu_take_interrupt` reports it and does not take it. Make the lifted path enter LS 0 too (look up or interpret the word there).
 - Patch 0037/0038 (SPU interrupts in the interpreter) is covered by unit tests only (`test_spu_interp_takes_interrupt`, and the other SPU interpreter runners pass). No older interpreted title image (YDKJ-class, CRI) has been run with it: run one when such an image is at hand and check its log for new `[spu_interp] interrupt` lines (batch 8 review M-2).
 - ps3recomp's `tools/test_spu_workload_masked.py` does not link (`spu_dispatch` undefined, upstream test since v0.18.0, not touched by our patches); `tools/test_spu_dma_repeat.py` is timing-sensitive and failed once under load (passes alone).
-- First boots on a busy machine stop on the screen-adjust page before the opening movie, with every SPURS worker idle (FINDINGS round 14 (b)). Find the job or wake-up that is lost.
+- First boots stay on the screen-adjust page until Cross is pressed (FINDINGS round 15; not load-dependent, not a stall). Batch 8's early runs passed it with no press. Find what accepted it then (a stray host input event, or a timeout GT6 has and we no longer meet) and whether the RPCS3 flow shows the page at all; until then boot with `--press 45:cross`.
 - `cellFsGetFreeSize` reports exactly 32 GiB (8 M blocks of 4 KiB). A title that multiplies block size and count in 32 bits gets 0 from any exact multiple of 4 GiB; check GT6's use before the second-boot HDD-space dialog is chased (FINDINGS round 13 (b)), and prefer a value that is not one.
 
 ## 2) Performance
