@@ -13,7 +13,9 @@ and faked CELL_OK:
   CellSpursWorkloadFlag (+0x60; the flag word is at +0x6C) and stores 0 into
   the flag to ask the kernel to run the receiver. The kernel now does that:
   a receiver whose flag is 0 is kicked like a ready count, and once selected
-  the flag goes back to all ones. Initialise sets the flag to all ones and the
+  the flag goes back to all ones (a plain big-endian store under the lock-line
+  lock: vm_write32 can take that lock again when an SPU holds a reservation
+  on the line, which deadlocked the kernel). Initialise sets the flag to all ones and the
   receiver to 0xFF (it wrote all ones over +0x60..+0x67, which are unused,
   and left the flag word and receiver 0). Setting a receiver while one is set
   is BUSY, clearing one that is not the caller's PERM; a wid past the
@@ -41,14 +43,24 @@ registered under the imported NIDs, then builds tests/test_spurs_workload_flag.c
 with the real cellSpurs.c and the SPU runtime, with a manufactured policy
 module: every error code above, the receiver set and cleared, the flag
 address, a flag stored 0 taken by the kernel (the receiver runs and the flag
-reads all ones again), the CellSpurs2 cleared with flags1 set and a live
+reads all ones again, with the policy module holding a reservation on the
+line), the CellSpurs2 cleared with flags1 set and a live
 kernel, and DestroyTaskset2.
 
 diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
-index f5174fd7..47bda73c 100644
+index f5174fd7..83623bc8 100644
 --- a/libs/spurs/cellSpurs.c
 +++ b/libs/spurs/cellSpurs.c
-@@ -422,7 +422,10 @@ enum {
+@@ -274,6 +274,8 @@ extern int  spu_coh_is_reserved(uint32_t);
+ extern void spu_coh_notify_write(uint32_t);
+ static inline u16 ef_r16(uint32_t a) { const uint8_t* p = vm_base + a; return (u16)((p[0] << 8) | p[1]); }
+ static inline void ef_w16(uint32_t a, u16 v) { uint8_t* p = vm_base + a; p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
++/* A big-endian store for use under spu_lockline_lock (vm_write32 may take that lock itself). */
++static inline void ef_w32(uint32_t a, u32 v) { ef_w16(a, (u16)(v >> 16)); ef_w16(a + 2, (u16)v); }
+ static inline void ef_line_end(uint32_t ea)
+ {
+     if (spu_coh_is_reserved(ea & ~127u)) spu_coh_notify_write(ea & ~127u);
+@@ -422,7 +424,10 @@ enum {
      SPURS_WKL_MAXCONT  = 0x50,
      SPURS_WKL_FLAG     = 0x60,
      SPURS_WKL_SIGNAL1  = 0x70,
@@ -59,7 +71,7 @@ index f5174fd7..47bda73c 100644
      SPURS_WKL_STATE1   = 0x80,
      SPURS_WKL_ENABLED  = 0xB0,
      SPURS_SYSSRV_MSG   = 0xBD,
-@@ -433,7 +436,10 @@ enum {
+@@ -433,7 +438,10 @@ enum {
       * clearing 0x2000 here overran the game's 4KB heap block and corrupted
       * the allocator (abort in the job pump's first object destruction). */
      SPURS_INST_SIZE    = 0x1000,
@@ -70,7 +82,7 @@ index f5174fd7..47bda73c 100644
  
  #define MAX_SPURS_INST 4
  struct SpursInst;
-@@ -528,7 +534,7 @@ static void spurs_api_unlock(struct SpursInst* si)
+@@ -528,7 +536,7 @@ static void spurs_api_unlock(struct SpursInst* si)
  
  static DWORD WINAPI spurs_kernel_thread(LPVOID p);
  
@@ -79,7 +91,7 @@ index f5174fd7..47bda73c 100644
  {
      if (!nspus || nspus > 6) return CELL_SPURS_CORE_ERROR_INVAL;
      AcquireSRWLockExclusive(&s_inst_directory_lock);
-@@ -557,9 +563,12 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
+@@ -557,9 +565,12 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
      /* Real BE instance: zero it, then the few live fields. (The global
       * workload table is NOT wiped here — the title may init several SPURS
       * instances before adding workloads to any of them.) */
@@ -94,7 +106,7 @@ index f5174fd7..47bda73c 100644
  
      s32 start_rc = spurs_scheduler_start(si);
      AcquireSRWLockExclusive(&si->lock);
-@@ -567,8 +576,8 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
+@@ -567,8 +578,8 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
      if (start_rc) __atomic_store_n(&si->ea, 0, __ATOMIC_RELEASE);
      ReleaseSRWLockExclusive(&si->lock);
      if (start_rc) return start_rc;
@@ -105,7 +117,7 @@ index f5174fd7..47bda73c 100644
      return CELL_OK;
  }
  
-@@ -578,7 +587,7 @@ s32 cellSpursInitialize(CellSpurs* spurs, s32 nSpus, s32 spuPriority,
+@@ -578,7 +589,7 @@ s32 cellSpursInitialize(CellSpurs* spurs, s32 nSpus, s32 spuPriority,
      (void)spuPriority; (void)ppuPriority; (void)exitIfNoWork;
      if (!spurs)
          return CELL_SPURS_CORE_ERROR_NULL_POINTER;
@@ -114,7 +126,7 @@ index f5174fd7..47bda73c 100644
  }
  
  s32 cellSpursInitializeWithAttribute(CellSpurs* spurs,
-@@ -588,7 +597,22 @@ s32 cellSpursInitializeWithAttribute(CellSpurs* spurs,
+@@ -588,7 +599,22 @@ s32 cellSpursInitializeWithAttribute(CellSpurs* spurs,
          return CELL_SPURS_CORE_ERROR_NULL_POINTER;
      u32 spurs_ea = (u32)(uintptr_t)spurs;
      attr = GUEST_PTR(attr, const CellSpursAttribute*);
@@ -138,7 +150,7 @@ index f5174fd7..47bda73c 100644
  }
  
  static void spurs_cancel_attached_queues(u32 spurs_ea);  /* defined with the queue table */
-@@ -947,6 +971,16 @@ s32 cellSpursDestroyTaskset(CellSpursTaskset* taskset)
+@@ -947,6 +973,16 @@ s32 cellSpursDestroyTaskset(CellSpursTaskset* taskset)
      return CELL_OK;
  }
  
@@ -155,7 +167,7 @@ index f5174fd7..47bda73c 100644
  s32 cellSpursShutdownTaskset(CellSpursTaskset* taskset)
  {
      taskset = GUEST_PTR(taskset, CellSpursTaskset*);
-@@ -1807,7 +1841,9 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+@@ -1807,7 +1843,9 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                  if (!pm) continue;
                  u32 signal = vm_read16(ea + SPURS_WKL_SIGNAL1);
                  u32 ready = vm_read8(ea + SPURS_WKL_READY1 + wid);
@@ -166,17 +178,17 @@ index f5174fd7..47bda73c 100644
                  if (kicked) si->idle[wid] = 0;
                  if (!kicked && (kick_pass || (si->pass_no & ((1u << si->idle[wid]) - 1))))
                      continue;
-@@ -1817,6 +1853,9 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+@@ -1817,6 +1855,9 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                  if (ready) vm_base[ea + SPURS_WKL_READY1 + wid] = (u8)(ready - 1);
                  if (signal & (0x8000u >> wid))
                      ef_w16(ea + SPURS_WKL_SIGNAL1, (u16)(signal & ~(0x8000u >> wid)));
 +                /* The receiver is selected: the flag goes back to all ones, as the SPURS kernel does. */
 +                if (vm_read8(ea + SPURS_WKL_FLAG_RECEIVER) == wid)
-+                    vm_write32(ea + SPURS_WKL_FLAG_WORD, 0xFFFFFFFFu);
++                    ef_w32(ea + SPURS_WKL_FLAG_WORD, 0xFFFFFFFFu);
                  ef_line_end(ea);
                  slot->fn = pm->fn; slot->image_id = pm->image_id;
                  slot->pm = vm_base + (u32)(uintptr_t)s_workloads[wid].pm;
-@@ -1932,6 +1971,63 @@ s32 cellSpursReadyCountStore(CellSpurs* spurs, CellSpursWorkloadId wid,
+@@ -1932,6 +1973,63 @@ s32 cellSpursReadyCountStore(CellSpurs* spurs, CellSpursWorkloadId wid,
      return CELL_OK;
  }
  
@@ -209,7 +221,7 @@ index f5174fd7..47bda73c 100644
 +        ef_line_end(ea);
 +        return isSet ? CELL_SPURS_POLICY_MODULE_ERROR_BUSY : CELL_SPURS_POLICY_MODULE_ERROR_PERM;
 +    }
-+    if (reset_flag) vm_write32(ea + SPURS_WKL_FLAG_WORD, 0xFFFFFFFFu);
++    if (reset_flag) ef_w32(ea + SPURS_WKL_FLAG_WORD, 0xFFFFFFFFu);
 +    vm_base[ea + SPURS_WKL_FLAG_RECEIVER] = isSet ? (u8)wid : 0xFF;
 +    ef_line_end(ea);
 +    return CELL_OK;
@@ -281,10 +293,10 @@ index 07a3d2e4..4242b957 100644
  s32 cellSpursReadyCountSwap(CellSpurs* spurs, CellSpursWorkloadId wid,
 diff --git a/tests/test_spurs_workload_flag.c b/tests/test_spurs_workload_flag.c
 new file mode 100644
-index 00000000..45eb90dc
+index 00000000..eb4f897a
 --- /dev/null
 +++ b/tests/test_spurs_workload_flag.c
-@@ -0,0 +1,153 @@
+@@ -0,0 +1,158 @@
 +/* The SPURS workload flag, cellSpursInitializeWithAttribute2 and cellSpursDestroyTaskset2, against the real
 + * libs/spurs/cellSpurs.c with a manufactured policy module (no game code).
 + *
@@ -298,6 +310,7 @@ index 00000000..45eb90dc
 +#undef spu_workload_dispatch_async
 +#include <assert.h>
 +#include <stdatomic.h>
++#include "../runtime/spu/spu_coherency.h"
 +
 +void spu_indirect_branch(spu_context*);
 +uint8_t* vm_base;
@@ -326,6 +339,10 @@ index 00000000..45eb90dc
 +static atomic_uint runs;
 +static void counting_policy(spu_context* c)
 +{
++    /* Hold a reservation on the instance's first line, as a policy module that reads it with GETLLAR does: the
++     * kernel's flag update must then not take the lock-line lock a second time (it deadlocked, through
++     * vm_write32's coherence path, before the flag was written with plain stores). */
++    spu_lockline_lock(); spu_coh_reserve(c, spu_ls_read32(c, 0x1C4)); spu_lockline_unlock();
 +    atomic_fetch_add(&runs, 1);
 +    c->pc = SPURS_PM_EXIT_TO_KERNEL_LS;
 +    spu_indirect_branch(c);
