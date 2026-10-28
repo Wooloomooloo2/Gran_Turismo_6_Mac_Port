@@ -1,0 +1,742 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] cellFs: mkdir, rename, truncate and write-opens only on writable mounts
+
+Upstream: not yet submitted; written to be upstreamed (generic, no title names)
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0023)
+
+What: patch 0020 confined cellFsUnlink and cellFsRmdir to /dev_hdd0 and
+/dev_hdd1 by an allowlist. The other calls that change the file system did
+not have it:
+- cellFsMkdir went through host_path(), which resolves an unknown device, a
+  relative path or '..' into the VFS root (the disc image), created every
+  missing parent and answered CELL_OK whatever happened;
+- cellFsRename and cellFsTruncate were libs/filesystem/cellFs.c's, whose
+  prefix map sends /dev_bdvd to the disc image, has no '..' handling, and
+  (rename) created the target's missing parents and replaced an existing one;
+- cellFsOpen honoured O_WRONLY/O_RDWR, O_CREAT and O_TRUNC on any path.
+runtime/ppu/ppu_fs.cpp now resolves all of them through one function,
+fs_target_of() (0020's canonical path, allowlist and realpath() parent check,
+now shared), registers cellFsRename (0xF12EECC8) and cellFsTruncate
+(0xC9DC3AC5) itself, and answers as lv2 does under RPCS3 (behaviour only; no
+RPCS3 code):
+- mkdir: one level; EEXIST when it exists (also "/" and a mount itself),
+  ENOENT for a missing parent, ENOTDIR under a file, EROFS on a read-only
+  mount;
+- rename: EPERM for "/", ENOTMOUNTED, EXDEV across devices, EROFS on a
+  read-only mount, EEXIST for an existing target (lv2 does not replace it;
+  renamex_np(RENAME_EXCL) on macOS), ENOENT for a missing source or target
+  folder; a mount itself is EBUSY;
+- truncate: EISDIR for "/" and a directory, EROFS, ENOENT;
+- open with write access, O_CREAT or O_TRUNC: on /dev_hdd0 and /dev_hdd1 the
+  canonical path with no fallback into another mount; on a read-only mount
+  EPERM for write access to or O_TRUNC of an existing file and for O_CREAT of
+  a missing one, otherwise the file opens read-only; "/" EISDIR; O_EXCL is
+  now honoured (EEXIST); an open failure answers EEXIST/ENOTDIR/EISDIR when
+  the host says so (it was always ENOENT);
+- everywhere: a relative path is ENOENT and an unknown device ENOTMOUNTED, a
+  symlink out of a writable mount answers as a read-only mount would, a
+  trailing '/' after a file is ENOTDIR (it removed the file), a host path that
+  does not fit is ENAMETOOLONG, and realpath() gets PATH_MAX buffers.
+unlink and rmdir keep 0020's answers, except "/" (EISDIR / EPERM, as lv2,
+where it was ENOTMOUNTED). Read-only opens and stat are unchanged.
+
+Why: a title's first boot made folders inside the disc image (a relative
+mkdir), and a rename or an O_TRUNC open through the same paths could replace,
+move or empty a disc file.
+
+Test: runtime/ppu/tests/test_fs_imports.cpp (run by
+tools/test_ppu_fs_imports.py) gains a write-guard block on scratch folders:
+every answer above, with checks that the disc folder and a folder outside the
+mounts are unchanged, plus trailing-slash, wrong-case (/DEV_HDD0) and long
+path cases for unlink.
+
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -27,6 +27,10 @@
+ #include <mutex>
+ #include <atomic>
+ #include <sys/stat.h>
++#include <limits.h>
++#ifndef PATH_MAX
++#define PATH_MAX 4096
++#endif
+ #include "../platform/win32_dirent.h"   /* <dirent.h>, or a Win32 stand-in */
+ 
+ /* Guest-resolving host backtrace (ppu_loader.cpp). Must be declared at file scope:
+@@ -265,6 +269,152 @@
+     return fd >= 0 && fd < FS_MAX ? __atomic_load_n(&g_dirs[fd], __ATOMIC_ACQUIRE) : nullptr;
+ }
+ 
++/* ---- calls that change the file system: the writable-mount allowlist ----
++ *
++ * Every call that creates, removes, renames, truncates or opens a file for writing goes
++ * through fs_target_of(), because the other mounts resolve into host folders that must never
++ * change (the disc image, a firmware tree):
++ *   - the guest path is made canonical the way lv2's VFS reads it ('.' and empty components
++ *     dropped, '..' pops one component and stops at '/'); a path that is not absolute is
++ *     ENOENT, as lv2 refuses it before any lookup;
++ *   - only /dev_hdd0/... and /dev_hdd1/... (PS3_HDD0_ROOT, PS3_HDD1_ROOT) may change. The
++ *     read-only mounts (/dev_bdvd, /dev_flash*, /app_home) answer as lv2 answers for a
++ *     read-only mount (EROFS, or EPERM for an open), every other device (or a path with no
++ *     device) ENOTMOUNTED, and "/" itself what lv2 answers for its admin root;
++ *   - the host path is built from the mount's root directly (no fallback into other mounts,
++ *     unlike host_path()) and its parent folder is resolved with realpath(): the change
++ *     happens only when that lies inside the mount's resolved root, so a symlink inside the
++ *     writable folder cannot reach outside it (answered as a read-only mount would).
++ * The answers otherwise follow RPCS3's sys_fs handlers (behaviour only; no RPCS3 code). */
++#define CELL_FS_EPERM      (int32_t)0x80010009u
++#define CELL_FS_EBUSY      (int32_t)0x8001000Au
++#define CELL_FS_EEXIST     (int32_t)0x80010014u
++#define CELL_FS_EROFS      (int32_t)0x80010026u
++#define CELL_FS_ENOTDIR    (int32_t)0x8001002Eu
++#define CELL_FS_EXDEV      (int32_t)0x80010030u
++#define CELL_FS_ENAMETOOLONG (int32_t)0x80010034u
++#define CELL_FS_ENOTEMPTY  (int32_t)0x80010036u
++#define CELL_FS_ENOTMOUNTED (int32_t)0x8001003Au
++/* lv2's reading of a guest path: '.' and empty components dropped, '..' pops
++ * one component (never above '/'). false for a path that is not absolute or
++ * does not fit. */
++static bool fs_canonical(const char* g, char* out, size_t cap)
++{
++    if (!g || g[0] != '/' || cap < 2) return false;
++    size_t len = 0;
++    out[0] = 0;
++    const char* p = g;
++    while (*p) {
++        while (*p == '/') p++;
++        const char* e = p;
++        while (*e && *e != '/') e++;
++        const size_t n = (size_t)(e - p);
++        if (n == 0 || (n == 1 && p[0] == '.')) { p = e; continue; }
++        if (n == 2 && p[0] == '.' && p[1] == '.') {
++            while (len > 0 && out[len - 1] != '/') len--;
++            if (len > 0) len--;            /* drop the '/' too */
++            out[len] = 0;
++            p = e; continue;
++        }
++        if (len + 1 + n + 1 > cap) return false;
++        out[len++] = '/';
++        memcpy(out + len, p, n); len += n; out[len] = 0;
++        p = e;
++    }
++    if (len == 0) { out[0] = '/'; out[1] = 0; }
++    return true;
++}
++static bool fs_on_device(const char* v, const char* dev)
++{
++    const size_t n = strlen(dev);
++    return strncmp(v, dev, n) == 0 && (v[n] == 0 || v[n] == '/');
++}
++static bool fs_resolve(const char* in, char* out)   /* out: PATH_MAX bytes */
++{
++#ifdef _WIN32
++    return _fullpath(out, in, PATH_MAX) != nullptr;
++#else
++    return realpath(in, out) != nullptr;
++#endif
++}
++enum fs_where {
++    FS_WRITABLE,        /* inside /dev_hdd0 or /dev_hdd1: host is set */
++    FS_READONLY,        /* a read-only mount */
++    FS_ESCAPE,          /* inside a writable mount, but a symlink leads out of it */
++    FS_UNMOUNTED,       /* an unknown device, or no device */
++    FS_ADMIN_ROOT,      /* "/" itself */
++    FS_RELATIVE,        /* not absolute (or too long) */
++    FS_NO_PARENT,       /* inside a writable mount; the parent folder does not resolve, or a
++                           trailing '/' follows a file (parent_errno ENOTDIR) */
++    FS_TOO_LONG,        /* the host path does not fit */
++};
++struct fs_target {
++    fs_where where;
++    char dev[64];        /* the canonical device ("dev_hdd0"); cross-device renames compare it */
++    bool mount_root;     /* the path is the writable mount itself */
++    int  parent_errno;   /* FS_NO_PARENT: why the parent did not resolve */
++    char host[PATH_MAX]; /* FS_WRITABLE: the host path */
++};
++static void fs_target_of(const char* gpath, fs_target* t)
++{
++    char v[1024];
++    t->dev[0] = 0; t->host[0] = 0; t->mount_root = false; t->parent_errno = 0;
++    if (!fs_canonical(gpath, v, sizeof v)) { t->where = FS_RELATIVE; return; }
++    if (v[1] == 0) { t->where = FS_ADMIN_ROOT; return; }
++    { const char* e = strchr(v + 1, '/');
++      const size_t n = e ? (size_t)(e - v - 1) : strlen(v + 1);
++      snprintf(t->dev, sizeof t->dev, "%.*s", (int)n, v + 1); }
++    const char* root = nullptr;
++    const char* rest = nullptr;
++    if (fs_on_device(v, "/dev_hdd0"))      { root = getenv("PS3_HDD0_ROOT"); rest = v + 9; }
++    else if (fs_on_device(v, "/dev_hdd1")) { root = getenv("PS3_HDD1_ROOT"); rest = v + 9; }
++    else if (fs_on_device(v, "/dev_bdvd") || fs_on_device(v, "/app_home") ||
++             strncmp(v, "/dev_flash", 10) == 0) { t->where = FS_READONLY; return; }
++    else { t->where = FS_UNMOUNTED; return; }
++    char croot[PATH_MAX];
++    if (!root || !*root || !fs_resolve(root, croot)) { t->where = FS_UNMOUNTED; return; }
++    if (*rest == 0) {                               /* the mount itself */
++        t->where = FS_WRITABLE; t->mount_root = true;
++        snprintf(t->host, sizeof t->host, "%s", croot);
++        return;
++    }
++    char hparent[PATH_MAX], cparent[PATH_MAX];
++    const char* name = strrchr(rest, '/') + 1;   /* rest starts with '/', canonical: no '.'/'..' */
++    const int hn = snprintf(hparent, sizeof hparent, "%s/%.*s", root, (int)(name - rest), rest);
++    if (hn < 0 || (size_t)hn >= sizeof hparent) { t->where = FS_TOO_LONG; return; }
++    if (!fs_resolve(hparent, cparent)) { t->where = FS_NO_PARENT; t->parent_errno = errno; return; }
++    const size_t rl = strlen(croot);
++    if (strncmp(cparent, croot, rl) != 0 || (cparent[rl] != 0 && cparent[rl] != '/')) {
++        t->where = FS_ESCAPE; return;             /* a symlink led out of the writable folder */
++    }
++    const int n = snprintf(t->host, sizeof t->host, "%s/%s", cparent, name);
++    if (n < 0 || (size_t)n >= sizeof t->host) { t->where = FS_TOO_LONG; t->host[0] = 0; return; }
++    t->where = FS_WRITABLE;
++    /* A trailing '/' names a directory: after a file it is ENOTDIR, as POSIX and lv2 answer
++     * (canonicalising dropped it, so check here). */
++    const size_t gl = strlen(gpath);
++    struct stat st;
++    if (gl > 1 && gpath[gl - 1] == '/' && lstat(t->host, &st) == 0 && !S_ISDIR(st.st_mode)) {
++        t->where = FS_NO_PARENT; t->parent_errno = ENOTDIR;
++    }
++}
++/* The answer for a target that may not change: `at_root` for "/" and `at_readonly` for a
++ * read-only mount (or a symlink out of a writable one) are the calling call's. */
++static int32_t fs_refusal(const fs_target& t, int32_t at_root, int32_t at_readonly)
++{
++    switch (t.where) {
++    case FS_RELATIVE:   return CELL_FS_ENOENT;
++    case FS_ADMIN_ROOT: return at_root;
++    case FS_UNMOUNTED:  return CELL_FS_ENOTMOUNTED;
++    case FS_READONLY:
++    case FS_ESCAPE:     return at_readonly;
++    case FS_NO_PARENT:  return t.parent_errno == ENOTDIR ? CELL_FS_ENOTDIR : CELL_FS_ENOENT;
++    case FS_TOO_LONG:   return CELL_FS_ENAMETOOLONG;
++    case FS_WRITABLE:   break;
++    }
++    return CELL_OK;
++}
++
+ /* ---- handlers ---- */
+ static void cellFsOpen(ppu_context* ctx)
+ {
+@@ -272,13 +422,49 @@
+     guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
+     uint32_t flags  = (uint32_t)ctx->gpr[4];
+     uint32_t fd_ptr = (uint32_t)ctx->gpr[5];
+-    host_path(hpath, sizeof hpath, gpath);
+ 
+-    /* NPDRM: see the note in sys_fs.c -- an EDAT is decrypted once into a cache
+-     * file and that is opened in its place. */
+-    { char dec_path[1200];
+-      const char* use = edat_resolve(hpath, dec_path, sizeof dec_path);
+-      if (use != hpath) snprintf(hpath, sizeof hpath, "%s", use); }
++    /* An open that can change the file system (write access, O_CREAT or O_TRUNC) goes through
++     * the writable-mount allowlist (fs_target_of): on /dev_hdd0 and /dev_hdd1 it opens the
++     * canonical path with no fallback into another mount. Elsewhere it answers as lv2 does
++     * (RPCS3's lv2_file::open_raw): on a read-only mount, write access to an existing file,
++     * O_TRUNC on one, or O_CREAT of a missing one is EPERM, and otherwise the file opens read
++     * only; "/" is EISDIR, an unknown device ENOTMOUNTED, a relative path ENOENT. A symlink
++     * out of a writable mount answers as a read-only mount (EPERM). host_path() resolved
++     * unknown, relative and '..' paths into the VFS root (the disc image), so an open with
++     * O_CREAT could make a file there. Read-only opens are unchanged. */
++    const bool changes = (flags & 0x3) != CELL_FS_O_RDONLY || (flags & (CELL_FS_O_CREAT | CELL_FS_O_TRUNC));
++    if (changes) {
++        fs_target t;
++        fs_target_of(gpath, &t);
++        int32_t refuse = CELL_OK;
++        if (t.where == FS_WRITABLE && strlen(t.host) >= sizeof hpath) {
++            refuse = CELL_FS_ENAMETOOLONG;
++        } else if (t.where == FS_WRITABLE) {
++            snprintf(hpath, sizeof hpath, "%s", t.host);
++        } else if (t.where == FS_READONLY) {
++            host_path(hpath, sizeof hpath, gpath);
++            struct stat rst;
++            const bool there = stat(hpath, &rst) == 0;
++            if (there && (rst.st_mode & S_IFMT) == S_IFDIR) refuse = CELL_FS_EISDIR;
++            else if (there && ((flags & 0x3) != CELL_FS_O_RDONLY || (flags & CELL_FS_O_TRUNC))) refuse = CELL_FS_EPERM;
++            else if (!there) refuse = (flags & CELL_FS_O_CREAT) ? CELL_FS_EPERM : CELL_FS_ENOENT;
++            else flags &= ~(uint32_t)(0x3 | CELL_FS_O_CREAT | CELL_FS_O_TRUNC | CELL_FS_O_APPEND | CELL_FS_O_EXCL);
++        } else {
++            refuse = fs_refusal(t, CELL_FS_EISDIR, CELL_FS_EPERM);
++        }
++        if (refuse != CELL_OK) {
++            if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] open '%s' flags=0x%X -> 0x%08X\n", gpath, flags, (uint32_t)refuse);
++            ctx->gpr[3] = (uint64_t)(int64_t)refuse;
++            return;
++        }
++    } else {
++        host_path(hpath, sizeof hpath, gpath);
++        /* NPDRM: see the note in sys_fs.c -- an EDAT is decrypted once into a cache
++         * file and that is opened in its place. */
++        { char dec_path[1200];
++          const char* use = edat_resolve(hpath, dec_path, sizeof dec_path);
++          if (use != hpath) snprintf(hpath, sizeof hpath, "%s", use); }
++    }
+ 
+     /* fopen() mode strings can't express the PS3/POSIX open semantics (e.g.
+      * O_WRONLY without create+truncate, or O_CREAT without O_TRUNC), so build
+@@ -291,6 +477,7 @@
+     if (flags & CELL_FS_O_CREAT)  oflags |= O_CREAT;
+     if (flags & CELL_FS_O_TRUNC)  oflags |= O_TRUNC;
+     if (flags & CELL_FS_O_APPEND) oflags |= O_APPEND;
++    if ((flags & CELL_FS_O_CREAT) && (flags & CELL_FS_O_EXCL)) oflags |= O_EXCL;
+ 
+     /* A bare device root ("/dev_bdvd") resolves to a DIRECTORY, and open() on a
+      * directory fails on Windows. Real cellFsOpen answers EISDIR there, and a
+@@ -307,8 +494,10 @@
+     }
+     int hfd = open(hpath, oflags | O_BINARY, 0666);
+     if (hfd < 0) {
+-        fprintf(stderr, "[fs] open FAIL '%s' -> '%s' (flags=0x%X)\n", gpath, hpath, flags);
+-        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
++        const int32_t rc = errno == EEXIST ? CELL_FS_EEXIST : errno == ENOTDIR ? CELL_FS_ENOTDIR
++                         : errno == EISDIR ? CELL_FS_EISDIR : CELL_FS_ENOENT;
++        fprintf(stderr, "[fs] open FAIL '%s' -> '%s' (flags=0x%X) -> 0x%08X\n", gpath, hpath, flags, (uint32_t)rc);
++        ctx->gpr[3] = (uint64_t)(int64_t)rc; return;
+     }
+     const char* fmode = (acc == CELL_FS_O_RDWR)
+                         ? ((flags & CELL_FS_O_APPEND) ? "ab+" : "rb+")
+@@ -830,128 +1019,111 @@
+ #define HOST_MKDIR(p) mkdir((p), 0777)
+ #endif
+ 
+-/* Create `path` and any missing parent dirs on the host. Returns 0 on
+- * success or if the directory already exists. */
+-static int host_mkdir_p(const char* path)
++/* cellFsMkdir(path, mode): create the one guest directory, only inside the writable mounts
++ * (fs_target_of). It used to create every missing parent and answer CELL_OK whatever
++ * happened, through host_path(), which resolves an unknown or relative path into the VFS
++ * root (the disc image), so a title's mkdir made folders there. As lv2 (RPCS3's
++ * sys_fs_mkdir): EEXIST when it exists (also for "/" and a mount itself), ENOENT when the
++ * parent is missing, ENOTDIR when a component is a file, EROFS on a read-only mount,
++ * ENOTMOUNTED on an unknown device, ENOENT for a relative path. */
++static int32_t fs_mkdir(const char* gpath)
+ {
+-    char tmp[1100];
+-    snprintf(tmp, sizeof tmp, "%s", path);
+-    size_t len = strlen(tmp);
+-    while (len > 1 && (tmp[len-1] == '/' || tmp[len-1] == '\\')) tmp[--len] = 0;
+-    for (char* p = tmp + 1; *p; p++) {
+-        if (*p == '/' || *p == '\\') { char c = *p; *p = 0; HOST_MKDIR(tmp); *p = c; }
+-    }
+-    int r = HOST_MKDIR(tmp);
+-    if (r != 0) { struct stat st; if (stat(tmp, &st) == 0 && (st.st_mode & S_IFDIR)) r = 0; }
+-    return r;
++    fs_target t;
++    fs_target_of(gpath, &t);
++    if (t.where != FS_WRITABLE) return fs_refusal(t, CELL_FS_EEXIST, CELL_FS_EROFS);
++    if (t.mount_root) return CELL_FS_EEXIST;
++    if (HOST_MKDIR(t.host) == 0) return CELL_OK;
++    if (errno == EEXIST) return CELL_FS_EEXIST;
++    if (errno == ENOENT) return CELL_FS_ENOENT;
++    if (errno == ENOTDIR) return CELL_FS_ENOTDIR;
++    return CELL_FS_EIO;
+ }
+-
+-/* cellFsMkdir(path, mode): create the guest directory on the host. A no-op stub
+- * here silently breaks games that create then poll a dir (e.g. LBP's boot waits
+- * for /dev_hdd0/game/<title>/USRDIR to appear). Create parents too. */
+ static void cellFsMkdir(ppu_context* ctx)
+ {
+-    char gpath[1024], hpath[1100];
++    char gpath[1024];
+     guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
+-    host_path(hpath, sizeof hpath, gpath);
+-    int r = host_mkdir_p(hpath);
+-    if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] mkdir '%s' -> '%s' (%s)\n", gpath, hpath, r == 0 ? "OK" : "FAIL");
+-    ctx->gpr[3] = CELL_OK;   /* existing dir is benign for boot */
++    const int32_t rc = fs_mkdir(gpath);
++    if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] mkdir '%s' -> 0x%08X\n", gpath, (uint32_t)rc);
++    ctx->gpr[3] = (uint64_t)(int64_t)rc;
+ }
+-/* cellFsUnlink(path) and cellFsRmdir(path) remove for real; they answered
+- * CELL_OK and removed nothing, so a title that installs by writing a new file
+- * and deleting the old one (or a marker telling its next boot the install is
+- * unfinished) found everything still there.
+- *
+- * Deletes are confined to the writable mounts by an allowlist, because the
+- * other mounts resolve into host folders that must never lose a file (the
+- * disc image, a firmware tree):
+- *   - the guest path is made canonical the way lv2's VFS reads it ('.' and
+- *     empty components dropped, '..' pops one component and stops at '/');
+- *   - only /dev_hdd0/... and /dev_hdd1/... (PS3_HDD0_ROOT, PS3_HDD1_ROOT) may
+- *     delete; the read-only mounts (/dev_bdvd, /dev_flash*, /app_home) answer
+- *     EROFS and every other device (or a path with no device) ENOTMOUNTED, as
+- *     an unmounted device does under lv2 (RPCS3's behaviour; no RPCS3 code);
+- *   - the host path is built from the mount's root directly (no fallback into
+- *     other mounts) and its parent folder is resolved with realpath(): the
+- *     delete happens only when that lies inside the mount's resolved root, so
+- *     a symlink inside the writable folder cannot reach outside it (EROFS).
+- * Answers otherwise follow RPCS3's sys_fs_unlink / sys_fs_rmdir: a missing path
+- * is ENOENT; unlink of a directory is EISDIR, rmdir of a file ENOTDIR and of a
+- * non-empty directory ENOTEMPTY. The mount's own root is never removed. */
+-#define CELL_FS_ENOTDIR    (int32_t)0x8001002Eu
+-#define CELL_FS_EROFS      (int32_t)0x80010026u
+-#define CELL_FS_ENOTEMPTY  (int32_t)0x80010036u
+-#define CELL_FS_ENOTMOUNTED (int32_t)0x8001003Au
+-#define CELL_FS_EBUSY      (int32_t)0x8001000Au
+-/* lv2's reading of a guest path: '.' and empty components dropped, '..' pops
+- * one component (never above '/'). false for a path that is not absolute or
+- * does not fit. */
+-static bool fs_canonical(const char* g, char* out, size_t cap)
+-{
+-    if (!g || g[0] != '/' || cap < 2) return false;
+-    size_t len = 0;
+-    out[0] = 0;
+-    const char* p = g;
+-    while (*p) {
+-        while (*p == '/') p++;
+-        const char* e = p;
+-        while (*e && *e != '/') e++;
+-        const size_t n = (size_t)(e - p);
+-        if (n == 0 || (n == 1 && p[0] == '.')) { p = e; continue; }
+-        if (n == 2 && p[0] == '.' && p[1] == '.') {
+-            while (len > 0 && out[len - 1] != '/') len--;
+-            if (len > 0) len--;            /* drop the '/' too */
+-            out[len] = 0;
+-            p = e; continue;
+-        }
+-        if (len + 1 + n + 1 > cap) return false;
+-        out[len++] = '/';
+-        memcpy(out + len, p, n); len += n; out[len] = 0;
+-        p = e;
+-    }
+-    if (len == 0) { out[0] = '/'; out[1] = 0; }
+-    return true;
+-}
+-static bool fs_on_device(const char* v, const char* dev)
+-{
+-    const size_t n = strlen(dev);
+-    return strncmp(v, dev, n) == 0 && (v[n] == 0 || v[n] == '/');
+-}
+-static bool fs_resolve(const char* in, char* out)
+-{
+-#ifdef _WIN32
+-    return _fullpath(out, in, 1100) != nullptr;
++/* cellFsRename(from, to): only within one writable mount. It was libs/filesystem/cellFs.c's,
++ * whose mapping table sends /dev_bdvd to the disc image and which created the target's
++ * missing parents, so a rename could move or create files there. As lv2 (RPCS3's
++ * sys_fs_rename): EPERM when either is "/", ENOTMOUNTED when either is on no device, EXDEV
++ * across devices, EROFS on a read-only mount; an existing target is EEXIST (lv2 does not
++ * replace it), a missing source or target parent ENOENT. Renaming a mount itself is EBUSY. */
++static int32_t fs_rename(const char* gfrom, const char* gto)
++{
++    fs_target a, b;
++    fs_target_of(gfrom, &a);
++    fs_target_of(gto, &b);
++    if (a.where == FS_RELATIVE || b.where == FS_RELATIVE) return CELL_FS_ENOENT;
++    if (a.where == FS_ADMIN_ROOT || b.where == FS_ADMIN_ROOT) return CELL_FS_EPERM;
++    if (a.where == FS_UNMOUNTED || b.where == FS_UNMOUNTED) return CELL_FS_ENOTMOUNTED;
++    if (strcmp(a.dev, b.dev) != 0) return CELL_FS_EXDEV;
++    if (a.where != FS_WRITABLE) return fs_refusal(a, CELL_FS_EPERM, CELL_FS_EROFS);
++    if (b.where != FS_WRITABLE) return fs_refusal(b, CELL_FS_EPERM, CELL_FS_EROFS);
++    if (a.mount_root || b.mount_root) return CELL_FS_EBUSY;
++#if defined(__APPLE__)
++    const int r = renamex_np(a.host, b.host, RENAME_EXCL);
+ #else
+-    return realpath(in, out) != nullptr;
++    struct stat st;
++    int r;
++    if (lstat(b.host, &st) == 0) { errno = EEXIST; r = -1; }
++    else r = rename(a.host, b.host);
+ #endif
++    if (r == 0) return CELL_OK;
++    if (errno == EEXIST || errno == ENOTEMPTY) return CELL_FS_EEXIST;
++    if (errno == ENOENT) return CELL_FS_ENOENT;
++    if (errno == ENOTDIR) return CELL_FS_ENOTDIR;
++    return CELL_FS_EIO;
+ }
++static void cellFsRename(ppu_context* ctx)
++{
++    char gfrom[1024], gto[1024];
++    guest_strcpy(gfrom, (uint32_t)ctx->gpr[3], sizeof gfrom);
++    guest_strcpy(gto, (uint32_t)ctx->gpr[4], sizeof gto);
++    const int32_t rc = fs_rename(gfrom, gto);
++    if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] rename '%s' -> '%s' -> 0x%08X\n", gfrom, gto, (uint32_t)rc);
++    ctx->gpr[3] = (uint64_t)(int64_t)rc;
++}
++/* cellFsTruncate(path, size): only inside the writable mounts. It was cellFs.c's, through its
++ * mapping table. As lv2 (RPCS3's sys_fs_truncate): EISDIR for "/" and for a directory,
++ * EROFS on a read-only mount, ENOENT for a missing file; the file grows with zeros or is cut. */
++static int32_t fs_truncate(const char* gpath, uint64_t size)
++{
++    fs_target t;
++    fs_target_of(gpath, &t);
++    if (t.where != FS_WRITABLE) return fs_refusal(t, CELL_FS_EISDIR, CELL_FS_EROFS);
++    struct stat st;
++    if (t.mount_root || (stat(t.host, &st) == 0 && S_ISDIR(st.st_mode))) return CELL_FS_EISDIR;
++    if (truncate(t.host, (off_t)size) == 0) return CELL_OK;
++    if (errno == ENOENT) return CELL_FS_ENOENT;
++    if (errno == ENOTDIR) return CELL_FS_ENOTDIR;
++    if (errno == EISDIR) return CELL_FS_EISDIR;
++    return CELL_FS_EIO;
++}
++static void cellFsTruncate(ppu_context* ctx)
++{
++    char gpath[1024];
++    guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
++    const int32_t rc = fs_truncate(gpath, ctx->gpr[4]);
++    if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] truncate '%s' size=%llu -> 0x%08X\n", gpath,
++                                     (unsigned long long)ctx->gpr[4], (uint32_t)rc);
++    ctx->gpr[3] = (uint64_t)(int64_t)rc;
++}
++/* cellFsUnlink(path) and cellFsRmdir(path) remove for real, only inside the writable mounts
++ * (fs_target_of above). Answers follow RPCS3's sys_fs_unlink / sys_fs_rmdir: a missing path
++ * is ENOENT; unlink of a directory is EISDIR, rmdir of a file ENOTDIR and of a non-empty
++ * directory ENOTEMPTY; a read-only mount EROFS; "/" EISDIR (unlink) or EPERM (rmdir). The
++ * mount's own root is never removed (EBUSY / EISDIR). */
+ static int32_t fs_remove(const char* gpath, bool dir)
+ {
+-    char v[1024];
+-    if (!fs_canonical(gpath, v, sizeof v)) return CELL_FS_ENOENT;
+-    const char* root = nullptr;
+-    const char* rest = nullptr;
+-    if (fs_on_device(v, "/dev_hdd0"))      { root = getenv("PS3_HDD0_ROOT"); rest = v + 9; }
+-    else if (fs_on_device(v, "/dev_hdd1")) { root = getenv("PS3_HDD1_ROOT"); rest = v + 9; }
+-    else if (fs_on_device(v, "/dev_bdvd") || fs_on_device(v, "/app_home") ||
+-             strncmp(v, "/dev_flash", 10) == 0)
+-        return CELL_FS_EROFS;
+-    else
+-        return CELL_FS_ENOTMOUNTED;
+-    if (!root || !*root) return CELL_FS_ENOTMOUNTED;
+-    if (*rest == 0) return dir ? CELL_FS_EBUSY : CELL_FS_EISDIR;   /* the mount itself */
+-
+-    char croot[1100], hparent[1100], cparent[1100], hpath[2300];
+-    if (!fs_resolve(root, croot)) return CELL_FS_ENOTMOUNTED;
+-    const char* name = strrchr(rest, '/') + 1;   /* rest starts with '/', canonical: no '.'/'..' */
+-    snprintf(hparent, sizeof hparent, "%s/%.*s", root, (int)(name - rest), rest);
+-    if (!fs_resolve(hparent, cparent)) return errno == ENOTDIR ? CELL_FS_ENOTDIR : CELL_FS_ENOENT;
+-    const size_t rl = strlen(croot);
+-    if (strncmp(cparent, croot, rl) != 0 || (cparent[rl] != 0 && cparent[rl] != '/'))
+-        return CELL_FS_EROFS;                    /* a symlink led out of the writable folder */
+-    snprintf(hpath, sizeof hpath, "%s/%s", cparent, name);
+-
++    fs_target t;
++    fs_target_of(gpath, &t);
++    if (t.where != FS_WRITABLE) return fs_refusal(t, dir ? CELL_FS_EPERM : CELL_FS_EISDIR, CELL_FS_EROFS);
++    if (t.mount_root) return dir ? CELL_FS_EBUSY : CELL_FS_EISDIR;
++    const char* hpath = t.host;
+     struct stat st;
+ #ifdef _WIN32
+     if (stat(hpath, &st) != 0) return errno == ENOTDIR ? CELL_FS_ENOTDIR : CELL_FS_ENOENT;
+@@ -1201,6 +1373,8 @@
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsClosedir"), "cellFsClosedir", cellFsClosedir);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsMkdir"),    "cellFsMkdir",    cellFsMkdir);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsRmdir"),    "cellFsRmdir",    cellFsRmdir);
++    ps3_hle_register_ctx(ps3_compute_nid("cellFsRename"),   "cellFsRename",   cellFsRename);
++    ps3_hle_register_ctx(ps3_compute_nid("cellFsTruncate"), "cellFsTruncate", cellFsTruncate);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsUnlink"),   "cellFsUnlink",   cellFsUnlink);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsFsync"),    "cellFsFsync",    cellFsFsync);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsGetFreeSize"),   "cellFsGetFreeSize",   cellFsGetFreeSize);
+diff --git a/runtime/ppu/tests/test_fs_imports.cpp b/runtime/ppu/tests/test_fs_imports.cpp
+--- a/runtime/ppu/tests/test_fs_imports.cpp
++++ b/runtime/ppu/tests/test_fs_imports.cpp
+@@ -13,7 +13,12 @@
+  *   - cellFsUnlink and cellFsRmdir remove for real, with RPCS3's answers
+  *     (ENOENT, EISDIR, ENOTDIR, ENOTEMPTY, EROFS on /dev_bdvd), and only inside
+  *     /dev_hdd0 and /dev_hdd1: '..' and symlink escapes, other devices and
+- *     device-less paths, and the USRDIR fallback into the disc never delete.
++ *     device-less paths, and the USRDIR fallback into the disc never delete;
++ *   - cellFsMkdir, cellFsRename, cellFsTruncate and an open with write access,
++ *     O_CREAT or O_TRUNC go through the same allowlist, with lv2's answers
++ *     (EEXIST, EXDEV, EROFS, EPERM for an open on a read-only mount,
++ *     ENOTMOUNTED, ENOENT for a relative path): nothing is created, renamed or
++ *     changed outside /dev_hdd0 and /dev_hdd1.
+  *
+  * Driven by tools/test_ppu_fs_imports.py (writes the stub ppu_recomp.h).
+  */
+@@ -251,6 +256,195 @@
+             CHECK(r == 0 && !exists("hdd1/c"), "/dev_hdd1 deletes (0x%08X)", r);
+             r = call(un, "/dev_hdd0/link");
+             CHECK(r == 0 && !exists("hdd0/link") && exists("outside/f"), "unlink of the symlink removes the link only (0x%08X)", r);
++            touch("hdd0/t");
++            r = call(un, "/dev_hdd0/t/");
++            CHECK(r == 0x8001002Eu && exists("hdd0/t"), "unlink of a file with a trailing '/' is ENOTDIR, file kept (0x%08X)", r);
++            r = call(un, "/DEV_HDD0/t");
++            CHECK(r == 0x8001003Au && exists("hdd0/t"), "/DEV_HDD0 (wrong case) is ENOTMOUNTED, file kept (0x%08X)", r);
++            { char longp[1000] = "/dev_hdd0/"; for (int i = 0; i < 9; i++) strcat(longp, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/");
++              strcat(longp, "f");
++              r = call(un, longp);
++              CHECK(r == 0x80010006u, "a long path whose parent is missing is ENOENT (0x%08X)", r); }
++        }
++        snprintf(p, sizeof p, "rm -rf '%s'", base);
++        (void)!system(p);
++    }
++    /* Creating, renaming, truncating and opening for writing are confined the same way. */
++    {
++        char base[512];
++        const char* tmp = getenv("TMPDIR");
++        snprintf(base, sizeof base, "%s/ps3recomp-fs-wguard-XXXXXX", tmp && *tmp ? tmp : "/tmp");
++        const bool made = mkdtemp(base) != nullptr;
++        CHECK(made, "scratch folder (write guard)");
++        char hdd0[600], hdd1[600], bdvd[600], outside[600], p[900];
++        snprintf(hdd0, sizeof hdd0, "%s/hdd0", base);       mkdir(hdd0, 0755);
++        snprintf(hdd1, sizeof hdd1, "%s/hdd1", base);       mkdir(hdd1, 0755);
++        snprintf(bdvd, sizeof bdvd, "%s/bdvd", base);       mkdir(bdvd, 0755);
++        snprintf(outside, sizeof outside, "%s/outside", base); mkdir(outside, 0755);
++        setenv("PS3_HDD0_ROOT", hdd0, 1);
++        setenv("PS3_HDD1_ROOT", hdd1, 1);
++        static char vfs2[600];
++        snprintf(vfs2, sizeof vfs2, "%s", bdvd);
++        ppu_vfs_root = vfs2;
++        auto touch = [&](const char* rel, const char* text) {
++            snprintf(p, sizeof p, "%s/%s", base, rel); FILE* f = fopen(p, "w");
++            if (f) { fputs(text, f); fclose(f); } };
++        auto exists = [&](const char* rel) { struct stat st; snprintf(p, sizeof p, "%s/%s", base, rel); return lstat(p, &st) == 0; };
++        auto size_of = [&](const char* rel) { struct stat st; snprintf(p, sizeof p, "%s/%s", base, rel);
++                                              return stat(p, &st) == 0 ? (long long)st.st_size : -1LL; };
++        auto count = [&](const char* rel) {       /* entries in a folder, to see nothing appeared */
++            snprintf(p, sizeof p, "%s/%s", base, rel); DIR* d = opendir(p); int n = 0;
++            if (d) { while (struct dirent* e = readdir(d)) if (e->d_name[0] != '.') n++; closedir(d); }
++            return n; };
++        snprintf(p, sizeof p, "%s/PS3_GAME", bdvd);            mkdir(p, 0755);
++        snprintf(p, sizeof p, "%s/PS3_GAME/USRDIR", bdvd);     mkdir(p, 0755);
++        touch("bdvd/PS3_GAME/USRDIR/keep", "disc");
++        touch("bdvd/x", "disc");
++        snprintf(p, sizeof p, "%s/link", hdd0);
++        const bool linked = symlink(outside, p) == 0;
++        CHECK(linked, "symlink out of /dev_hdd0 (write guard)");
++        snprintf(p, sizeof p, "%s/game", hdd0);                mkdir(p, 0755);
++        snprintf(p, sizeof p, "%s/game/T", hdd0);              mkdir(p, 0755);
++        snprintf(p, sizeof p, "%s/game/T/USRDIR", hdd0);       mkdir(p, 0755);
++        touch("hdd0/a", "aaaa");
++        touch("hdd0/b", "bb");
++        touch("hdd1/c", "c");
++        const int bdvd_n = count("bdvd"), outside_n = count("outside");
++        auto md = find(ps3_compute_nid("cellFsMkdir")), rn = find(0xF12EECC8u),
++             tr = find(0xC9DC3AC5u), op = find(ps3_compute_nid("cellFsOpen")), cl = find(ps3_compute_nid("cellFsClose"));
++        CHECK(ps3_compute_nid("cellFsRename") == 0xF12EECC8u && rn != nullptr, "cellFsRename: handler registered");
++        CHECK(ps3_compute_nid("cellFsTruncate") == 0xC9DC3AC5u && tr != nullptr, "cellFsTruncate: handler registered");
++        auto call1 = [&](void (*f)(ppu_context*), const char* g) {
++            memset(&ctx, 0, sizeof ctx); strcpy((char*)mem + 0x300, g); ctx.gpr[3] = 0x300; f(&ctx);
++            return (uint32_t)ctx.gpr[3]; };
++        auto call2 = [&](void (*f)(ppu_context*), const char* g, const char* h) {
++            memset(&ctx, 0, sizeof ctx); strcpy((char*)mem + 0x300, g); strcpy((char*)mem + 0x700, h);
++            ctx.gpr[3] = 0x300; ctx.gpr[4] = 0x700; f(&ctx); return (uint32_t)ctx.gpr[3]; };
++        auto trunc_ = [&](const char* g, uint64_t n) {
++            memset(&ctx, 0, sizeof ctx); strcpy((char*)mem + 0x300, g); ctx.gpr[3] = 0x300; ctx.gpr[4] = n; tr(&ctx);
++            return (uint32_t)ctx.gpr[3]; };
++        auto open_ = [&](const char* g, uint32_t flags) {
++            memset(&ctx, 0, sizeof ctx); strcpy((char*)mem + 0x300, g); memset(mem + 0x400, 0xEE, 4);
++            ctx.gpr[3] = 0x300; ctx.gpr[4] = flags; ctx.gpr[5] = 0x400; op(&ctx);
++            const uint32_t r = (uint32_t)ctx.gpr[3], fd = rd32(0x400);
++            if (r == 0) { memset(&ctx, 0, sizeof ctx); ctx.gpr[3] = fd; cl(&ctx); }
++            return r; };
++        const uint32_t RDONLY = 0, WRONLY = 1, RDWR = 2, CREAT = 0x40, EXCL = 0x80, TRUNC = 0x200;
++        if (md && rn && tr && op && cl) {
++            uint32_t r;
++            /* mkdir */
++            r = call1(md, "database/gt6");
++            CHECK(r == 0x80010006u && count("bdvd") == bdvd_n, "mkdir of a relative path is ENOENT; nothing made in the disc (0x%08X)", r);
++            r = call1(md, "/database/gt6");
++            CHECK(r == 0x8001003Au && count("bdvd") == bdvd_n, "mkdir on no device is ENOTMOUNTED; nothing made (0x%08X)", r);
++            r = call1(md, "/dev_bdvd/new");
++            CHECK(r == 0x80010026u && !exists("bdvd/new"), "mkdir on /dev_bdvd is EROFS (0x%08X)", r);
++            r = call1(md, "/dev_hdd0/../dev_bdvd/new");
++            CHECK(r == 0x80010026u && !exists("bdvd/new"), "mkdir '..' into /dev_bdvd is EROFS (0x%08X)", r);
++            r = call1(md, "/host_root/new");
++            CHECK(r == 0x8001003Au && count("bdvd") == bdvd_n, "mkdir on /host_root is ENOTMOUNTED (0x%08X)", r);
++            r = call1(md, "/dev_hdd0/link/new");
++            CHECK(r == 0x80010026u && count("outside") == outside_n, "mkdir through a symlink out of /dev_hdd0 is EROFS (0x%08X)", r);
++            r = call1(md, "/");
++            CHECK(r == 0x80010014u, "mkdir of '/' is EEXIST (0x%08X)", r);
++            r = call1(md, "/dev_hdd0");
++            CHECK(r == 0x80010014u, "mkdir of the /dev_hdd0 mount is EEXIST (0x%08X)", r);
++            r = call1(md, "/dev_hdd0/p/q");
++            CHECK(r == 0x80010006u && !exists("hdd0/p"), "mkdir with a missing parent is ENOENT; no parent made (0x%08X)", r);
++            r = call1(md, "/dev_hdd0/a/q");
++            CHECK(r == 0x8001002Eu, "mkdir under a file is ENOTDIR (0x%08X)", r);
++            r = call1(md, "/dev_hdd0/p");
++            CHECK(r == 0 && exists("hdd0/p"), "mkdir in /dev_hdd0 makes the folder (0x%08X)", r);
++            r = call1(md, "/dev_hdd0/p/");
++            CHECK(r == 0x80010014u, "mkdir of an existing folder is EEXIST (0x%08X)", r);
++            r = call1(md, "/DEV_HDD0/q");
++            CHECK(r == 0x8001003Au && !exists("hdd0/q"), "mkdir on /DEV_HDD0 (wrong case) is ENOTMOUNTED (0x%08X)", r);
++            r = call1(md, "/dev_hdd1/cache");
++            CHECK(r == 0 && exists("hdd1/cache"), "mkdir in /dev_hdd1 makes the folder (0x%08X)", r);
++            /* rename */
++            r = call2(rn, "/dev_hdd0/a", "/dev_hdd0/b");
++            CHECK(r == 0x80010014u && size_of("hdd0/a") == 4 && size_of("hdd0/b") == 2,
++                  "rename onto an existing file is EEXIST; both kept (0x%08X)", r);
++            r = call2(rn, "/dev_hdd0/a", "/dev_hdd1/a");
++            CHECK(r == 0x80010030u && exists("hdd0/a") && !exists("hdd1/a"), "rename across /dev_hdd0 and /dev_hdd1 is EXDEV (0x%08X)", r);
++            r = call2(rn, "/dev_hdd0/a", "/dev_bdvd/a");
++            CHECK(r == 0x80010030u && !exists("bdvd/a"), "rename into /dev_bdvd is EXDEV (0x%08X)", r);
++            r = call2(rn, "/dev_hdd0/a", "/dev_hdd0/../dev_bdvd/a");
++            CHECK(r == 0x80010030u && !exists("bdvd/a"), "rename '..' into /dev_bdvd is EXDEV (0x%08X)", r);
++            r = call2(rn, "/dev_bdvd/x", "/dev_bdvd/y");
++            CHECK(r == 0x80010026u && exists("bdvd/x") && !exists("bdvd/y"), "rename within /dev_bdvd is EROFS (0x%08X)", r);
++            r = call2(rn, "x", "/dev_hdd0/y");
++            CHECK(r == 0x80010006u, "rename from a relative path is ENOENT (0x%08X)", r);
++            r = call2(rn, "/x", "/y");
++            CHECK(r == 0x8001003Au && exists("bdvd/x") && !exists("bdvd/y"), "rename on no device is ENOTMOUNTED (0x%08X)", r);
++            r = call2(rn, "/", "/dev_hdd0/y");
++            CHECK(r == 0x80010009u, "rename of '/' is EPERM (0x%08X)", r);
++            r = call2(rn, "/dev_hdd0/a", "/dev_hdd0/link/a");
++            CHECK(r == 0x80010026u && exists("hdd0/a") && count("outside") == outside_n,
++                  "rename through a symlink out of /dev_hdd0 is EROFS (0x%08X)", r);
++            r = call2(rn, "/dev_hdd0/a", "/dev_hdd0/nodir/a");
++            CHECK(r == 0x80010006u && !exists("hdd0/nodir"), "rename to a missing folder is ENOENT; no folder made (0x%08X)", r);
++            r = call2(rn, "/dev_hdd0/none", "/dev_hdd0/z");
++            CHECK(r == 0x80010006u, "rename of a missing file is ENOENT (0x%08X)", r);
++            r = call2(rn, "/dev_hdd0", "/dev_hdd0/z");
++            CHECK(r == 0x8001000Au, "rename of the /dev_hdd0 mount is EBUSY (0x%08X)", r);
++            r = call2(rn, "/dev_hdd0/a", "/dev_hdd0/p/a2");
++            CHECK(r == 0 && !exists("hdd0/a") && size_of("hdd0/p/a2") == 4, "rename within /dev_hdd0 moves the file (0x%08X)", r);
++            /* truncate */
++            r = trunc_("/dev_bdvd/x", 0);
++            CHECK(r == 0x80010026u && size_of("bdvd/x") == 4, "truncate on /dev_bdvd is EROFS; file kept (0x%08X)", r);
++            r = trunc_("/dev_hdd0/../dev_bdvd/x", 0);
++            CHECK(r == 0x80010026u && size_of("bdvd/x") == 4, "truncate '..' into /dev_bdvd is EROFS (0x%08X)", r);
++            r = trunc_("x", 0);
++            CHECK(r == 0x80010006u && size_of("bdvd/x") == 4, "truncate of a relative path is ENOENT (0x%08X)", r);
++            r = trunc_("/dev_hdd0/p", 0);
++            CHECK(r == 0x80010012u, "truncate of a folder is EISDIR (0x%08X)", r);
++            r = trunc_("/dev_hdd0/none", 0);
++            CHECK(r == 0x80010006u && !exists("hdd0/none"), "truncate of a missing file is ENOENT (0x%08X)", r);
++            r = trunc_("/dev_hdd0/p/a2", 1);
++            CHECK(r == 0 && size_of("hdd0/p/a2") == 1, "truncate in /dev_hdd0 cuts the file (0x%08X)", r);
++            /* open with write access, O_CREAT or O_TRUNC */
++            r = open_("database/gt6/f", RDWR | CREAT);
++            CHECK(r == 0x80010006u && count("bdvd") == bdvd_n, "create on a relative path is ENOENT; nothing made (0x%08X)", r);
++            r = open_("/dev_bdvd/new", WRONLY | CREAT);
++            CHECK(r == 0x80010009u && !exists("bdvd/new"), "create on /dev_bdvd is EPERM (0x%08X)", r);
++            r = open_("/dev_hdd0/../dev_bdvd/new", WRONLY | CREAT | TRUNC);
++            CHECK(r == 0x80010009u && !exists("bdvd/new"), "create '..' into /dev_bdvd is EPERM (0x%08X)", r);
++            r = open_("/dev_bdvd/x", RDWR);
++            CHECK(r == 0x80010009u && size_of("bdvd/x") == 4, "write access to a /dev_bdvd file is EPERM (0x%08X)", r);
++            r = open_("/dev_bdvd/x", RDONLY | TRUNC);
++            CHECK(r == 0x80010009u && size_of("bdvd/x") == 4, "O_TRUNC on a /dev_bdvd file is EPERM; file kept (0x%08X)", r);
++            r = open_("/dev_bdvd/x", RDONLY | CREAT);
++            CHECK(r == 0 && size_of("bdvd/x") == 4, "O_CREAT on an existing /dev_bdvd file opens it read-only (0x%08X)", r);
++            r = open_("/dev_bdvd/none", RDONLY | CREAT);
++            CHECK(r == 0x80010009u && !exists("bdvd/none"), "O_CREAT of a missing /dev_bdvd file is EPERM (0x%08X)", r);
++            r = open_("/host_root/new", WRONLY | CREAT);
++            CHECK(r == 0x8001003Au && count("bdvd") == bdvd_n, "create on /host_root is ENOTMOUNTED (0x%08X)", r);
++            r = open_("/new", WRONLY | CREAT);
++            CHECK(r == 0x8001003Au && count("bdvd") == bdvd_n, "create on no device is ENOTMOUNTED (0x%08X)", r);
++            r = open_("/", WRONLY | CREAT);
++            CHECK(r == 0x80010012u, "create of '/' is EISDIR (0x%08X)", r);
++            r = open_("/dev_hdd0/link/new", WRONLY | CREAT);
++            CHECK(r == 0x80010009u && count("outside") == outside_n, "create through a symlink out of /dev_hdd0 is EPERM (0x%08X)", r);
++            r = open_("/dev_hdd0/nodir/new", WRONLY | CREAT);
++            CHECK(r == 0x80010006u && !exists("hdd0/nodir"), "create in a missing folder is ENOENT (0x%08X)", r);
++            r = open_("/dev_hdd0/game/T/USRDIR/keep", WRONLY | CREAT | TRUNC);
++            CHECK(r == 0 && exists("hdd0/game/T/USRDIR/keep") && size_of("bdvd/PS3_GAME/USRDIR/keep") == 4,
++                  "create of a /dev_hdd0 USRDIR file makes it there; the disc file it would fall back to is kept (0x%08X)", r);
++            r = open_("/dev_hdd0/./p/../new", RDWR | CREAT);
++            CHECK(r == 0 && exists("hdd0/new"), "create on a canonical path inside /dev_hdd0 (0x%08X)", r);
++            r = open_("/dev_hdd0/new", RDWR | CREAT | EXCL);
++            CHECK(r == 0x80010014u, "O_CREAT|O_EXCL of an existing file is EEXIST (0x%08X)", r);
++            r = open_("/dev_hdd0/new/", RDWR);
++            CHECK(r == 0x8001002Eu, "write open of a file with a trailing '/' is ENOTDIR (0x%08X)", r);
++            r = call2(rn, "/dev_hdd0/new/", "/dev_hdd0/new2");
++            CHECK(r == 0x8001002Eu && exists("hdd0/new"), "rename of a file with a trailing '/' is ENOTDIR (0x%08X)", r);
++            r = open_("/dev_hdd0/p", RDWR);
++            CHECK(r == 0x80010012u, "write access to a folder is EISDIR (0x%08X)", r);
++            r = open_("/dev_hdd1/c", RDWR | TRUNC);
++            CHECK(r == 0 && size_of("hdd1/c") == 0, "O_TRUNC in /dev_hdd1 cuts the file (0x%08X)", r);
++            CHECK(count("bdvd") == bdvd_n && size_of("bdvd/x") == 4 && count("outside") == outside_n,
++                  "the disc folder and the folder outside are unchanged");
+         }
+         snprintf(p, sizeof p, "rm -rf '%s'", base);
+         (void)!system(p);
