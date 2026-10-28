@@ -199,6 +199,62 @@ lwmutex logged (20261028-012412, diagnostic build, since reverted):
 **Test evidence for patch 0011** (`tools/test_cellfiber_ppu.py`): a Run plus ReturnToThread
 round trip takes 5.6 µs and a Switch A -> B -> A 5.1 µs on the M4 Max (20,000 of each).
 
+## Import audit and the menu-path imports (2026-10-28)
+
+**Every import GT6 calls on its way to the menu now has a real handler; the boot still stops on
+the same deadlock.** `scripts/audit_imports.py "$GT6_TREE" --runs` reads EMAIN's import table and
+ps3recomp's two registration paths (the table `gen_hle_nids.py --all` writes, and the runtime's
+own `ps3_hle_register_ctx`/`_fast` calls), and counts each import's calls in every run's
+milestone log.
+
+| | Before (patches 0001-0011) | After (0001-0017) |
+|---|---|---|
+| EMAIN imports | 740 | 740 |
+| Handled | 437 | 460 |
+| Unhandled | 303 | 280 |
+| Unhandled and called in a run (30 runs) | 10 | 0 |
+| Unhandled and called by the RPCS3 reference run (`calls.txt`) | 4 | 0 |
+
+- The 10 called: the 9 still unresolved in run 20261028-011330 plus `cellSpursDestroyTaskset2`
+  (called only in the old runs that exited). The RPCS3 reference adds `cellMusicInitialize2`,
+  `cellMusicSetVolume2` and `sceNpTrophySetSoundLevel` (with `cellVideoOutGetScreenSize`).
+- Miscount guards: 3 NIDs are registered under two names (`netInitializeNetworkEx` /
+  `sys_net_initialize_network_ex`, `netFinalizeNetwork` / `sys_net_finalize_network`,
+  `_sys_spu_image_import` / `sys_spu_image_import`; the first registration runs) and 15 literal
+  NIDs carry a label that is not their name (the PSL1GHT `net*`/`sys_net_bnet_*` labels in
+  `ppu_sysprx.cpp`). None is on GT6's path. The ctx table holds 85 of its 256 slots. The built
+  `ppu_hle_nids.cpp` matches the audit's reading of `libs/**` once rebuilt. 16 NIDs logged
+  unresolved in older runs are handled now (patches 0007, 0011 and this task).
+- Patches 0012-0017, one per library: `cellVideoOutGetScreenSize` (VALUE_IS_NOT_SET, as RPCS3),
+  the SPURS workload flag, `cellSpursInitializeWithAttribute2` and `cellSpursDestroyTaskset2`,
+  the `cellUsbd` extra LDDs (no device attached), `sys_mempool_*` and `sys_prx_get_module_list`
+  (empty: no PRX is loaded), the `cellMusic*2` player (no music library) and
+  `sceNpTrophySetSoundLevel`.
+
+**Boot, run 20261028-021830** (`--until time --seconds 300 --png`, fresh play folder):
+- `timeout` after 300.1 s, no crash, flips, 300 frames dumped (cap), `unresolved_nids` empty.
+  The one unimplemented system call is still 327 (`sys_mmapper_enable_page_fault_notification`).
+- The new calls run: `cellVideoOutGetScreenSize` (once), `cellSpursInitializeWithAttribute2`
+  (a second SPURS instance at 0x01682E00, 1 SPU, now with a kernel), `sys_mempool_create`,
+  `sys_prx_get_module_list`, and 8 USB drivers registered (two Logitech force-feedback
+  ranges, five Thrustmaster wheels and an "Oculus" entry), none probed (no device attached).
+- **The screen is unchanged:** "Sony Computer Entertainment / presents" fades in by present 60
+  and stays to the last dump (present 17,940; 17 draws and 2 clears per frame).
+- **The deadlock persists.** A host `sample` 50 s into a second run: the context's host thread is
+  in `sys_lwmutex_lock` from func_00841978, the thread that called Run waits in
+  `cellFiberPpuContextRun`, and the main thread waits in `sys_lwcond_wait` from func_00A5F3DC
+  (via func_005A7FA4 and func_00735DC4), as in run 20261028-012412.
+- **The workload flag is not the main thread's event.** GT6 takes the flag's address
+  (func_00BB35xx, right after `_cellSpursWorkloadFlagReceiver2`), converts it to an RSX I/O
+  offset with its own copy of the GCM address table (func_00BBB8E0) and stores it (0x0173E468),
+  apparently for the GPU to release the flag and wake the GPU-sync workload. With the faked call
+  that offset came from an unwritten stack slot.
+- **The first boot with these patches hung earlier** (run 20261028-020741): no flip, stuck right
+  after `cellSpursGetWorkloadFlag`. The SPURS kernel reset the flag with `vm_write32` while
+  holding the lock-line lock, and `vm_write32` takes that lock again when an SPU holds a
+  reservation on the line. Fixed in patch 0013 (plain stores), with a test that holds the
+  reservation and hung before the fix.
+
 ## RPCS3 reference: boot to the first menu (2026-10-28)
 
 **RPCS3 did not reach the first menu either.** It ran the first-run install to the end. After
