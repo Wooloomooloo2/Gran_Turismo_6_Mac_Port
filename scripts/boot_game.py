@@ -54,6 +54,7 @@ Exit status: 0 on first_frame (with --until time also on a timeout after a flip 
 least one frame kept), otherwise 1.
 """
 import argparse
+import hashlib
 import datetime
 import json
 import math
@@ -218,23 +219,68 @@ def current_patch_set():
     return commit, patches_hash(PATCHES)
 
 
-def check_images(tree, commit=None, patches=None):
-    """Every build under <tree>/port-build*/port with a gt6.image: (current, problems).
-    current is [(sha, binary, elf)] for the builds made from this checkout's ps3recomp commit
-    and patch set; problems names each build that is not (stale: it would silently lack the
-    current fixes) and each SELF more than one build claims (D47)."""
+def ps3recomp_tree_hash(sub=None):
+    """SHA-256 of the ps3recomp submodule's working tree as port/write_image.cmake records it
+    in gt6.image ("ps3recomp_tree"): `git diff HEAD --binary`, then "<path>\n<sha256>\n" for
+    each untracked file git lists (--exclude-standard; __pycache__ and .pyc left out). It
+    changes with any edit, inside the patch series or not (D47). None without git."""
+    sub = Path(sub or PS3RECOMP)
+    try:
+        diff = subprocess.run(["git", "-C", str(sub), "diff", "HEAD", "--binary"],
+                              capture_output=True, check=True).stdout
+        others = subprocess.run(["git", "-C", str(sub), "ls-files", "--others",
+                                 "--exclude-standard"], capture_output=True, check=True,
+                                text=True).stdout.split("\n")
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    state = bytearray(diff)
+    for f in others:
+        if not f or "/__pycache__/" in "/" + f or f.endswith(".pyc"):
+            continue
+        h = hashlib.sha256((sub / f).read_bytes()).hexdigest()
+        state += f"{f}\n{h}\n".encode()
+    return hashlib.sha256(bytes(state)).hexdigest()
+
+
+IMAGE_FIELDS = ("self_sha256", "elf", "ps3recomp_commit", "ps3recomp_patches", "ps3recomp_tree")
+
+
+def build_problem(gt6, info, commit, patches, tree_state):
+    """Why the build gt6 (its gt6.image info) must not run, or None (D47)."""
+    missing = [k for k in IMAGE_FIELDS if not (info or {}).get(k)]
+    if tree_state is None and "ps3recomp_tree" in missing:
+        missing.remove("ps3recomp_tree")
+    if missing:
+        return (f"{gt6} has no complete {IMAGE_NAME} (missing {', '.join(missing)}): it was "
+                f"built before D47 or its build failed; rebuild it")
+    if info.get("ps3recomp_patches") != patches or info.get("ps3recomp_commit") != commit:
+        return (f"{gt6} was built from ps3recomp {info.get('ps3recomp_commit')} with patch set "
+                f"{info.get('ps3recomp_patches')}; this checkout is {commit} with {patches}")
+    if tree_state is not None and info.get("ps3recomp_tree") != tree_state:
+        return (f"{gt6} was built from another ps3recomp working tree (tree hash "
+                f"{info.get('ps3recomp_tree')}, now {tree_state}): the submodule was edited "
+                f"outside the patch series, or this build was not redone after it")
+    return None
+
+
+def check_images(tree, commit=None, patches=None, tree_state=None):
+    """Every build under <tree>/port-build*/port: (current, problems).
+    current is [(sha, binary, elf)] for the builds made from this checkout's ps3recomp commit,
+    patch set and submodule working tree; problems names each build that is not (stale: it
+    would silently lack the current fixes, or carry a debug edit the others lack), each binary
+    with no complete gt6.image, and each SELF more than one build claims (D47). With commit
+    and patches given (tests), the working tree is compared only when tree_state is given."""
     if commit is None and patches is None:
         commit, patches = current_patch_set()
+        tree_state = ps3recomp_tree_hash()
     current, problems, seen = [], [], {}
-    for img in sorted(Path(tree).glob("port-build*/port/" + IMAGE_NAME)):
-        info = image_info(img)
-        gt6 = img.parent / "gt6"
-        if not (info and gt6.is_file() and "self_sha256" in info and "elf" in info):
+    for gt6 in sorted(Path(tree).glob("port-build*/port/gt6")):
+        if not gt6.is_file():
             continue
-        if info.get("ps3recomp_patches") != patches or info.get("ps3recomp_commit") != commit:
-            problems.append(f"{gt6} was built from ps3recomp {info.get('ps3recomp_commit')} with "
-                            f"patch set {info.get('ps3recomp_patches')}; this checkout is {commit} "
-                            f"with {patches}")
+        info = image_info(gt6)
+        problem = build_problem(gt6, info, commit, patches, tree_state)
+        if problem:
+            problems.append(problem)
             continue
         sha = info["self_sha256"]
         if sha in seen:
@@ -538,6 +584,20 @@ def boot(gt6, tree, seconds=300, idle=60, headless=True, env=None, until="flip",
                          f"run scripts/prepare_play.py first")
     info = image_info(gt6)
     _, problems = check_images(tree)
+    # A --gt6 binary outside <tree>/port-build*/port is checked too (D47): refused when its
+    # gt6.image is stale, and run with a loud warning when it has none (a test or debug build).
+    unchecked = None
+    if gt6.parent.parent.parent != tree or not gt6.parent.parent.name.startswith("port-build"):
+        if info is None:
+            unchecked = str(gt6)
+            print(f"WARNING: {gt6} has no {IMAGE_NAME}, so it cannot be checked against this "
+                  f"checkout's ps3recomp patches (D47); it may lack the current fixes",
+                  file=sys.stderr)
+        else:
+            commit, patches = current_patch_set()
+            problem = build_problem(gt6, info, commit, patches, ps3recomp_tree_hash())
+            if problem:
+                problems.append(problem)
     if problems:
         raise SystemExit("error: a port build does not match this checkout's ps3recomp patches, "
                          "so it would run without the current fixes (D47). Re-translate and "
@@ -637,6 +697,7 @@ def boot(gt6, tree, seconds=300, idle=60, headless=True, env=None, until="flip",
         "dump_stopped": dump_stopped,
         "play": str(play_dir),
         "play_reused": reused,
+        "unchecked_build": unchecked,
         "backtraces": backtraces,
         "pid": proc.pid,
         "run": str(run),

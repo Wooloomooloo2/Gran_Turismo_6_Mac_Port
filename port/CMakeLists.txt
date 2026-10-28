@@ -365,10 +365,14 @@ target_include_directories(gt6 PRIVATE
     "${CMAKE_CURRENT_BINARY_DIR}"
 )
 target_link_libraries(gt6 PRIVATE ps3recomp_runtime)
+# The POST_BUILD step also records the hash of the submodule's working tree at link time, so
+# an edit outside the patch series (a debug line) makes the other builds stale (D47).
 add_custom_command(TARGET gt6 POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_BINARY_DIR}/gt6.image.pending"
-                                     "$<TARGET_FILE_DIR:gt6>/gt6.image"
-    COMMENT "gt6.image: the SELF and patch set this binary was built from (D44, D47)")
+    COMMAND ${CMAKE_COMMAND} -DSUB=${PS3RECOMP_DIR}
+                             -DIN=${CMAKE_CURRENT_BINARY_DIR}/gt6.image.pending
+                             -DOUT=$<TARGET_FILE_DIR:gt6>/gt6.image
+                             -P ${CMAKE_CURRENT_SOURCE_DIR}/write_image.cmake
+    COMMENT "gt6.image: the SELF, patch set and ps3recomp tree this binary was built from (D44, D47)")
 set_target_properties(gt6 PROPERTIES LINKER_LANGUAGE CXX)
 
 target_compile_options(gt6 PRIVATE

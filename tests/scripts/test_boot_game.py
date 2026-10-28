@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 import json
 import os
+import subprocess
 import shutil
 import sys
 import time
@@ -514,6 +515,66 @@ def test_boot_refuses_a_stale_build(tree, tmp_path, monkeypatch):
     with pytest.raises(SystemExit, match="does not match this checkout's ps3recomp patches"):
         boot_game.boot(gt6, tree, seconds=1)
     assert not (tree / "runs").exists()
+
+
+def test_build_without_a_complete_image_is_a_problem(tree):
+    """D47 (review m4): a port-build*/port/gt6 with no gt6.image, or one missing a field, is
+    stale, not skipped."""
+    _image(tree, "port-build", "aa", "decrypted/a.elf")
+    (tree / "port-build-noimage" / "port").mkdir(parents=True)
+    (tree / "port-build-noimage" / "port" / "gt6").write_text("")
+    half = _image(tree, "port-build-half", "bb", "decrypted/b.elf")
+    info = json.loads((half.parent / "gt6.image").read_text())
+    del info["ps3recomp_patches"]
+    (half.parent / "gt6.image").write_text(json.dumps(info))
+    current, problems = boot_game.check_images(tree, "c1", "p1")
+    assert [c[0] for c in current] == ["aa"]
+    assert any("port-build-noimage/" in p and "no complete gt6.image" in p for p in problems)
+    assert any("port-build-half/" in p and "ps3recomp_patches" in p for p in problems)
+
+
+def test_edited_submodule_tree_makes_a_build_stale(tree):
+    """D47 (review m4): the working-tree hash must match too, when it is known."""
+    gt6 = _image(tree, "port-build", "aa", "decrypted/a.elf")
+    info = json.loads((gt6.parent / "gt6.image").read_text())
+    info["ps3recomp_tree"] = "t1"
+    (gt6.parent / "gt6.image").write_text(json.dumps(info))
+    assert boot_game.check_images(tree, "c1", "p1", "t1")[1] == []
+    _, problems = boot_game.check_images(tree, "c1", "p1", "t2")
+    assert len(problems) == 1 and "another ps3recomp working tree" in problems[0]
+
+
+def test_tree_hash_follows_edits_and_untracked_files(tmp_path):
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    subprocess.run(["git", "init", "-q", str(sub)], check=True)
+    (sub / "a.c").write_text("x\n")
+    subprocess.run(["git", "-C", str(sub), "add", "a.c"], check=True)
+    subprocess.run(["git", "-C", str(sub), "-c", "user.name=t", "-c", "user.email=t@t",
+                    "commit", "-q", "-m", "a"], check=True)
+    h0 = boot_game.ps3recomp_tree_hash(sub)
+    (sub / "a.c").write_text("y\n")
+    h1 = boot_game.ps3recomp_tree_hash(sub)
+    (sub / "new.c").write_text("z\n")
+    h2 = boot_game.ps3recomp_tree_hash(sub)
+    (sub / "__pycache__").mkdir()
+    (sub / "__pycache__" / "m.pyc").write_bytes(b"c")
+    assert len({h0, h1, h2}) == 3 and boot_game.ps3recomp_tree_hash(sub) == h2
+
+
+def test_gt6_outside_port_build_is_checked(tree, tmp_path, monkeypatch, capsys):
+    """D47 (review m4): --gt6 outside port-build* is refused when its image is stale and runs
+    with a warning when it has none."""
+    monkeypatch.setattr(boot_game, "current_patch_set", lambda: ("c1", "p1"))
+    monkeypatch.setattr(boot_game, "ps3recomp_tree_hash", lambda sub=None: "t1")
+    stale = _image(tmp_path, "elsewhere", "aa", str(boot_game.ELF_REL), patches="p0")
+    info = json.loads((stale.parent / "gt6.image").read_text())
+    info["ps3recomp_tree"] = "t1"
+    (stale.parent / "gt6.image").write_text(json.dumps(info))
+    with pytest.raises(SystemExit, match="patch set p0"):
+        boot_game.boot(stale, tree, seconds=1)
+    rep = boot_game.boot(fake("crash", tmp_path), tree, seconds=30, idle=20)
+    assert rep["unchecked_build"] and "cannot be checked" in capsys.readouterr().err
 
 
 def test_boot_refuses_a_writable_disc_layer(tree, tmp_path, monkeypatch):
