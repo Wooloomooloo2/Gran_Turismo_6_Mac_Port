@@ -1,0 +1,361 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] cellMusic: the music player's second API, with no music library
+
+Upstream: not yet submitted; written to be upstreamed (generic, no title names)
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0015)
+
+What: cellMusicUtility had no source file, so its imports took the unresolved
+path and faked CELL_OK, and a title waiting for the player's callback never
+heard back. libs/misc/cellMusic.c (new) implements the second API:
+cellMusicInitialize2 (0xBE50B11E), cellMusicFinalize2 (0x7BE4DC31),
+cellMusicSetVolume2 (0x4014C246), cellMusicGetPlaybackStatus2 (0x648B7611),
+cellMusicSelectContents2 (0xAD04CDDD), cellMusicGetSelectionContext2
+(0x8793EF97), cellMusicSetSelectionContext2 (0x2BDC5D6B) and
+cellMusicSetPlaybackCommand2 (0x98947A6E).
+
+The player plays the user's own music over a title and reports each result
+on the title's callback, cb(event, param, userData), queued for its next
+cellSysutilCheckCallback. The runtime has no music library, so the player
+starts and stops but never plays: Initialize2 checks its arguments (mode
+NORMAL, a callback, SPU priority 16-255, else PARAM) and reports
+INITIALIZE_RESULT; SelectContents2 reports SELECT_CONTENTS_RESULT CANCELED,
+as if the user closed the empty list; GetSelectionContext2 is
+NO_ACTIVE_CONTENT; SetSelectionContext2 reports INVALID_CONTEXT;
+SetPlaybackCommand2 with nothing selected fails with GENERIC, in its return
+and its event; GetPlaybackStatus2 is STOP; SetVolume2 reports its result
+(its level is in f1, which the generic handler does not read; nothing plays).
+Calls other than Initialize2 before it are GENERIC; Finalize2 reports its
+result and ends the session. Behaviour and error codes follow RPCS3 with no
+music chosen (RPCS3 keeps the callback after Finalize2).
+
+Why: a title that starts the music player at boot and waits for its
+initialise result stalled on the faked success.
+
+Test: tools/test_music2.py (new) checks the names hash to the imported NIDs,
+then builds libs/misc/tests/test_music2.c with cellMusic.c and a recording
+sysutil queue: each answer and each callback event above.
+
+diff --git a/libs/misc/cellMusic.c b/libs/misc/cellMusic.c
+new file mode 100644
+index 00000000..ab04f99d
+--- /dev/null
++++ b/libs/misc/cellMusic.c
+@@ -0,0 +1,101 @@
++/*
++ * ps3recomp - cellMusic (cellMusicUtility), the in-game music player: second API
++ *
++ * The player plays the user's own music (from the system's music library) over
++ * a title, which drives it through the cellMusic*2 calls and hears every result
++ * on its callback, cb(event, param, userData), from its next
++ * cellSysutilCheckCallback. The runtime has no music library, so the player
++ * starts and stops but never has anything to play: a content selection is
++ * cancelled (as if the user closed the list), a saved selection context names
++ * no music here (INVALID_CONTEXT), a playback command with nothing selected
++ * fails, and the status stays STOP. Behaviour and error codes follow RPCS3
++ * (cellMusic) with no music chosen.
++ */
++
++#include "cellMusic.h"
++#include "../system/cellSysutil.h"
++#include "../../runtime/ppu/ppu_memory.h"   /* vm_write32: translate + byte-swap */
++#include <stdio.h>
++
++static u32 s_func;       /* the title's callback (an OPD), 0: not initialised */
++static u32 s_userdata;
++
++static void music_event(u32 event, u32 param)
++{
++    const u64 args[8] = { event, param, s_userdata, 0, 0, 0, 0, 0 };
++    if (s_func) cellSysutilQueueGuestCallbackArgs(s_func, args);
++}
++
++/* NID 0xBE50B11E. */
++s32 cellMusicInitialize2(s32 mode, s32 spuPriority, void* func, void* userData)
++{
++    if (mode != CELL_MUSIC2_PLAYER_MODE_NORMAL || !func || spuPriority < 16 || spuPriority > 255)
++        return (s32)CELL_MUSIC2_ERROR_PARAM;
++    s_func = (u32)(uintptr_t)func;
++    s_userdata = (u32)(uintptr_t)userData;
++    printf("[cellMusic] Initialize2: no music library; nothing will play\n");
++    music_event(CELL_MUSIC2_EVENT_INITIALIZE_RESULT, CELL_OK);
++    return CELL_OK;
++}
++
++/* NID 0x7BE4DC31. */
++s32 cellMusicFinalize2(void)
++{
++    if (s_func) music_event(CELL_MUSIC2_EVENT_FINALIZE_RESULT, CELL_OK);
++    s_func = 0;
++    s_userdata = 0;
++    return CELL_OK;
++}
++
++/* cellMusicSetVolume2(float level): the level is in f1, which this generic
++ * handler does not read; nothing plays, so there is no volume to set. NID
++ * 0x4014C246. */
++s32 cellMusicSetVolume2(void)
++{
++    if (!s_func) return (s32)CELL_MUSIC2_ERROR_GENERIC;
++    music_event(CELL_MUSIC2_EVENT_SET_VOLUME_RESULT, CELL_OK);
++    return CELL_OK;
++}
++
++/* NID 0x648B7611. */
++s32 cellMusicGetPlaybackStatus2(s32* status)
++{
++    if (!status) return (s32)CELL_MUSIC2_ERROR_PARAM;
++    vm_write32((u32)(uintptr_t)status, CELL_MUSIC2_PB_STATUS_STOP);
++    return CELL_OK;
++}
++
++/* The selection list has nothing in it: the user's answer is "cancel". NID 0xAD04CDDD. */
++s32 cellMusicSelectContents2(void)
++{
++    if (!s_func) return (s32)CELL_MUSIC2_ERROR_GENERIC;
++    music_event(CELL_MUSIC2_EVENT_SELECT_CONTENTS_RESULT, CELL_MUSIC2_CANCELED);
++    return CELL_OK;
++}
++
++/* NID 0x8793EF97. */
++s32 cellMusicGetSelectionContext2(void* context)
++{
++    if (!context) return (s32)CELL_MUSIC2_ERROR_PARAM;
++    return (s32)CELL_MUSIC2_ERROR_NO_ACTIVE_CONTENT;   /* nothing has been selected */
++}
++
++/* A context the title saved earlier names music this library does not have. NID 0x2BDC5D6B. */
++s32 cellMusicSetSelectionContext2(void* context)
++{
++    if (!context) return (s32)CELL_MUSIC2_ERROR_PARAM;
++    if (!s_func) return (s32)CELL_MUSIC2_ERROR_GENERIC;
++    music_event(CELL_MUSIC2_EVENT_SET_SELECTION_CONTEXT_RESULT, CELL_MUSIC2_ERROR_INVALID_CONTEXT);
++    return CELL_OK;
++}
++
++/* STOP..FASTREVERSE; with nothing selected the command fails, now and in its result event. NID 0x98947A6E. */
++s32 cellMusicSetPlaybackCommand2(s32 command, void* param)
++{
++    (void)param;
++    if (command < CELL_MUSIC2_PB_CMD_STOP || command > CELL_MUSIC2_PB_CMD_FASTREVERSE)
++        return (s32)CELL_MUSIC2_ERROR_PARAM;
++    if (!s_func) return (s32)CELL_MUSIC2_ERROR_GENERIC;
++    music_event(CELL_MUSIC2_EVENT_SET_PLAYBACK_COMMAND_RESULT, CELL_MUSIC2_ERROR_GENERIC);
++    return (s32)CELL_MUSIC2_ERROR_GENERIC;
++}
+diff --git a/libs/misc/cellMusic.h b/libs/misc/cellMusic.h
+new file mode 100644
+index 00000000..67ad8eab
+--- /dev/null
++++ b/libs/misc/cellMusic.h
+@@ -0,0 +1,52 @@
++/*
++ * ps3recomp - cellMusic (cellMusicUtility), the in-game music player: second API
++ *
++ * The player plays the user's own music over a title. No music library is
++ * available to the runtime, so nothing is ever selected or played.
++ */
++
++#ifndef PS3RECOMP_CELL_MUSIC_H
++#define PS3RECOMP_CELL_MUSIC_H
++
++#include "ps3emu/ps3types.h"
++#include "ps3emu/error_codes.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define CELL_MUSIC2_CANCELED                1
++#define CELL_MUSIC2_ERROR_PARAM             0x8002c102u
++#define CELL_MUSIC2_ERROR_BUSY              0x8002c103u
++#define CELL_MUSIC2_ERROR_NO_ACTIVE_CONTENT 0x8002c104u
++#define CELL_MUSIC2_ERROR_INVALID_CONTEXT   0x8002c106u
++#define CELL_MUSIC2_ERROR_GENERIC           0x8002c1ffu
++
++/* Callback events: cb(event, param, userData) */
++#define CELL_MUSIC2_EVENT_STATUS_NOTIFICATION          0
++#define CELL_MUSIC2_EVENT_INITIALIZE_RESULT            1
++#define CELL_MUSIC2_EVENT_FINALIZE_RESULT              2
++#define CELL_MUSIC2_EVENT_SELECT_CONTENTS_RESULT       3
++#define CELL_MUSIC2_EVENT_SET_PLAYBACK_COMMAND_RESULT  4
++#define CELL_MUSIC2_EVENT_SET_VOLUME_RESULT            5
++#define CELL_MUSIC2_EVENT_SET_SELECTION_CONTEXT_RESULT 6
++
++#define CELL_MUSIC2_PB_CMD_STOP        0
++#define CELL_MUSIC2_PB_CMD_FASTREVERSE 6
++#define CELL_MUSIC2_PB_STATUS_STOP     0
++#define CELL_MUSIC2_PLAYER_MODE_NORMAL 0
++
++s32 cellMusicInitialize2(s32 mode, s32 spuPriority, void* func, void* userData);
++s32 cellMusicFinalize2(void);
++s32 cellMusicSetVolume2(void);
++s32 cellMusicGetPlaybackStatus2(s32* status);
++s32 cellMusicSelectContents2(void);
++s32 cellMusicGetSelectionContext2(void* context);
++s32 cellMusicSetSelectionContext2(void* context);
++s32 cellMusicSetPlaybackCommand2(s32 command, void* param);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* PS3RECOMP_CELL_MUSIC_H */
+diff --git a/libs/misc/tests/test_music2.c b/libs/misc/tests/test_music2.c
+new file mode 100644
+index 00000000..7699a60f
+--- /dev/null
++++ b/libs/misc/tests/test_music2.c
+@@ -0,0 +1,89 @@
++/*
++ * test_music2 - the cellMusic*2 calls (libs/misc/cellMusic.c).
++ *
++ * The music player plays the user's own music over a title. Every result
++ * reaches the title's callback, cb(event, param, userData), on its next
++ * cellSysutilCheckCallback. No music library is available here, so a content
++ * selection is cancelled, a selection context is refused and playback stays
++ * stopped. Behaviour and error codes follow RPCS3 (with no music chosen).
++ * Run by tools/test_music2.py.
++ */
++#include "../cellMusic.c"
++#include <assert.h>
++#include <stdlib.h>
++
++/* ppu_memory.h hooks the runtime supplies; inert here. */
++uint8_t* vm_base;
++int g_resv_store_active = 0;
++uint32_t g_ww_lo = 0, g_ww_hi = 0;
++void ppu_resv_break_store(uint64_t ea) { (void)ea; }
++int  spu_coh_is_reserved(uint32_t addr) { (void)addr; return 0; }
++void spu_lockline_lock(void) {}
++void spu_lockline_unlock(void) {}
++void spu_coh_notify_write(uint32_t addr) { (void)addr; }
++void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width) { (void)addr; (void)val; (void)width; }
++
++/* The sysutil queue: record what would reach the title's callback. */
++static u32 q_opd[16];
++static u64 q_args[16][3];
++static int q_n;
++s32 cellSysutilQueueGuestCallbackArgs(u32 opd, const u64 args[8])
++{
++    q_opd[q_n] = opd; q_args[q_n][0] = args[0]; q_args[q_n][1] = args[1]; q_args[q_n][2] = args[2];
++    q_n++;
++    return CELL_OK;
++}
++
++static int fails = 0;
++#define CHECK(c, ...) do { const int ok_ = (c); printf(ok_ ? "[PASS] " : "[FAIL] "); printf(__VA_ARGS__); \
++                           printf("\n"); if (!ok_) fails++; } while (0)
++#define CB   0x5000u
++#define UD   0x6000u
++#define OUT  0x100u
++#define CTX  0x1000u
++
++static int event_is(int i, u32 ev, u32 param)
++{
++    return i < q_n && q_opd[i] == CB && q_args[i][0] == ev && (u32)q_args[i][1] == param && q_args[i][2] == UD;
++}
++
++int main(void)
++{
++    vm_base = calloc(1, 0x10000);
++    CHECK((u32)cellMusicSetVolume2() == 0x8002c1ffu, "SetVolume2 before Initialize2 is GENERIC");
++    CHECK((u32)cellMusicInitialize2(1, 100, (void*)(uintptr_t)CB, (void*)(uintptr_t)UD) == 0x8002c102u,
++          "Initialize2: a mode other than NORMAL is PARAM");
++    CHECK((u32)cellMusicInitialize2(0, 15, (void*)(uintptr_t)CB, (void*)(uintptr_t)UD) == 0x8002c102u,
++          "Initialize2: an SPU priority under 16 is PARAM");
++    CHECK((u32)cellMusicInitialize2(0, 100, NULL, (void*)(uintptr_t)UD) == 0x8002c102u,
++          "Initialize2: no callback is PARAM");
++    CHECK(cellMusicInitialize2(0, 100, (void*)(uintptr_t)CB, (void*)(uintptr_t)UD) == CELL_OK && q_n == 1 &&
++          event_is(0, 1, CELL_OK), "Initialize2 succeeds and reports INITIALIZE_RESULT, CELL_OK");
++
++    vm_write32(OUT, 0xDEAD);
++    CHECK(cellMusicGetPlaybackStatus2((s32*)(uintptr_t)OUT) == CELL_OK && vm_read32(OUT) == 0,
++          "GetPlaybackStatus2: stopped");
++    CHECK((u32)cellMusicGetPlaybackStatus2(NULL) == 0x8002c102u, "GetPlaybackStatus2(NULL) is PARAM");
++    CHECK(cellMusicSetVolume2() == CELL_OK && event_is(1, 5, CELL_OK), "SetVolume2 reports SET_VOLUME_RESULT");
++
++    CHECK(cellMusicSelectContents2() == CELL_OK && event_is(2, 3, 1),
++          "SelectContents2: no music to choose from, SELECT_CONTENTS_RESULT CANCELED");
++    CHECK((u32)cellMusicGetSelectionContext2((void*)(uintptr_t)CTX) == 0x8002c104u,
++          "GetSelectionContext2 with nothing selected is NO_ACTIVE_CONTENT");
++    CHECK((u32)cellMusicGetSelectionContext2(NULL) == 0x8002c102u, "GetSelectionContext2(NULL) is PARAM");
++    CHECK(cellMusicSetSelectionContext2((void*)(uintptr_t)CTX) == CELL_OK && event_is(3, 6, 0x8002c106u),
++          "SetSelectionContext2 reports INVALID_CONTEXT (no such music here)");
++    CHECK((u32)cellMusicSetSelectionContext2(NULL) == 0x8002c102u, "SetSelectionContext2(NULL) is PARAM");
++
++    CHECK((u32)cellMusicSetPlaybackCommand2(7, NULL) == 0x8002c102u, "SetPlaybackCommand2: an unknown command is PARAM");
++    CHECK((u32)cellMusicSetPlaybackCommand2(1, NULL) == 0x8002c1ffu && event_is(4, 4, 0x8002c1ffu),
++          "SetPlaybackCommand2 PLAY with nothing selected fails, and says so (GENERIC)");
++    vm_write32(OUT, 0xDEAD);
++    CHECK(cellMusicGetPlaybackStatus2((s32*)(uintptr_t)OUT) == CELL_OK && vm_read32(OUT) == 0, "still stopped");
++
++    CHECK(cellMusicFinalize2() == CELL_OK && event_is(5, 2, CELL_OK), "Finalize2 reports FINALIZE_RESULT");
++    CHECK((u32)cellMusicSetVolume2() == 0x8002c1ffu, "after Finalize2 the player is not initialised");
++    if (fails) { printf("%d check(s) failed\n", fails); return 1; }
++    puts("test_music2: OK");
++    return 0;
++}
+diff --git a/tools/test_music2.py b/tools/test_music2.py
+new file mode 100644
+index 00000000..2d152c3f
+--- /dev/null
++++ b/tools/test_music2.py
+@@ -0,0 +1,57 @@
++#!/usr/bin/env python3
++"""The cellMusic*2 calls of cellMusicUtility (libs/misc/cellMusic.c).
++
++Titles import the music player's second API (cellMusicInitialize2 0xBE50B11E,
++cellMusicSetVolume2 0x4014C246, and six more). The library had no source file,
++so every one took the unresolved path and faked CELL_OK, and the title's
++callback never heard back. Checks that the names hash to the imported NIDs,
++then builds libs/misc/tests/test_music2.c, which includes cellMusic.c, and
++runs it.
++"""
++import hashlib
++import os
++import shutil
++import struct
++import subprocess
++import sys
++import tempfile
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++SUFFIX = b"\x67\x59\x65\x99\x04\x25\x04\x90\x56\x64\x27\x49\x94\x89\x74\x1A"
++NIDS = (('cellMusicInitialize2', 0xBE50B11E), ('cellMusicSetVolume2', 0x4014C246),
++        ('cellMusicFinalize2', 0x7BE4DC31), ('cellMusicGetPlaybackStatus2', 0x648B7611),
++        ('cellMusicGetSelectionContext2', 0x8793EF97), ('cellMusicSelectContents2', 0xAD04CDDD),
++        ('cellMusicSetPlaybackCommand2', 0x98947A6E), ('cellMusicSetSelectionContext2', 0x2BDC5D6B))
++
++
++def nid(name):
++    return struct.unpack('<I', hashlib.sha1(name.encode() + SUFFIX).digest()[:4])[0]
++
++
++def main():
++    fails = 0
++    for name, want in NIDS:
++        got = nid(name)
++        fails += got != want
++        print(f"[{'PASS' if got == want else 'FAIL'}] {name} hashes to 0x{got:08X} (imported as 0x{want:08X})")
++    cc = os.environ.get('CC') or shutil.which('cc') or shutil.which('gcc') or shutil.which('clang')
++    if not cc:
++        print('SKIP: no C compiler')
++        return 1 if fails else 0
++    with tempfile.TemporaryDirectory() as tmp:
++        exe = Path(tmp) / 'test_music2'
++        r = subprocess.run([cc, '-std=gnu17', '-O1', '-w', '-I' + str(ROOT / 'include'),
++                            str(ROOT / 'libs/misc/tests/test_music2.c'), '-o', str(exe)],
++                           capture_output=True, text=True)
++        if r.returncode:
++            print(r.stdout + r.stderr)
++            print('FAIL: fixture did not build')
++            return 1
++        r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=30)
++        sys.stdout.write(r.stdout + r.stderr)
++        return 1 if (fails or r.returncode) else 0
++
++
++if __name__ == '__main__':
++    sys.exit(main())
