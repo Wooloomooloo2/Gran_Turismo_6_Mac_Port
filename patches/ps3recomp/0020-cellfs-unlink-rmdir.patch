@@ -1,5 +1,5 @@
 From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
-Subject: [PATCH] cellFs: cellFsUnlink and cellFsRmdir remove for real
+Subject: [PATCH] cellFs: cellFsUnlink and cellFsRmdir remove for real, only on writable mounts
 
 Upstream: not yet submitted; written to be upstreamed (generic, no title names)
 Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
@@ -7,25 +7,44 @@ Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0019)
 
 What: runtime/ppu/ppu_fs.cpp registered cellFsUnlink (0x7F4677A8) and
 cellFsRmdir (0x2796FDF3) as handlers that answered CELL_OK and removed
-nothing. They now remove the file or the empty folder. Answers follow
-RPCS3's sys_fs_unlink and sys_fs_rmdir: a read-only device (/dev_bdvd,
-/app_home) is EROFS and a missing path ENOENT; unlink of a folder is EISDIR;
-rmdir of a file is ENOTDIR and of a folder that is not empty ENOTEMPTY.
+nothing. They now remove the file or the empty folder, confined to the
+writable mounts by an allowlist:
+- the guest path is made canonical as lv2's VFS reads it ('.' and empty
+  components dropped, '..' pops one component and stops at '/');
+- only /dev_hdd0 and /dev_hdd1 (PS3_HDD0_ROOT, PS3_HDD1_ROOT) delete. The
+  read-only mounts (/dev_bdvd, /dev_flash*, /app_home) answer EROFS, and any
+  other device, or a path with no device, ENOTMOUNTED, as an unmounted device
+  does under lv2; a relative path is ENOENT;
+- the host path is built from the mount's root (no fallback into another
+  mount), and its parent folder is resolved with realpath(): the delete
+  happens only when it lies inside the mount's resolved root, so a symlink in
+  the writable folder cannot lead outside it (EROFS). A symlink itself is
+  removed, not followed. The mount's own root is never removed (EBUSY / EISDIR).
+Other answers follow RPCS3's sys_fs_unlink and sys_fs_rmdir (behaviour only;
+no RPCS3 code): a missing path is ENOENT; unlink of a folder is EISDIR; rmdir
+of a file is ENOTDIR and of a folder that is not empty ENOTEMPTY.
 
 Why: a title that installs data by writing new files and deleting the old
 ones, or that deletes a marker telling its next boot an install is
 unfinished, found everything still there. One first-run install made over
-10,000 unlink and 1,000 rmdir calls, all of them faked.
+10,000 unlink and 1,000 rmdir calls, all of them faked. host_path() maps
+every unknown device and unnormalised '..' into the VFS root, and falls back
+from a missing USRDIR file to the disc's, so a delete through it could remove
+files from the read-only disc image; the allowlist stops that.
 
 Test: runtime/ppu/tests/test_fs_imports.cpp (run by
-tools/test_ppu_fs_imports.py) gains the cases above on a scratch /dev_hdd0
-(PS3_HDD0_ROOT). Each call is run once, before it is checked.
+tools/test_ppu_fs_imports.py) gains the cases above on scratch /dev_hdd0 and
+/dev_hdd1 folders: the error answers, real removal, '..' escapes into the
+disc and to a device-less path, a symlink escape, /host_root, /dev_usb000,
+/dev_flash, /app_home, a relative path, the USRDIR fallback (the disc file is
+kept), the mount root, and a canonical '.'/'..' path inside /dev_hdd0. Each
+call is run once, before it is checked.
 
 diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
-index decac7e1..caebfd51 100644
+index decac7e..b96e688 100644
 --- a/runtime/ppu/ppu_fs.cpp
 +++ b/runtime/ppu/ppu_fs.cpp
-@@ -858,8 +858,45 @@ static void cellFsMkdir(ppu_context* ctx)
+@@ -858,8 +858,124 @@ static void cellFsMkdir(ppu_context* ctx)
      if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] mkdir '%s' -> '%s' (%s)\n", gpath, hpath, r == 0 ? "OK" : "FAIL");
      ctx->gpr[3] = CELL_OK;   /* existing dir is benign for boot */
  }
@@ -34,24 +53,103 @@ index decac7e1..caebfd51 100644
 +/* cellFsUnlink(path) and cellFsRmdir(path) remove for real; they answered
 + * CELL_OK and removed nothing, so a title that installs by writing a new file
 + * and deleting the old one (or a marker telling its next boot the install is
-+ * unfinished) found everything still there. Answers follow RPCS3's
-+ * sys_fs_unlink / sys_fs_rmdir: a read-only device (/dev_bdvd, /app_home) is
-+ * EROFS, a missing path ENOENT; unlink of a directory is EISDIR, rmdir of a
-+ * file ENOTDIR and of a non-empty directory ENOTEMPTY. */
++ * unfinished) found everything still there.
++ *
++ * Deletes are confined to the writable mounts by an allowlist, because the
++ * other mounts resolve into host folders that must never lose a file (the
++ * disc image, a firmware tree):
++ *   - the guest path is made canonical the way lv2's VFS reads it ('.' and
++ *     empty components dropped, '..' pops one component and stops at '/');
++ *   - only /dev_hdd0/... and /dev_hdd1/... (PS3_HDD0_ROOT, PS3_HDD1_ROOT) may
++ *     delete; the read-only mounts (/dev_bdvd, /dev_flash*, /app_home) answer
++ *     EROFS and every other device (or a path with no device) ENOTMOUNTED, as
++ *     an unmounted device does under lv2 (RPCS3's behaviour; no RPCS3 code);
++ *   - the host path is built from the mount's root directly (no fallback into
++ *     other mounts) and its parent folder is resolved with realpath(): the
++ *     delete happens only when that lies inside the mount's resolved root, so
++ *     a symlink inside the writable folder cannot reach outside it (EROFS).
++ * Answers otherwise follow RPCS3's sys_fs_unlink / sys_fs_rmdir: a missing path
++ * is ENOENT; unlink of a directory is EISDIR, rmdir of a file ENOTDIR and of a
++ * non-empty directory ENOTEMPTY. The mount's own root is never removed. */
 +#define CELL_FS_ENOTDIR    (int32_t)0x8001002Eu
 +#define CELL_FS_EROFS      (int32_t)0x80010026u
 +#define CELL_FS_ENOTEMPTY  (int32_t)0x80010036u
-+static bool fs_read_only_device(const char* g)
++#define CELL_FS_ENOTMOUNTED (int32_t)0x8001003Au
++#define CELL_FS_EBUSY      (int32_t)0x8001000Au
++/* lv2's reading of a guest path: '.' and empty components dropped, '..' pops
++ * one component (never above '/'). false for a path that is not absolute or
++ * does not fit. */
++static bool fs_canonical(const char* g, char* out, size_t cap)
 +{
-+    return strncmp(g, "/dev_bdvd", 9) == 0 || strncmp(g, "/app_home", 9) == 0;
++    if (!g || g[0] != '/' || cap < 2) return false;
++    size_t len = 0;
++    out[0] = 0;
++    const char* p = g;
++    while (*p) {
++        while (*p == '/') p++;
++        const char* e = p;
++        while (*e && *e != '/') e++;
++        const size_t n = (size_t)(e - p);
++        if (n == 0 || (n == 1 && p[0] == '.')) { p = e; continue; }
++        if (n == 2 && p[0] == '.' && p[1] == '.') {
++            while (len > 0 && out[len - 1] != '/') len--;
++            if (len > 0) len--;            /* drop the '/' too */
++            out[len] = 0;
++            p = e; continue;
++        }
++        if (len + 1 + n + 1 > cap) return false;
++        out[len++] = '/';
++        memcpy(out + len, p, n); len += n; out[len] = 0;
++        p = e;
++    }
++    if (len == 0) { out[0] = '/'; out[1] = 0; }
++    return true;
++}
++static bool fs_on_device(const char* v, const char* dev)
++{
++    const size_t n = strlen(dev);
++    return strncmp(v, dev, n) == 0 && (v[n] == 0 || v[n] == '/');
++}
++static bool fs_resolve(const char* in, char* out)
++{
++#ifdef _WIN32
++    return _fullpath(out, in, 1100) != nullptr;
++#else
++    return realpath(in, out) != nullptr;
++#endif
 +}
 +static int32_t fs_remove(const char* gpath, bool dir)
 +{
-+    char hpath[1100];
-+    host_path(hpath, sizeof hpath, gpath);
++    char v[1024];
++    if (!fs_canonical(gpath, v, sizeof v)) return CELL_FS_ENOENT;
++    const char* root = nullptr;
++    const char* rest = nullptr;
++    if (fs_on_device(v, "/dev_hdd0"))      { root = getenv("PS3_HDD0_ROOT"); rest = v + 9; }
++    else if (fs_on_device(v, "/dev_hdd1")) { root = getenv("PS3_HDD1_ROOT"); rest = v + 9; }
++    else if (fs_on_device(v, "/dev_bdvd") || fs_on_device(v, "/app_home") ||
++             strncmp(v, "/dev_flash", 10) == 0)
++        return CELL_FS_EROFS;
++    else
++        return CELL_FS_ENOTMOUNTED;
++    if (!root || !*root) return CELL_FS_ENOTMOUNTED;
++    if (*rest == 0) return dir ? CELL_FS_EBUSY : CELL_FS_EISDIR;   /* the mount itself */
++
++    char croot[1100], hparent[1100], cparent[1100], hpath[2300];
++    if (!fs_resolve(root, croot)) return CELL_FS_ENOTMOUNTED;
++    const char* name = strrchr(rest, '/') + 1;   /* rest starts with '/', canonical: no '.'/'..' */
++    snprintf(hparent, sizeof hparent, "%s/%.*s", root, (int)(name - rest), rest);
++    if (!fs_resolve(hparent, cparent)) return errno == ENOTDIR ? CELL_FS_ENOTDIR : CELL_FS_ENOENT;
++    const size_t rl = strlen(croot);
++    if (strncmp(cparent, croot, rl) != 0 || (cparent[rl] != 0 && cparent[rl] != '/'))
++        return CELL_FS_EROFS;                    /* a symlink led out of the writable folder */
++    snprintf(hpath, sizeof hpath, "%s/%s", cparent, name);
++
 +    struct stat st;
-+    if (fs_read_only_device(gpath)) return CELL_FS_EROFS;
++#ifdef _WIN32
 +    if (stat(hpath, &st) != 0) return errno == ENOTDIR ? CELL_FS_ENOTDIR : CELL_FS_ENOENT;
++#else
++    if (lstat(hpath, &st) != 0) return errno == ENOTDIR ? CELL_FS_ENOTDIR : CELL_FS_ENOENT;   /* a symlink is removed, not followed */
++#endif
 +    if (!dir && S_ISDIR(st.st_mode)) return CELL_FS_EISDIR;
 +    if (dir && !S_ISDIR(st.st_mode)) return CELL_FS_ENOTDIR;
 +    if ((dir ? rmdir(hpath) : unlink(hpath)) == 0) return CELL_OK;
@@ -74,21 +172,42 @@ index decac7e1..caebfd51 100644
  {
      int fd = (int)(uint32_t)ctx->gpr[3];
 diff --git a/runtime/ppu/tests/test_fs_imports.cpp b/runtime/ppu/tests/test_fs_imports.cpp
-index 02a13b2a..ba288ab3 100644
+index 02a13b2..402fa5c 100644
 --- a/runtime/ppu/tests/test_fs_imports.cpp
 +++ b/runtime/ppu/tests/test_fs_imports.cpp
-@@ -9,7 +9,9 @@
+@@ -9,7 +9,11 @@
   *   - cellFsGetFreeSize writes a block size and a non-zero free block count
   *     (both big-endian) and returns CELL_OK;
   *   - cellFsChmod and cellFsUtime return CELL_OK;
 - *   - cellFsSdataOpenByFd returns CELL_ENOSYS instead of a silent CELL_OK.
 + *   - cellFsSdataOpenByFd returns CELL_ENOSYS instead of a silent CELL_OK;
 + *   - cellFsUnlink and cellFsRmdir remove for real, with RPCS3's answers
-+ *     (ENOENT, EISDIR, ENOTDIR, ENOTEMPTY, EROFS on /dev_bdvd).
++ *     (ENOENT, EISDIR, ENOTDIR, ENOTEMPTY, EROFS on /dev_bdvd), and only inside
++ *     /dev_hdd0 and /dev_hdd1: '..' and symlink escapes, other devices and
++ *     device-less paths, and the USRDIR fallback into the disc never delete.
   *
   * Driven by tools/test_ppu_fs_imports.py (writes the stub ppu_recomp.h).
   */
-@@ -87,6 +89,45 @@ int main()
+@@ -23,7 +27,17 @@ uint32_t ppu_vm_size = 0;
+ void vm_write32(uint64_t a, uint32_t v) { uint32_t be = __builtin_bswap32(v); memcpy(vm_base + a, &be, 4); }
+ void vm_write64(uint64_t a, uint64_t v) { uint64_t be = __builtin_bswap64(v); memcpy(vm_base + a, &be, 8); }
+ void ppu_guest_caller(char* out, size_t n) { if (n) out[0] = 0; }
+-void ps3_vfs_ps3game_fallback(char* path, size_t cap) { (void)path; (void)cap; }
++/* As sys_fs.c's fallback: a missing .../USRDIR/<x> becomes <vfs root>/PS3_GAME/USRDIR/<x>
++ * when that exists. Deletes must never take it. */
++void ps3_vfs_ps3game_fallback(char* path, size_t cap)
++{
++    struct stat st;
++    const char* u = strstr(path, "/USRDIR/");
++    if (!u || stat(path, &st) == 0 || !ppu_vfs_root) return;
++    char alt[1100];
++    snprintf(alt, sizeof alt, "%s/PS3_GAME/USRDIR/%s", ppu_vfs_root, u + 8);
++    if (stat(alt, &st) == 0) snprintf(path, cap, "%s", alt);
++}
+ void ydkj_host_bt(const char* tag) { (void)tag; }
+ }
+ ps3_guest_caller_fn g_ps3_guest_caller = nullptr;
+@@ -87,6 +101,118 @@ int main()
          f(&ctx);
          CHECK((uint32_t)ctx.gpr[3] == r.ret, "%s returns 0x%08X (want 0x%08X)", r.name, (uint32_t)ctx.gpr[3], r.ret);
      }
@@ -130,6 +249,79 @@ index 02a13b2a..ba288ab3 100644
 +            r = call(rm, "/dev_hdd0/e");      CHECK(r == 0, "rmdir of a second empty directory (0x%08X)", r);
 +        }
 +        rmdir(root);
++    }
++    /* Deletes are confined to the writable mounts: canonical guest path, an allowlist of
++     * /dev_hdd0 and /dev_hdd1, and the resolved parent inside the mount's resolved root. */
++    {
++        char base[512];
++        const char* tmp = getenv("TMPDIR");
++        snprintf(base, sizeof base, "%s/ps3recomp-fs-guard-XXXXXX", tmp && *tmp ? tmp : "/tmp");
++        const bool made = mkdtemp(base) != nullptr;
++        CHECK(made, "scratch folder (guard)");
++        char hdd0[600], hdd1[600], bdvd[600], outside[600], p[900];
++        snprintf(hdd0, sizeof hdd0, "%s/hdd0", base);       mkdir(hdd0, 0755);
++        snprintf(hdd1, sizeof hdd1, "%s/hdd1", base);       mkdir(hdd1, 0755);
++        snprintf(bdvd, sizeof bdvd, "%s/bdvd", base);       mkdir(bdvd, 0755);
++        snprintf(outside, sizeof outside, "%s/outside", base); mkdir(outside, 0755);
++        setenv("PS3_HDD0_ROOT", hdd0, 1);
++        setenv("PS3_HDD1_ROOT", hdd1, 1);
++        static char vfs[600];
++        snprintf(vfs, sizeof vfs, "%s", bdvd);
++        ppu_vfs_root = vfs;
++        auto touch = [&](const char* rel) { snprintf(p, sizeof p, "%s/%s", base, rel); FILE* f = fopen(p, "w"); if (f) fclose(f); };
++        auto exists = [&](const char* rel) { struct stat st; snprintf(p, sizeof p, "%s/%s", base, rel); return lstat(p, &st) == 0; };
++        snprintf(p, sizeof p, "%s/PS3_GAME", bdvd);            mkdir(p, 0755);
++        snprintf(p, sizeof p, "%s/PS3_GAME/USRDIR", bdvd);     mkdir(p, 0755);
++        touch("bdvd/PS3_GAME/USRDIR/keep");
++        touch("bdvd/x");
++        touch("outside/f");
++        snprintf(p, sizeof p, "%s/link", hdd0);
++        const bool linked = symlink(outside, p) == 0;
++        CHECK(linked, "symlink out of /dev_hdd0");
++        snprintf(p, sizeof p, "%s/game", hdd0);                mkdir(p, 0755);
++        snprintf(p, sizeof p, "%s/game/T/", hdd0);             mkdir(p, 0755);
++        snprintf(p, sizeof p, "%s/game/T/USRDIR", hdd0);       mkdir(p, 0755);
++        touch("hdd1/c");
++        touch("hdd0/game/T/USRDIR/mine");
++        auto un = find(0x7F4677A8u), rm = find(0x2796FDF3u);
++        auto call = [&](void (*f)(ppu_context*), const char* g) {
++            memset(&ctx, 0, sizeof ctx); strcpy((char*)mem + 0x300, g); ctx.gpr[3] = 0x300; f(&ctx);
++            return (uint32_t)ctx.gpr[3];
++        };
++        if (un && rm) {
++            uint32_t r;
++            r = call(un, "/dev_hdd0/../../dev_bdvd/x");
++            CHECK(r == 0x80010026u && exists("bdvd/x"), "'..' out of /dev_hdd0 into /dev_bdvd is EROFS, file kept (0x%08X)", r);
++            r = call(un, "/dev_hdd0/../x");
++            CHECK(r == 0x8001003Au && exists("bdvd/x"), "'..' to a device-less path is ENOTMOUNTED, file kept (0x%08X)", r);
++            r = call(un, "/dev_hdd0/link/f");
++            CHECK(r == 0x80010026u && exists("outside/f"), "a symlink out of /dev_hdd0 is EROFS, target kept (0x%08X)", r);
++            r = call(un, "/host_root/x");
++            CHECK(r == 0x8001003Au && exists("bdvd/x"), "/host_root is ENOTMOUNTED, file kept (0x%08X)", r);
++            r = call(un, "/dev_usb000/x");
++            CHECK(r == 0x8001003Au && exists("bdvd/x"), "/dev_usb000 is ENOTMOUNTED, file kept (0x%08X)", r);
++            r = call(un, "/x");
++            CHECK(r == 0x8001003Au && exists("bdvd/x"), "a device-less path is ENOTMOUNTED, file kept (0x%08X)", r);
++            r = call(un, "x");
++            CHECK(r == 0x80010006u && exists("bdvd/x"), "a relative path is ENOENT, file kept (0x%08X)", r);
++            r = call(un, "/dev_flash/sys/x");
++            CHECK(r == 0x80010026u, "/dev_flash is EROFS (0x%08X)", r);
++            r = call(un, "/app_home/x");
++            CHECK(r == 0x80010026u && exists("bdvd/x"), "/app_home is EROFS (0x%08X)", r);
++            r = call(un, "/dev_hdd0/game/T/USRDIR/keep");
++            CHECK(r == 0x80010006u && exists("bdvd/PS3_GAME/USRDIR/keep"),
++                  "a missing /dev_hdd0 USRDIR file is ENOENT; the disc file it would fall back to is kept (0x%08X)", r);
++            r = call(rm, "/dev_hdd0");
++            CHECK(r == 0x8001000Au && exists("hdd0"), "rmdir of the /dev_hdd0 mount itself is EBUSY (0x%08X)", r);
++            r = call(un, "/dev_hdd0/./game/../game/T/USRDIR/mine");
++            CHECK(r == 0 && !exists("hdd0/game/T/USRDIR/mine"), "a canonical path inside /dev_hdd0 deletes (0x%08X)", r);
++            r = call(un, "/dev_hdd1/c");
++            CHECK(r == 0 && !exists("hdd1/c"), "/dev_hdd1 deletes (0x%08X)", r);
++            r = call(un, "/dev_hdd0/link");
++            CHECK(r == 0 && !exists("hdd0/link") && exists("outside/f"), "unlink of the symlink removes the link only (0x%08X)", r);
++        }
++        snprintf(p, sizeof p, "rm -rf '%s'", base);
++        (void)!system(p);
 +    }
      printf("%s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
      return fails ? 1 : 0;
