@@ -1,0 +1,136 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] cellFs: cellFsUnlink and cellFsRmdir remove for real
+
+Upstream: not yet submitted; written to be upstreamed (generic, no title names)
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0019)
+
+What: runtime/ppu/ppu_fs.cpp registered cellFsUnlink (0x7F4677A8) and
+cellFsRmdir (0x2796FDF3) as handlers that answered CELL_OK and removed
+nothing. They now remove the file or the empty folder. Answers follow
+RPCS3's sys_fs_unlink and sys_fs_rmdir: a read-only device (/dev_bdvd,
+/app_home) is EROFS and a missing path ENOENT; unlink of a folder is EISDIR;
+rmdir of a file is ENOTDIR and of a folder that is not empty ENOTEMPTY.
+
+Why: a title that installs data by writing new files and deleting the old
+ones, or that deletes a marker telling its next boot an install is
+unfinished, found everything still there. One first-run install made over
+10,000 unlink and 1,000 rmdir calls, all of them faked.
+
+Test: runtime/ppu/tests/test_fs_imports.cpp (run by
+tools/test_ppu_fs_imports.py) gains the cases above on a scratch /dev_hdd0
+(PS3_HDD0_ROOT). Each call is run once, before it is checked.
+
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+index decac7e1..caebfd51 100644
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -858,8 +858,45 @@ static void cellFsMkdir(ppu_context* ctx)
+     if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] mkdir '%s' -> '%s' (%s)\n", gpath, hpath, r == 0 ? "OK" : "FAIL");
+     ctx->gpr[3] = CELL_OK;   /* existing dir is benign for boot */
+ }
+-static void cellFsRmdir(ppu_context* ctx)  { ctx->gpr[3] = CELL_OK; }
+-static void cellFsUnlink(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
++/* cellFsUnlink(path) and cellFsRmdir(path) remove for real; they answered
++ * CELL_OK and removed nothing, so a title that installs by writing a new file
++ * and deleting the old one (or a marker telling its next boot the install is
++ * unfinished) found everything still there. Answers follow RPCS3's
++ * sys_fs_unlink / sys_fs_rmdir: a read-only device (/dev_bdvd, /app_home) is
++ * EROFS, a missing path ENOENT; unlink of a directory is EISDIR, rmdir of a
++ * file ENOTDIR and of a non-empty directory ENOTEMPTY. */
++#define CELL_FS_ENOTDIR    (int32_t)0x8001002Eu
++#define CELL_FS_EROFS      (int32_t)0x80010026u
++#define CELL_FS_ENOTEMPTY  (int32_t)0x80010036u
++static bool fs_read_only_device(const char* g)
++{
++    return strncmp(g, "/dev_bdvd", 9) == 0 || strncmp(g, "/app_home", 9) == 0;
++}
++static int32_t fs_remove(const char* gpath, bool dir)
++{
++    char hpath[1100];
++    host_path(hpath, sizeof hpath, gpath);
++    struct stat st;
++    if (fs_read_only_device(gpath)) return CELL_FS_EROFS;
++    if (stat(hpath, &st) != 0) return errno == ENOTDIR ? CELL_FS_ENOTDIR : CELL_FS_ENOENT;
++    if (!dir && S_ISDIR(st.st_mode)) return CELL_FS_EISDIR;
++    if (dir && !S_ISDIR(st.st_mode)) return CELL_FS_ENOTDIR;
++    if ((dir ? rmdir(hpath) : unlink(hpath)) == 0) return CELL_OK;
++    if (errno == ENOENT) return CELL_FS_ENOENT;
++    if (errno == ENOTEMPTY || errno == EEXIST) return CELL_FS_ENOTEMPTY;
++    if (errno == ENOTDIR) return CELL_FS_ENOTDIR;
++    return CELL_FS_EIO;
++}
++static void fs_remove_call(ppu_context* ctx, bool dir)
++{
++    char gpath[1024];
++    guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
++    const int32_t rc = fs_remove(gpath, dir);
++    if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] %s '%s' -> 0x%08X\n", dir ? "rmdir" : "unlink", gpath, (uint32_t)rc);
++    ctx->gpr[3] = (uint64_t)(int64_t)rc;
++}
++static void cellFsRmdir(ppu_context* ctx)  { fs_remove_call(ctx, true); }
++static void cellFsUnlink(ppu_context* ctx) { fs_remove_call(ctx, false); }
+ static void cellFsFsync(ppu_context* ctx)
+ {
+     int fd = (int)(uint32_t)ctx->gpr[3];
+diff --git a/runtime/ppu/tests/test_fs_imports.cpp b/runtime/ppu/tests/test_fs_imports.cpp
+index 02a13b2a..ba288ab3 100644
+--- a/runtime/ppu/tests/test_fs_imports.cpp
++++ b/runtime/ppu/tests/test_fs_imports.cpp
+@@ -9,7 +9,9 @@
+  *   - cellFsGetFreeSize writes a block size and a non-zero free block count
+  *     (both big-endian) and returns CELL_OK;
+  *   - cellFsChmod and cellFsUtime return CELL_OK;
+- *   - cellFsSdataOpenByFd returns CELL_ENOSYS instead of a silent CELL_OK.
++ *   - cellFsSdataOpenByFd returns CELL_ENOSYS instead of a silent CELL_OK;
++ *   - cellFsUnlink and cellFsRmdir remove for real, with RPCS3's answers
++ *     (ENOENT, EISDIR, ENOTDIR, ENOTEMPTY, EROFS on /dev_bdvd).
+  *
+  * Driven by tools/test_ppu_fs_imports.py (writes the stub ppu_recomp.h).
+  */
+@@ -87,6 +89,45 @@ int main()
+         f(&ctx);
+         CHECK((uint32_t)ctx.gpr[3] == r.ret, "%s returns 0x%08X (want 0x%08X)", r.name, (uint32_t)ctx.gpr[3], r.ret);
+     }
++    /* cellFsUnlink / cellFsRmdir on a scratch /dev_hdd0 (PS3_HDD0_ROOT, read on first use). */
++    {
++        char root[512];
++        const char* tmp = getenv("TMPDIR");
++        snprintf(root, sizeof root, "%s/ps3recomp-fs-rm-XXXXXX", tmp && *tmp ? tmp : "/tmp");
++        const bool made = mkdtemp(root) != nullptr;
++        CHECK(made, "scratch folder");
++        setenv("PS3_HDD0_ROOT", root, 1);
++        char p[700];
++        snprintf(p, sizeof p, "%s/d", root);         mkdir(p, 0755);
++        snprintf(p, sizeof p, "%s/d/f", root);       fclose(fopen(p, "w"));
++        snprintf(p, sizeof p, "%s/e", root);         mkdir(p, 0755);
++        const uint32_t NID_UNLINK = 0x7F4677A8u, NID_RMDIR = 0x2796FDF3u;
++        CHECK(ps3_compute_nid("cellFsUnlink") == NID_UNLINK && ps3_compute_nid("cellFsRmdir") == NID_RMDIR,
++              "cellFsUnlink / cellFsRmdir NIDs");
++        auto un = find(NID_UNLINK), rm = find(NID_RMDIR);
++        auto call = [&](void (*f)(ppu_context*), const char* g) {
++            memset(&ctx, 0, sizeof ctx); strcpy((char*)mem + 0x300, g); ctx.gpr[3] = 0x300; f(&ctx);
++            return (uint32_t)ctx.gpr[3];
++        };
++        if (un && rm) {   /* CHECK evaluates its condition twice: each call runs once, first */
++            struct stat st;
++            uint32_t r;
++            r = call(rm, "/dev_hdd0/d");      CHECK(r == 0x80010036u, "rmdir of a non-empty directory is ENOTEMPTY (0x%08X)", r);
++            r = call(rm, "/dev_hdd0/d/f");    CHECK(r == 0x8001002Eu, "rmdir of a file is ENOTDIR (0x%08X)", r);
++            r = call(un, "/dev_hdd0/d");      CHECK(r == 0x80010012u, "unlink of a directory is EISDIR (0x%08X)", r);
++            snprintf(p, sizeof p, "%s/d/f", root);
++            r = call(un, "/dev_hdd0/d/f");    const int gone_f = stat(p, &st) != 0;
++            CHECK(r == 0 && gone_f, "unlink removes the file (0x%08X)", r);
++            r = call(un, "/dev_hdd0/d/f");    CHECK(r == 0x80010006u, "unlink of a missing file is ENOENT (0x%08X)", r);
++            snprintf(p, sizeof p, "%s/d", root);
++            r = call(rm, "/dev_hdd0/d");      const int gone_d = stat(p, &st) != 0;
++            CHECK(r == 0 && gone_d, "rmdir removes the empty directory (0x%08X)", r);
++            r = call(rm, "/dev_hdd0/d");      CHECK(r == 0x80010006u, "rmdir of a missing directory is ENOENT (0x%08X)", r);
++            r = call(un, "/dev_bdvd/PS3_GAME/PARAM.SFO"); CHECK(r == 0x80010026u, "unlink on /dev_bdvd is EROFS (0x%08X)", r);
++            r = call(rm, "/dev_hdd0/e");      CHECK(r == 0, "rmdir of a second empty directory (0x%08X)", r);
++        }
++        rmdir(root);
++    }
+     printf("%s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
+     return fails ? 1 : 0;
+ }
