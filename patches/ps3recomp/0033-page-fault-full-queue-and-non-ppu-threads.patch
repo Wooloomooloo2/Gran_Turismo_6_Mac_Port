@@ -7,7 +7,7 @@ Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0032)
 
 What (fixes to 0029, from its review):
 - A fault whose event the queue refuses (full) waits and sends again every
-  1 ms, as lv2 does (RPCS3 Thread.cpp retries the same way; no code taken).
+  1 ms, as RPCS3 models lv2 (Thread.cpp; the 1 ms interval is RPCS3's choice; no code taken).
   Before, the page was committed as zeros and never paged in for anyone. A
   queue that no longer exists stops the process with the page named.
 - A thread with no guest PPU identity of its own (an SPU worker, an HLE host

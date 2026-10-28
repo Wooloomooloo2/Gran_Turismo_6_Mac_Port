@@ -1,0 +1,466 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] page-fault waits detach and report, a destroyed queue is forgotten; 337 answers a refused map; Verify's marks order; Open2's checks
+
+Upstream: not yet submitted; written to be upstreamed (generic, no title names)
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0034)
+
+What (fixes to 0029, 0033 and 0034, from their review, M-1 to M-6 and M-8):
+- M-1: a host thread (no PPU identity) that goes on because the page was
+  mapped for another thread leaves its slot "detached" until the pager's 57
+  for its own still-queued event arrives, so that 57 answers CELL_OK as lv2
+  answers it for a suspended thread (it answered EINVAL). A detached slot is
+  taken first: its event was sent first.
+- M-2: a thread waiting on a page fault prints a "still waiting" line every
+  5 s, for PPU and host threads.
+- M-4: sys_event_queue_destroy tells the page-fault areas (through a hook
+  sys_mmapper_pf.c sets, so builds without it still link); an area whose
+  queue is gone stops the process on its next fault instead of sending the
+  event to a queue that reused the id. lv2 disconnects the notification's
+  event port.
+- M-5: 337 (search_and_map) answers ps3_mm_map's error instead of OK.
+- M-3: cellPamfVerify also refuses an unknown block that starts before the
+  end of the marks (libpamf's order check, as RPCS3 models it; an unknown
+  offset of 0 with marks set is refused too).
+- M-6: cellDmuxOpen2 checks the callback function and each field of the
+  CellDmuxResource or CellDmuxResourceEx it carries, as libdmux does.
+- M-8: the 1 ms retry interval is named as RPCS3's choice.
+Behaviour reference: RPCS3 sys_mmapper.cpp, Thread.cpp, cellPamf.cpp and
+cellDmux.cpp (GPL-2.0, read only, no code from them).
+Tests: tests/test_mmapper_page_fault.c (PPU-served-first ordering, a
+destroyed queue whose id is reused), tools/test_loader_memory_domain.py (a
+refused map), tests/test_pamf_header_dmux.c (marks order, Open2).
+
+diff --git a/libs/codec/cellDmux.c b/libs/codec/cellDmux.c
+index 60272bd7..619aad70 100644
+--- a/libs/codec/cellDmux.c
++++ b/libs/codec/cellDmux.c
+@@ -94,12 +94,22 @@ s32 cellDmuxOpenEx(u32 demuxerType, u32 demuxerResourceEx, u32 demuxerCb, u32 de
+     return (s32)CELL_DMUX_ERROR_FATAL;
+ }
+ 
+-/* CellDmuxResource2: isResourceEx (b8) 0, then the resource; checked only for
+- * presence here. */
++/* CellDmuxResource2: isResourceEx (b8) at 0, then at 4 either a
++ * CellDmuxResource (memAddr 0, memSize 4, ppuThreadPriority 8,
++ * ppuThreadStackSize 0xC, ...) or a CellDmuxResourceEx (as above). Checked
++ * as libdmux does (review M-6): the callback function too, and each field of
++ * whichever resource it carries. */
+ s32 cellDmuxOpen2(u32 demuxerType2, u32 demuxerResource2, u32 demuxerCb, u32 demuxerHandle)
+ {
+     if (!demuxerType2 || vm_read32(demuxerType2) != DMUX_STREAM_TYPE_PAMF ||
+-        !demuxerResource2 || !demuxerCb || !demuxerHandle)
++        !demuxerResource2 || !demuxerCb || !vm_read32(demuxerCb) || !demuxerHandle)
++        return (s32)CELL_DMUX_ERROR_ARG;
++    const u32 r = demuxerResource2 + 4;
++    if (!vm_read32(r) || vm_read32(r + 4) == 0xFFFFFFFFu || vm_read32(r + 0xC) == 0xFFFFFFFFu)
++        return (s32)CELL_DMUX_ERROR_ARG;
++    if (vm_read8(demuxerResource2) &&
++        (!vm_read32(r + 0x10) || vm_read32(r + 0x1C) == 0 ||
++         ((((u64)vm_read32(r + 0x14) << 32) | vm_read32(r + 0x18)) & 0xF0F0F0F0F0F0F0F0ull) != 0))
+         return (s32)CELL_DMUX_ERROR_ARG;
+     printf("[cellDmux] Open2: no PAMF demuxer core -> FATAL\n");
+     return (s32)CELL_DMUX_ERROR_FATAL;
+diff --git a/libs/codec/cellPamf.c b/libs/codec/cellPamf.c
+index 5a8017e8..1ae63c3b 100644
+--- a/libs/codec/cellPamf.c
++++ b/libs/codec/cellPamf.c
+@@ -599,6 +599,7 @@ s32 cellPamfVerify(u32 pAddr, u64 fileSize)
+         const u64 seq_end = PAMF_SEQ_INFO + 4u + (u64)vm_read32(pAddr + PAMF_SEQ_INFO);
+         if ((mo == 0) != (ms == 0) || (mo && hs < (u64)mo + ms) ||
+             (uo == 0) != (us == 0) || (uo && hs < (u64)uo + us) ||
++            (u64)uo < (u64)mo + ms ||   /* the unknown block follows the marks (review M-3) */
+             seq_end > hs)
+             rc = (s32)CELL_PAMF_ERROR_INVALID_PAMF;
+     }
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index f661b2fa..e5c77734 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -3407,7 +3407,16 @@ extern "C" void lv2_syscall(ppu_context* ctx)
+          * which the 1 MB default was used, keeps no record). */
+         if (size == ps3_mmapper_block_size(mem_id)) {
+             extern int32_t ps3_mm_map(uint32_t addr, uint32_t mem_id);   /* extern "C" above */
+-            (void)ps3_mm_map(va, mem_id);
++            /* A refused map (the object is already mapped inside a page-fault
++             * area, or a page there is taken) is answered, not hidden: the
++             * block's pages would stay unmapped (review M-5). */
++            int32_t mrc = ps3_mm_map(va, mem_id);
++            if (mrc != CELL_OK) {
++                fprintf(stderr, "[mmapper] 337 search_and_map: mapping object 0x%X at 0x%08X refused (0x%08X)\n",
++                        mem_id, va, (uint32_t)mrc);
++                ctx->gpr[3] = (uint64_t)(int64_t)mrc;
++                return;
++            }
+         }
+         if (outp) vm_write32(outp, va);
+         ctx->gpr[3] = 0;
+diff --git a/runtime/syscalls/sys_event.c b/runtime/syscalls/sys_event.c
+index 948369ce..0b2ffe14 100644
+--- a/runtime/syscalls/sys_event.c
++++ b/runtime/syscalls/sys_event.c
+@@ -10,7 +10,7 @@
+ #include "../spu/spu_workload.h"   /* spu_elf_image_size, spu_workload_dispatch_async */
+ #include <string.h>
+ #include <stdlib.h>               /* getenv */
+-#include "ps3emu/log_first.h"
++#include "ps3emu/log_first.h"
+ 
+ /* Recorded by sys_spu_thread_initialize (lv2_register.c): the SPURS kernel
+  * context EA the title's SPU task runtime is dispatched against. */
+@@ -237,6 +237,9 @@ int64_t sys_event_queue_create(ppu_context* ctx)
+     return CELL_OK;
+ }
+ 
++/* Set by sys_mmapper_pf.c (327) so a page-fault area forgets a destroyed queue. */
++void (*g_evt_queue_destroy_hook)(uint32_t queue_id);
++
+ int64_t sys_event_queue_destroy(ppu_context* ctx)
+ {
+     uint32_t queue_id = LV2_ARG_U32(ctx, 0);
+@@ -279,6 +282,7 @@ int64_t sys_event_queue_destroy(ppu_context* ctx)
+     q->active = 0;
+     q->cancelled = 1;
+     q->count = 0;
++    if (g_evt_queue_destroy_hook) g_evt_queue_destroy_hook(queue_id);   /* page-fault areas (sys_mmapper_pf.c) */
+ #ifdef _WIN32
+     WakeAllConditionVariable(&q->not_empty);
+     LeaveCriticalSection(&q->lock);
+diff --git a/runtime/syscalls/sys_mmapper_pf.c b/runtime/syscalls/sys_mmapper_pf.c
+index 4b90948d..ebb4dc6d 100644
+--- a/runtime/syscalls/sys_mmapper_pf.c
++++ b/runtime/syscalls/sys_mmapper_pf.c
+@@ -38,8 +38,10 @@
+  * here the fault goes to the pager as a PPU fault under an id of the host
+  * thread's own (0x7FFE0001 on), and the thread waits until the page is mapped
+  * or that id is recovered. The page is never committed empty. Every such fault
+- * is reported on stderr. A full queue is retried every 1 ms, as lv2 does; a
+- * queue that is gone stops the process, naming the page.
++ * is reported on stderr. A full queue is retried every 1 ms (RPCS3's interval;
++ * lv2 retries, its interval is not documented); a queue that is gone, or
++ * destroyed since 327 named it, stops the process, naming the page. A thread
++ * still waiting prints a line every 5 s.
+  */
+ #include "sys_mmapper_pf.h"
+ #include "sys_memory.h"
+@@ -77,6 +79,7 @@ typedef struct pf_fault {
+     volatile uint64_t tid;        /* 0 = free slot */
+     volatile uint32_t addr;
+     volatile int      recovered;
++    volatile int      detached;   /* its host thread went on; the event is still the pager's */
+ } pf_fault;
+ 
+ static mm_object s_obj[MM_OBJ_MAX];
+@@ -96,6 +99,7 @@ static void mm_unlock(void) { pthread_mutex_unlock(&s_lock); }
+ #endif
+ 
+ extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
++extern void (*g_evt_queue_destroy_hook)(uint32_t queue_id);   /* sys_event.c */
+ 
+ static mm_object* obj_of(uint32_t id)
+ {
+@@ -305,19 +309,21 @@ static LONG WINAPI pf_veh(EXCEPTION_POINTERS* ep)
+         pf_nap();
+     }
+     f->addr = addr;
++    __atomic_store_n(&f->detached, 0, __ATOMIC_RELEASE);
+     __atomic_store_n(&f->recovered, 0, __ATOMIC_RELEASE);
+-    /* A full queue refuses the event: wait and send again, as lv2 does (RPCS3
+-     * retries every 1 ms). Never map zeros. A queue that is gone can never be
++    /* A full queue refuses the event: wait and send again, as RPCS3 models
++     * lv2 (every 1 ms, RPCS3's interval). Never map zeros. A queue that is gone can never be
+      * answered: stop the process, naming the page, rather than hand out data
+      * the pager never filled. */
+     for (int tries = 0;; tries++) {
+-        if (sys_event_queue_push_by_id(a->queue_id, SYS_MEMORY_PAGE_FAULT_EVENT_KEY, addr,
++        uint32_t qid = __atomic_load_n(&a->queue_id, __ATOMIC_ACQUIRE);
++        if (qid && sys_event_queue_push_by_id(qid, SYS_MEMORY_PAGE_FAULT_EVENT_KEY, addr,
+                                        (SYS_MEMORY_PAGE_FAULT_TYPE_PPU_THREAD << 32) | (tid & 0xFFFFFFFFull),
+                                        SYS_MEMORY_PAGE_FAULT_CAUSE_NON_MAPPED) == 0)
+             break;
+-        if (!pf_queue_alive(a->queue_id)) {
+-            fprintf(stderr, "[pf] FATAL: page fault at 0x%08X (fault id 0x%08llX) but queue %u of area 0x%08X is gone; "
+-                    "no pager can map it\n", addr, (unsigned long long)tid, a->queue_id, a->start);
++        if (!pf_queue_alive(qid)) {
++            fprintf(stderr, "[pf] FATAL: page fault at 0x%08X (fault id 0x%08llX) but the queue of area 0x%08X is gone; "
++                    "no pager can map it\n", addr, (unsigned long long)tid, a->start);
+             abort();
+         }
+         if (tries == 0)
+@@ -327,10 +333,20 @@ static LONG WINAPI pf_veh(EXCEPTION_POINTERS* ep)
+     }
+     if (getenv("PS3_PFLOG"))
+         fprintf(stderr, "[pf] tid 0x%llX faulted at 0x%08X -> queue %u\n", (unsigned long long)tid, addr, a->queue_id);
+-    for (;;) {
++    /* pf_nap is about 20 us, so 250000 naps is about 5 s. */
++    for (unsigned long naps = 1;; naps++) {
+         if (__atomic_load_n(&f->recovered, __ATOMIC_ACQUIRE)) break;
+-        /* A host thread also goes on once the page is mapped, whoever asked. */
+-        if (host && !ps3_pf_page_unmapped(page)) break;
++        /* A host thread also goes on once the page is mapped, whoever asked.
++         * Its event is still queued and the pager will answer it with 57, which
++         * lv2 would accept (the thread it names is suspended there until then).
++         * The slot stays, detached, until that 57 takes it (review M-1). */
++        if (host && !ps3_pf_page_unmapped(page)) {
++            __atomic_store_n(&f->detached, 1, __ATOMIC_RELEASE);
++            return EXCEPTION_CONTINUE_EXECUTION;
++        }
++        if (naps % 250000 == 0)
++            fprintf(stderr, "[pf] still waiting for page 0x%08X (fault id 0x%08llX, %s thread), about %lu s\n",
++                    page, (unsigned long long)tid, host ? "NON-PPU" : "PPU", naps / 50000);
+         pf_nap();
+     }
+     __atomic_store_n(&f->tid, 0, __ATOMIC_RELEASE);
+@@ -370,6 +386,7 @@ int64_t sys_mmapper_enable_page_fault_notification(ppu_context* ctx)
+     for (uint32_t p = 0; p < pages; p++)
+         if (!slot->mapped[p]) host_protect(rs + p * MM_PAGE, MM_PAGE, 0);
+     if (!s_veh_installed) { s_veh_installed = 1; AddVectoredExceptionHandler(1, pf_veh); }
++    g_evt_queue_destroy_hook = ps3_pf_queue_destroyed;
+     __atomic_store_n(&slot->end, re, __ATOMIC_RELEASE);
+     mm_unlock();
+     fprintf(stderr, "[pf] page-fault notification for 0x%08X-0x%08X -> queue %u\n", rs, re, qid);
+@@ -380,15 +397,33 @@ int64_t sys_mmapper_enable_page_fault_notification(ppu_context* ctx)
+ int64_t sys_ppu_thread_recover_page_fault(ppu_context* ctx)
+ {
+     uint64_t tid = LV2_ARG_U64(ctx, 0) & 0xFFFFFFFFull;
+-    for (int i = 0; i < PF_FAULT_MAX; i++)
+-        if (tid && (__atomic_load_n(&s_fault[i].tid, __ATOMIC_ACQUIRE) & 0xFFFFFFFFull) == tid &&
+-            !__atomic_load_n(&s_fault[i].recovered, __ATOMIC_ACQUIRE)) {
+-            __atomic_store_n(&s_fault[i].recovered, 1, __ATOMIC_RELEASE);
+-            return CELL_OK;
+-        }
++    /* A detached slot (its host thread already went on) answers first: its
++     * event was sent first, and the pager answers events in order. */
++    for (int pass = 0; pass < 2; pass++)
++        for (int i = 0; i < PF_FAULT_MAX; i++)
++            if (tid && (__atomic_load_n(&s_fault[i].tid, __ATOMIC_ACQUIRE) & 0xFFFFFFFFull) == tid &&
++                !__atomic_load_n(&s_fault[i].recovered, __ATOMIC_ACQUIRE) &&
++                __atomic_load_n(&s_fault[i].detached, __ATOMIC_ACQUIRE) == !pass) {
++                if (!pass) {   /* nobody waits on it: free the slot */
++                    __atomic_store_n(&s_fault[i].detached, 0, __ATOMIC_RELEASE);
++                    __atomic_store_n(&s_fault[i].tid, 0, __ATOMIC_RELEASE);
++                } else
++                    __atomic_store_n(&s_fault[i].recovered, 1, __ATOMIC_RELEASE);
++                return CELL_OK;
++            }
+     return (int64_t)(int32_t)CELL_EINVAL;
+ }
+ 
++/* The queue a page-fault area names is being destroyed: forget it, so a later
++ * fault there stops the process instead of sending its event to whichever
++ * queue reuses the id (lv2 disconnects the notification's port; review M-4). */
++void ps3_pf_queue_destroyed(uint32_t queue_id)
++{
++    for (int i = 0; i < PF_AREA_MAX; i++)
++        if (__atomic_load_n(&s_area[i].end, __ATOMIC_ACQUIRE) && s_area[i].queue_id == queue_id)
++            __atomic_store_n(&s_area[i].queue_id, 0, __ATOMIC_RELEASE);
++}
++
+ /* lv2 198: sys_spu_thread_recover_page_fault(u32 id). No SPU thread is ever
+  * suspended on a page fault here (see the header comment). */
+ int64_t sys_spu_thread_recover_page_fault(ppu_context* ctx)
+diff --git a/runtime/syscalls/sys_mmapper_pf.h b/runtime/syscalls/sys_mmapper_pf.h
+index 9608a05b..d9d2ea9e 100644
+--- a/runtime/syscalls/sys_mmapper_pf.h
++++ b/runtime/syscalls/sys_mmapper_pf.h
+@@ -39,6 +39,9 @@ int64_t sys_spu_thread_recover_page_fault(ppu_context* ctx);
+ /* Is the guest page holding addr inside a page-fault area and not mapped? */
+ int ps3_pf_page_unmapped(uint32_t addr);
+ 
++/* sys_event_queue_destroy tells the page-fault areas their queue is gone. */
++void ps3_pf_queue_destroyed(uint32_t queue_id);
++
+ void sys_mmapper_pf_init(lv2_syscall_table* tbl);
+ 
+ #ifdef __cplusplus
+diff --git a/tests/test_mmapper_page_fault.c b/tests/test_mmapper_page_fault.c
+index 6f541149..c7e3eee3 100644
+--- a/tests/test_mmapper_page_fault.c
++++ b/tests/test_mmapper_page_fault.c
+@@ -14,6 +14,7 @@
+ #include <string.h>
+ #include <signal.h>
+ #include <unistd.h>
++#include <sys/wait.h>
+ 
+ /* Runtime data and hooks the three files refer to; inert here. */
+ uint8_t* vm_base;
+@@ -149,6 +150,38 @@ static int64_t serve_one(uint32_t q, uint64_t* out, uint32_t pattern)
+     return recover(out[2] & 0xFFFFFFFFu);
+ }
+ 
++/* Review M-1: a PPU thread and a host thread fault on one page, the PPU
++ * thread's event first; the pager's later 57 for the host thread's event is
++ * still accepted. Review M-4: a destroyed queue is forgotten. */
++static uint32_t g_area3, g_q3;
++static volatile uint32_t g_seen4 = 0xFFFFFFFFu, g_seen5 = 0xFFFFFFFFu;
++static void* guest_ppu11(void* arg)
++{
++    (void)arg;
++    ppu_context self; memset(&self, 0, sizeof self);
++    self.thread_id = 11;
++    g_active_ctx = &self;
++    __asm__ volatile("" ::: "memory");
++    g_seen4 = *(volatile uint32_t*)vm_to_host(g_area3 + 0x20010);
++    return NULL;
++}
++static void* host_toucher3(void* arg)
++{
++    (void)arg;
++    g_active_ctx = NULL;
++    __asm__ volatile("" ::: "memory");
++    g_seen5 = *(volatile uint32_t*)vm_to_host(g_area3 + 0x20010);
++    return NULL;
++}
++static int64_t receive_into(uint32_t q, uint64_t* out)
++{
++    ppu_context c; memset(&c, 0, sizeof c);
++    c.gpr[3] = q; c.gpr[4] = SCRATCH + 0x300; c.gpr[5] = 0;
++    int64_t rc = sys_event_queue_receive(&c);
++    for (int i = 0; i < 4; i++) out[i] = rd64(SCRATCH + 0x300 + 8 * i);
++    return rc;
++}
++
+ int main(void)
+ {
+     setvbuf(stdout, NULL, _IONBF, 0);
+@@ -236,6 +269,65 @@ int main(void)
+           (uint32_t)g_evt3[2] < 0x7FFF0000u, "under a host fault id of its own (0x%llX)", (unsigned long long)g_evt3[2]);
+     CHECK(g_seen3 == 0x5A5A5A5Au, "the host thread then reads the pager's data (0x%08X)", g_seen3);
+ 
++    {   /* M-1 */
++        ppu_context c; memset(&c, 0, sizeof c);
++        c.gpr[3] = 0x1000000; c.gpr[4] = 0; c.gpr[5] = 0x10000000; c.gpr[6] = SCRATCH;
++        assert(sys_mmapper_allocate_address(&c) == CELL_OK);
++        g_area3 = rd32(SCRATCH);
++        memset(&c, 0, sizeof c);
++        c.gpr[3] = SCRATCH + 8; c.gpr[4] = 0; c.gpr[5] = 0x7779; c.gpr[6] = 8;
++        assert(sys_event_queue_create(&c) == CELL_OK);
++        g_q3 = rd32(SCRATCH + 8);
++        assert(enable(g_area3, g_q3) == CELL_OK);
++    }
++    pthread_t t11, th3;
++    pthread_create(&t11, NULL, guest_ppu11, NULL);
++    usleep(30000);
++    pthread_create(&th3, NULL, host_toucher3, NULL);
++    usleep(30000);
++    uint64_t e11[4], eh[4];
++    CHECK(receive_into(g_q3, e11) == CELL_OK && (uint32_t)e11[2] == 11, "M-1: the PPU thread's event comes first (0x%llX)", (unsigned long long)e11[2]);
++    uint32_t o3 = ps3_mm_object_create(0x10000);
++    CHECK(ps3_mm_map(g_area3 + 0x20000, o3) == CELL_OK, "the pager maps the page for it");
++    *(volatile uint32_t*)vm_to_host(g_area3 + 0x20010) = 0x600DF00Du;
++    CHECK(recover(11) == CELL_OK, "and recovers thread 11");
++    pthread_join(t11, NULL);
++    pthread_join(th3, NULL);
++    CHECK(g_seen4 == 0x600DF00Du && g_seen5 == 0x600DF00Du, "both threads read the pager's data (0x%08X, 0x%08X)", g_seen4, g_seen5);
++    CHECK(receive_into(g_q3, eh) == CELL_OK && (uint32_t)eh[2] > 0x7FFE0000u, "the host thread's event is still the pager's to answer (0x%llX)", (unsigned long long)eh[2]);
++    CHECK(recover(eh[2] & 0xFFFFFFFFu) == CELL_OK, "its 57 is accepted, as lv2 accepts it for a suspended thread");
++    CHECK((uint32_t)recover(eh[2] & 0xFFFFFFFFu) == CELL_EINVAL, "a second 57 for it is EINVAL (the slot is free again)");
++
++    {   /* M-4: destroy the queue, make another that may reuse its id, then fault. */
++        ppu_context c; memset(&c, 0, sizeof c);
++        c.gpr[3] = g_q3; c.gpr[4] = 0;
++        CHECK(sys_event_queue_destroy(&c) == CELL_OK, "M-4: the area's queue is destroyed");
++        memset(&c, 0, sizeof c);
++        c.gpr[3] = SCRATCH + 8; c.gpr[4] = 0; c.gpr[5] = 0x777A; c.gpr[6] = 8;
++        assert(sys_event_queue_create(&c) == CELL_OK);
++        uint32_t qn = rd32(SCRATCH + 8);
++        fflush(stdout);
++        pid_t pid = fork();
++        if (pid == 0) {
++            ppu_context self; memset(&self, 0, sizeof self);
++            self.thread_id = 12;
++            g_active_ctx = &self;
++            __asm__ volatile("" ::: "memory");
++            volatile uint32_t v = *(volatile uint32_t*)vm_to_host(g_area3 + 0x40010);
++            (void)v;
++            _exit(0);                     /* reached only if the fault was answered */
++        }
++        int st = 0;
++        waitpid(pid, &st, 0);
++        CHECK(WIFSIGNALED(st) && WTERMSIG(st) == SIGABRT, "a fault after that stops the process (status 0x%X), new queue %u%s", st, qn,
++              qn == g_q3 ? " reused the id" : "");
++        uint64_t stray[4];
++        memset(&c, 0, sizeof c);
++        c.gpr[3] = qn; c.gpr[4] = SCRATCH + 0x300; c.gpr[5] = 1;   /* 1 us timeout */
++        CHECK(sys_event_queue_receive(&c) != CELL_OK, "and the new queue got no page-fault event");
++        (void)stray;
++    }
++
+     if (fails) { printf("%d check(s) failed\n", fails); return 1; }
+     puts("test_mmapper_page_fault: OK");
+     return 0;
+diff --git a/tests/test_pamf_header_dmux.c b/tests/test_pamf_header_dmux.c
+index 1256194e..b25b1e67 100644
+--- a/tests/test_pamf_header_dmux.c
++++ b/tests/test_pamf_header_dmux.c
+@@ -57,7 +57,13 @@ int main(void)
+     CHECK(cellPamfVerify(HDR, file) == CELL_OK, "verify: a well-formed header is OK");
+     be32w(HDR + 0x10, 0x100);
+     CHECK((uint32_t)cellPamfVerify(HDR, file) == CELL_PAMF_ERROR_INVALID_PAMF, "verify: marks offset without a size is INVALID_PAMF");
+-    be32w(HDR + 0x10, 0);
++    be32w(HDR + 0x14, 0x10);
++    CHECK((uint32_t)cellPamfVerify(HDR, file) == CELL_PAMF_ERROR_INVALID_PAMF, "verify: marks and no unknown block after them is INVALID_PAMF");
++    be32w(HDR + 0x18, 0x100); be32w(HDR + 0x1C, 0x10);
++    CHECK((uint32_t)cellPamfVerify(HDR, file) == CELL_PAMF_ERROR_INVALID_PAMF, "verify: an unknown block inside the marks is INVALID_PAMF");
++    be32w(HDR + 0x18, 0x110);
++    CHECK(cellPamfVerify(HDR, file) == CELL_OK, "verify: an unknown block right after the marks is OK");
++    be32w(HDR + 0x10, 0); be32w(HDR + 0x14, 0); be32w(HDR + 0x18, 0); be32w(HDR + 0x1C, 0);
+     be32w(HDR + 0x50, 0x2000);
+     CHECK((uint32_t)cellPamfVerify(HDR, file) == CELL_PAMF_ERROR_INVALID_PAMF, "verify: sequence info past the header is INVALID_PAMF");
+     be32w(HDR + 0x50, 0x200);
+@@ -100,6 +106,28 @@ int main(void)
+     be32w(res + 0x14, 0); be32w(res + 0x10, 0);
+     CHECK((uint32_t)cellDmuxOpenEx(type, res, cb, handle) == CELL_DMUX_ERROR_ARG, "OpenEx with no SPURS: ARG");
+ 
++    {   /* Open2 (review M-6): CellDmuxResource2 = isResourceEx, then the resource at +4. */
++        const uint32_t r2 = 0x30500;
++        be32w(res + 0x10, 0x50000); be32w(res + 0x14, 0x01010101);
++        be32w(cb, 0x60000);
++        vm_base[r2] = 0; memcpy(vm_base + r2 + 4, vm_base + res, 0x10);
++        CHECK((uint32_t)cellDmuxOpen2(type, r2, cb, handle) == CELL_DMUX_ERROR_FATAL, "Open2 with a plain resource: FATAL (no demuxer core)");
++        be32w(cb, 0);
++        CHECK((uint32_t)cellDmuxOpen2(type, r2, cb, handle) == CELL_DMUX_ERROR_ARG, "Open2 with no callback function: ARG");
++        be32w(cb, 0x60000);
++        be32w(r2 + 4, 0);
++        CHECK((uint32_t)cellDmuxOpen2(type, r2, cb, handle) == CELL_DMUX_ERROR_ARG, "Open2 with no memory: ARG");
++        be32w(r2 + 4, 0x40000); be32w(r2 + 4 + 0xC, 0xFFFFFFFFu);
++        CHECK((uint32_t)cellDmuxOpen2(type, r2, cb, handle) == CELL_DMUX_ERROR_ARG, "Open2 with stack size -1: ARG");
++        vm_base[r2] = 1; memcpy(vm_base + r2 + 4, vm_base + res, 0x20);
++        CHECK((uint32_t)cellDmuxOpen2(type, r2, cb, handle) == CELL_DMUX_ERROR_FATAL, "Open2 with a resourceEx: FATAL");
++        be32w(r2 + 4 + 0x10, 0);
++        CHECK((uint32_t)cellDmuxOpen2(type, r2, cb, handle) == CELL_DMUX_ERROR_ARG, "Open2 resourceEx with no SPURS: ARG");
++        be32w(r2 + 4 + 0x10, 0x50000); be32w(r2 + 4 + 0x18, 0x00000020);
++        CHECK((uint32_t)cellDmuxOpen2(type, r2, cb, handle) == CELL_DMUX_ERROR_ARG, "Open2 resourceEx with a priority byte of 0x20: ARG");
++        CHECK(vm_base[handle] == 0xAA, "Open2 writes no handle");
++    }
++
+     if (fails) { printf("%d check(s) failed\n", fails); return 1; }
+     puts("test_pamf_header_dmux: OK");
+     return 0;
+diff --git a/tools/test_loader_memory_domain.py b/tools/test_loader_memory_domain.py
+index cfa48292..1ba784f2 100644
+--- a/tools/test_loader_memory_domain.py
++++ b/tools/test_loader_memory_domain.py
+@@ -19,8 +19,8 @@ uint8_t* vm_base; uint32_t ppu_vm_size; uint32_t ppu_hle_inject_base=0x20000000u
+ uint32_t vm_read32(uint64_t a){auto p=vm_base+a;return (uint32_t(p[0])<<24)|(uint32_t(p[1])<<16)|(uint32_t(p[2])<<8)|p[3];}
+ void vm_write32(uint64_t a,uint32_t x){auto p=vm_base+a;p[0]=x>>24;p[1]=x>>16;p[2]=x>>8;p[3]=x;}
+ uint32_t ps3_mmapper_block_size(uint32_t id){return id==1?0x100000u:0x200000u;}
+-static uint32_t g_map_va, g_map_id; static int g_maps;
+-int32_t ps3_mm_map(uint32_t va,uint32_t id){g_map_va=va;g_map_id=id;g_maps++;return 0;}
++static uint32_t g_map_va, g_map_id; static int g_maps; static int32_t g_map_rc;
++int32_t ps3_mm_map(uint32_t va,uint32_t id){g_map_va=va;g_map_id=id;g_maps++;return g_map_rc;}
+ void actual_loader_cases(ppu_context* ctx){switch(ctx->gpr[11]){
+ '''
+  post='''default:std::abort();}}
+@@ -33,7 +33,9 @@ c.gpr[3]=base;actual_loader_cases(&c);CHECK(c.gpr[3]!=0);
+ c={};c.gpr[11]=330;c.gpr[3]=0x100000;c.gpr[5]=0x100000;c.gpr[6]=0x10000;actual_loader_cases(&c);CHECK(c.gpr[3]==0);uint32_t second=vm_read32(0x10000);CHECK(second>=base+0x100000);
+ c={};c.gpr[11]=337;c.gpr[3]=second;c.gpr[4]=1;c.gpr[6]=0x10000;g_maps=0;actual_loader_cases(&c);CHECK(c.gpr[3]==0&&vm_read32(0x10000)==second);
+ CHECK(g_maps==1&&g_map_va==second&&g_map_id==1);
+-vm_shutdown();std::puts("PASS loader330/337 failure recovery, reservation bounds, independent cursors and 337 recording its mapping");}
++c={};c.gpr[11]=330;c.gpr[3]=0x100000;c.gpr[5]=0x100000;c.gpr[6]=0x10000;actual_loader_cases(&c);CHECK(c.gpr[3]==0);uint32_t third=vm_read32(0x10000);
++c={};c.gpr[11]=337;c.gpr[3]=third;c.gpr[4]=1;c.gpr[6]=0x10000;g_map_rc=(int32_t)0x8001000Au;vm_write32(0x10000,0);actual_loader_cases(&c);CHECK((uint32_t)c.gpr[3]==0x8001000Au&&vm_read32(0x10000)==0);g_map_rc=0;
++vm_shutdown();std::puts("PASS loader330/337 failure recovery, reservation bounds, independent cursors and 337 recording its mapping (a refused map answered)");}
+ '''
+  with tempfile.TemporaryDirectory(prefix='ps3-loader-memory-') as tmp:
+   tmp=Path(tmp);(tmp/'fixture.cpp').write_text(pre+body+post)
