@@ -1,0 +1,64 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] cellGame tests: CreateGameData then ContentPermit, with and without PS3_HDD0_ROOT
+
+Upstream: not yet submitted; written to be upstreamed (generic, no title names)
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0024)
+
+What: test only. libs/system/tests/test_game_category.c (run by
+tools/test_game_category.py) gains two cases for patch 0022's ContentPermit:
+- game data DataCheck did not find, then cellGameCreateGameData: the folders
+  <content>/<dir>/USRDIR exist, and ContentPermit reports that data's paths;
+  with no PS3_HDD0_ROOT they are also made under the VFS root, where ppu_fs
+  maps /dev_hdd0 then;
+- the same with PS3_HDD0_ROOT set: nothing is made under the VFS root.
+
+Why: the review of 0022 found both branches untested, and the second is the
+one a runtime with its own /dev_hdd0 folder takes.
+
+diff --git a/libs/system/tests/test_game_category.c b/libs/system/tests/test_game_category.c
+--- a/libs/system/tests/test_game_category.c
++++ b/libs/system/tests/test_game_category.c
+@@ -127,8 +127,40 @@
+         assert(cellGameContentPermit((char*)0x600, (char*)0x700) == CELL_OK);
+         assert(strcmp((const char*)vm_base + 0x600, "/dev_hdd0/game/HAVE00001") == 0);
+         assert(strcmp((const char*)vm_base + 0x700, "/dev_hdd0/game/HAVE00001/USRDIR") == 0);
+-        char cmd[400];
+-        snprintf(cmd, sizeof cmd, "rm -rf '%s/HAVE00001' '%s'", root, vfs);
++
++        /* Missing data the title then creates: CreateGameData makes <content>/<dir>/USRDIR,
++         * and the ContentPermit after it reports that data. With no PS3_HDD0_ROOT the
++         * runtime's /dev_hdd0 lies under the VFS root, so the folders are made there too. */
++        unsetenv("PS3_HDD0_ROOT");
++        strcpy((char*)vm_base + 0x500, "MADE00001");
++        assert(cellGameDataCheck(CELL_GAME_GAMETYPE_GAMEDATA, (char*)0x500, (CellGameContentSize*)0x200) == CELL_GAME_RET_NONE);
++        memset(vm_base + 0x800, 0, 0x100);
++        assert(cellGameCreateGameData((CellGameSetInitParams*)0x800, (char*)0x900, (char*)0xA00) == CELL_OK);
++        snprintf(probe, sizeof probe, "%s/MADE00001/USRDIR", root);
++        assert(stat(probe, &st) == 0 && S_ISDIR(st.st_mode));
++        assert(cellGameContentPermit((char*)0x600, (char*)0x700) == CELL_OK);
++        assert(strcmp((const char*)vm_base + 0x600, "/dev_hdd0/game/MADE00001") == 0);
++        assert(strcmp((const char*)vm_base + 0x700, "/dev_hdd0/game/MADE00001/USRDIR") == 0);
++        snprintf(probe, sizeof probe, "%s/game/MADE00001/USRDIR", vfs);
++        assert(stat(probe, &st) == 0);
++
++        /* With PS3_HDD0_ROOT set (the port's case) the content root already is /dev_hdd0, and
++         * nothing is made under the VFS root (the disc layer). */
++        setenv("PS3_HDD0_ROOT", root, 1);
++        strcpy((char*)vm_base + 0x500, "MADE00002");
++        assert(cellGameDataCheck(CELL_GAME_GAMETYPE_GAMEDATA, (char*)0x500, (CellGameContentSize*)0x200) == CELL_GAME_RET_NONE);
++        assert(cellGameCreateGameData((CellGameSetInitParams*)0x800, (char*)0x900, (char*)0xA00) == CELL_OK);
++        assert(cellGameContentPermit((char*)0x600, (char*)0x700) == CELL_OK);
++        assert(strcmp((const char*)vm_base + 0x700, "/dev_hdd0/game/MADE00002/USRDIR") == 0);
++        snprintf(probe, sizeof probe, "%s/MADE00002/USRDIR", root);
++        assert(stat(probe, &st) == 0);
++        snprintf(probe, sizeof probe, "%s/game/MADE00002", vfs);
++        assert(stat(probe, &st) != 0);
++        unsetenv("PS3_HDD0_ROOT");
++
++        char cmd[600];
++        snprintf(cmd, sizeof cmd, "rm -rf '%s/HAVE00001' '%s/MADE00001' '%s/MADE00002' '%s'",
++                 root, root, root, vfs);
+         assert(system(cmd) == 0);
+     }
+ 
