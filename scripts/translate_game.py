@@ -394,7 +394,7 @@ def lift_spu(elf, data, staging, python, tools, logs, missed_dir=None):
             "seconds": round(time.monotonic() - t0, 2)}
 
 
-def translate(tree, out, python, tools, chunks=64, jobs=None, patches=None):
+def translate(tree, out, python, tools, chunks=64, jobs=None, patches=None, elf_rel=ELF_REL):
     tree = Path(tree).resolve()
     out = Path(out).resolve()
     tools = Path(tools)
@@ -402,7 +402,8 @@ def translate(tree, out, python, tools, chunks=64, jobs=None, patches=None):
         raise SystemExit(f"error: {out} is inside a git work tree; translated code is "
                          f"derived from the game and must live outside it")
     check_out(tree, out)
-    elf = tree / ELF_REL
+    elf_rel = Path(elf_rel)
+    elf = tree / elf_rel
     if not elf.is_file():
         raise SystemExit(f"error: ELF not found: {elf}")
     data = elf.read_bytes()
@@ -448,7 +449,7 @@ def translate(tree, out, python, tools, chunks=64, jobs=None, patches=None):
         spu = lift_spu(elf, data, staging, python, tools, logs, tree / "spu-missed")
         record = {
             "tool": TOOL,
-            "elf": ELF_REL.as_posix(),
+            "elf": elf_rel.as_posix(),
             "elf_sha256": map_game.sha256_file(elf),
             "ps3recomp_commit": map_game.ps3recomp_commit(tools.parent),
             "ps3recomp_patches": applied_hash,
@@ -472,6 +473,10 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="Translate GT6's PPU and SPU code (dev-only).")
     ap.add_argument("tree", help="gt6unpack build tree (holds decrypted/)")
     ap.add_argument("-o", "--output", help="output folder (default: <tree>/recomp)")
+    ap.add_argument("--elf", default=str(ELF_REL),
+                    help="the decrypted executable to translate, relative to the tree (default: "
+                         "the 1.22 USRDIR/EMAIN.SELF; the post-install one is "
+                         "decrypted/.../USRDIR/TPPS-01.22/EMAIN.SELF.elf, D44)")
     ap.add_argument("--chunks", type=int, default=64)
     ap.add_argument("--jobs", type=int)
     ap.add_argument("--ps3recomp", default=str(map_game.DEFAULT_PS3RECOMP))
@@ -484,7 +489,7 @@ def main(argv=None):
     if not (tools / "ppu_lifter.py").is_file():
         ap.exit(2, f"error: no ps3recomp tools at {tools} "
                    f"(git submodule update --init third_party/ps3recomp)\n")
-    rec = translate(tree, out, args.python, tools, args.chunks, args.jobs)
+    rec = translate(tree, out, args.python, tools, args.chunks, args.jobs, elf_rel=args.elf)
     print(f"{rec['functions']} functions, code end {rec['code_end']}, "
           f"{rec['seconds']['loader']} s + {rec['seconds']['lifter']} s -> {out.resolve()}")
     spu = rec["spu"]

@@ -441,3 +441,20 @@ def test_stop_file_reaches_spawned_images(tmp_path):
     assert boot_game._frames_bytes(frames) == 100
     boot_game._stop_dumps(frames, "bytes")
     assert (frames / boot_game.STOP_NAME).is_file() and (frames / "spawn10" / boot_game.STOP_NAME).is_file()
+
+
+def test_images_env_lists_every_build(tree, tmp_path):
+    """D44: each <tree>/port-build*/port with gt6 and gt6.image becomes "<sha>=<bin>|<elf>"."""
+    for d, sha, elf in (("port-build", "aa", "decrypted/a.elf"), ("port-build-tpps122", "bb", "decrypted/b.elf")):
+        p = tree / d / "port"
+        p.mkdir(parents=True)
+        (p / "gt6").write_text("")
+        (p / "gt6.image").write_text(json.dumps({"self": "x", "self_sha256": sha, "elf": elf}))
+    (tree / "port-build-junk" / "port").mkdir(parents=True)   # no image: ignored
+    env = boot_game.images_env(tree)
+    assert env == (f"aa={tree / 'port-build/port/gt6'}|{tree / 'decrypted/a.elf'};"
+                   f"bb={tree / 'port-build-tpps122/port/gt6'}|{tree / 'decrypted/b.elf'}")
+    assert boot_game.image_info(tree / "port-build-tpps122/port/gt6")["elf"] == "decrypted/b.elf"
+    assert boot_game.image_info(tree / "port-build-junk/port/gt6") is None
+    e = boot_game.build_env(tree, tmp_path, True, None)
+    assert e["GT6_IMAGES"] == env

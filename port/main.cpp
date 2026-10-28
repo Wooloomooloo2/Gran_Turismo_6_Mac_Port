@@ -66,6 +66,7 @@
 #include <string>
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>   /* _NSGetExecutablePath */
+#include <CommonCrypto/CommonDigest.h>   /* CC_SHA256: which EMAIN.SELF is on disk (D44) */
 #endif
 #include <errno.h>
 
@@ -528,6 +529,62 @@ static void gt6_exitspawn_output(const char* var, int n, bool dir)
     setenv(var, buf, 1);
 }
 
+/* D44: GT6's first-run install replaces USRDIR/EMAIN.SELF with TPPS-01.22's, so the program
+ * a boot or an exit-spawn starts is whichever EMAIN.SELF the play folder holds then. Each port
+ * binary is one translated executable (GT6_SELF_SHA256, the SELF its ELF came from);
+ * $GT6_IMAGES lists the others the harness knows, "<sha256>=<binary>|<elf>;...". Answers
+ * false when this binary is the right one (or nothing better is known), else fills bin/elf. */
+static bool gt6_sha256_file(const char* path, char hex[65])
+{
+#if defined(__APPLE__)
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;
+    CC_SHA256_CTX c;
+    CC_SHA256_Init(&c);
+    static unsigned char buf[1 << 16];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) CC_SHA256_Update(&c, buf, (CC_LONG)n);
+    fclose(f);
+    unsigned char md[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256_Final(md, &c);
+    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) snprintf(hex + 2 * i, 3, "%02x", md[i]);
+    return true;
+#else
+    (void)path; (void)hex;
+    return false;
+#endif
+}
+
+static bool gt6_other_image(std::string& bin, std::string& elf)
+{
+    char disk[1200], hex[65];
+    snprintf(disk, sizeof disk, "%sgame/BCES01977/USRDIR/EMAIN.SELF", s_hdd0_mapping);
+    if (!gt6_sha256_file(disk, hex)) {
+        printf("[image] cannot hash %s; staying with this binary\n", disk);
+        return false;
+    }
+    if (strcmp(hex, GT6_SELF_SHA256) == 0) return false;
+    const char* list = getenv("GT6_IMAGES");
+    std::string all = list ? list : "";
+    size_t pos = 0;
+    while (pos < all.size()) {
+        size_t end = all.find(';', pos);
+        if (end == std::string::npos) end = all.size();
+        const std::string item = all.substr(pos, end - pos);
+        pos = end + 1;
+        const size_t eq = item.find('='), bar = item.find('|');
+        if (eq == std::string::npos || bar == std::string::npos || bar < eq) continue;
+        if (item.compare(0, eq, hex) != 0) continue;
+        bin = item.substr(eq + 1, bar - eq - 1);
+        elf = item.substr(bar + 1);
+        return true;
+    }
+    printf("[image] the play folder's EMAIN.SELF (sha256 %.16s...) is not this binary's "
+           "(%.16s...) and no other build of it is known (GT6_IMAGES); running this one\n",
+           hex, GT6_SELF_SHA256);
+    return false;
+}
+
 static void gt6_exitspawn(const char* path, const char* const* argv, const char* const* envp,
                           const uint8_t* data, uint32_t data_size, int32_t prio, uint64_t flags)
 {
@@ -585,9 +642,15 @@ static void gt6_exitspawn(const char* path, const char* const* argv, const char*
             if (fl >= 0) fcntl(fd, F_SETFD, fl | FD_CLOEXEC);
         }
     }
-    char* const args[] = { s_self_exe, s_elf_arg, nullptr };
-    execv(s_self_exe, args);
-    fprintf(stderr, "[exitspawn] exec %s failed: %s\n", s_self_exe, strerror(errno));
+    /* the executable now on disk, which the first-run install may have replaced (D44) */
+    std::string obin = s_self_exe, oelf = s_elf_arg;
+    if (gt6_other_image(obin, oelf))
+        printf("[exitspawn] the play folder's EMAIN.SELF is another executable: %s %s\n",
+               obin.c_str(), oelf.c_str());
+    fflush(stdout);
+    char* const args[] = { (char*)obin.c_str(), (char*)oelf.c_str(), nullptr };
+    execv(obin.c_str(), args);
+    fprintf(stderr, "[exitspawn] exec %s failed: %s\n", obin.c_str(), strerror(errno));
 }
 
 /* GT6: the PARAM.SFO cellGame answers from (D43). A PS3 with the disc in the drive and the
@@ -637,6 +700,21 @@ int main(int argc, char** argv)
 
     if (!configure_vfs_roots())
         return 1;
+    {   /* D44: run the build of the EMAIN.SELF the play folder holds */
+        std::string obin, oelf;
+        if (!getenv("GT6_IMAGE_SWITCHED") && gt6_other_image(obin, oelf)) {
+            setenv("GT6_IMAGE_SWITCHED", "1", 1);
+            printf("[image] the play folder's EMAIN.SELF is another executable: exec %s %s\n",
+                   obin.c_str(), oelf.c_str());
+            fflush(NULL);
+            char* const args[] = { (char*)obin.c_str(), (char*)oelf.c_str(), nullptr };
+            execv(obin.c_str(), args);
+            fprintf(stderr, "[image] exec %s failed: %s; running this one\n", obin.c_str(),
+                    strerror(errno));
+        }
+        unsetenv("GT6_IMAGE_SWITCHED");
+        printf("[image] this binary: %s (SELF sha256 %.16s...)\n", GT6_LIFT_ELF_PATH, GT6_SELF_SHA256);
+    }
     configure_game_params();
     configure_guest_argv();
     gt6_configure_spurs();

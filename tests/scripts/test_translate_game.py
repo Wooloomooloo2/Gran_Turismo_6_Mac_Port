@@ -549,3 +549,18 @@ def test_staging_and_old_are_removed_only_when_ours(tree, tmp_path):
         assert not d.exists()
     assert sorted(p.name for p in tmp_path.iterdir()) == ["no-patches", "out", "ps3recomp", "tree"]
     assert not (out / ".translate_game-staging").exists()
+
+
+def test_elf_option_translates_another_executable(tree, tmp_path):
+    """--elf picks the executable (D44: the post-install TPPS-01.22 EMAIN), recorded as "elf"."""
+    other = Path("decrypted") / "dev_hdd0/game/BCES01977/USRDIR/TPPS-01.22/EMAIN.SELF.elf"
+    (tree / other).parent.mkdir(parents=True)
+    (tree / other).write_bytes((tree / ELF_REL).read_bytes())
+    out = tmp_path / "out"
+    rec = translate_game.translate(tree, out, sys.executable, fake_tools(tmp_path, "a", 1),
+                                   elf_rel=other)
+    assert rec["elf"] == other.as_posix()
+    with pytest.raises(SystemExit) as e:
+        translate_game.translate(tree, tmp_path / "out2", sys.executable,
+                                 fake_tools(tmp_path, "b", 1), elf_rel="decrypted/missing.elf")
+    assert "ELF not found" in str(e.value)

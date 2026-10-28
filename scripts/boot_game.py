@@ -184,8 +184,35 @@ def press_env(presses):
     return env
 
 
+IMAGE_NAME = "gt6.image"   # written by port/CMakeLists.txt beside each binary (D44)
+
+
+def image_info(gt6):
+    """The gt6.image beside a port binary ({self, self_sha256, elf}), or None."""
+    try:
+        return json.loads((Path(gt6).parent / IMAGE_NAME).read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def images_env(tree):
+    """GT6_IMAGES for the port (D44): every build under <tree>/port-build*/port with its
+    gt6.image, as "<self sha256>=<binary>|<elf>;...", so the port can start the build of
+    whichever EMAIN.SELF the play folder holds (the first-run install replaces it)."""
+    items = []
+    for img in sorted(Path(tree).glob("port-build*/port/" + IMAGE_NAME)):
+        info = image_info(img)
+        gt6 = img.parent / "gt6"
+        if info and gt6.is_file() and "self_sha256" in info and "elf" in info:
+            items.append(f"{info['self_sha256']}={gt6}|{Path(tree) / info['elf']}")
+    return ";".join(items)
+
+
 def build_env(tree, run, headless, env, frame_every=60, frame_max=300):
     e = dict(os.environ)
+    images = images_env(tree)
+    if images:
+        e["GT6_IMAGES"] = images
     e["PS3_MILESTONE_OUT"] = str(run / "milestones.log")
     # The numbered series (patch 0010) replaces milestone 2's single overwritten dump.
     e.pop("PS3RECOMP_METAL_FRAME_DUMP", None)
@@ -447,7 +474,8 @@ def boot(gt6, tree, seconds=300, idle=60, headless=True, env=None, until="flip",
     if not (tree / "play" / "prepare.json").is_file():
         raise SystemExit(f"error: {tree}/play/prepare.json is missing: "
                          f"run scripts/prepare_play.py first")
-    elf = tree / ELF_REL
+    info = image_info(gt6)
+    elf = tree / (info["elf"] if info and "elf" in info else ELF_REL)
     if not elf.is_file():
         raise SystemExit(f"error: ELF not found: {elf}")
     if not gt6.is_file():
