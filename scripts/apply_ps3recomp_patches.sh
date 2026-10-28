@@ -40,6 +40,7 @@ fi
 shopt -s nullglob
 all=("$patches"/*.patch)
 n=${#all[@]}
+[ "$n" -gt 0 ] || exit 0   # no patches: nothing to apply or verify (bash 3.2: an empty array is unbound)
 
 # Which patches are in? Later patches may rewrite lines an earlier one added, so a patch
 # is not checked on its own against the final tree. The files the series touches are copied
