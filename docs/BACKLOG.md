@@ -45,6 +45,8 @@ Shortcuts taken, with the proper fix logged. Priority order: 1) Stability, 2) Pe
 - Writers outside the cellFs allowlist (D45, batch 3 review m5): `cellSysCacheMount` and cellGame CreateGameData join a guest-supplied name to a host root without canonicalising it (a `../` in a cache id or game-data folder name would leave the play folder; GT6 passes its title id). The EDAT `.dec` cache is written beside the encrypted file wherever that is (refused on the read-only disc layer, D46). `cellFsUtil*` (`cellFsUtility.c`) uses the raw guest path as a host path (GT6 does not import it). Proper fix: route all four through ppu_fs.cpp's resolver.
 - The `GT6_IMAGE_SWITCHED` guard and the per-image `PAD_SCRIPT` hand-over in `port/main.cpp` have no automated test (batch 3 review m7); they are exercised only by the end-to-end install run.
 
+- Movies (D57, patch 0034): GT6's opening movie is not played. Real playback needs a guest-ABI PAMF demuxer (`cellDmuxOpenEx` with a demux thread delivering the title's DEMUX_DONE / AU_FOUND callbacks, `EnableEs`, `GetAu`/`ReleaseAu`), the AVC decoder (`libvdec`, VideoToolbox) and the audio decoder (`cellAdec`: ATRAC3plus has no macOS decoder, AC3 does). Until then `cellDmuxQueryAttr`/`OpenEx` answer FATAL. ps3recomp's `cellPamfReader*` still parse an invented header layout (0 streams for GT6's file) and its `cellDmuxOpen`/`SetStream` are host-layout toys; both must be rewritten on the real formats with the demuxer. `cellPamfVerify` checks only the header's top level.
+
 ## 2) Performance
 
 - The lwcond waiter queue (patch 0005) is one lock and one condition variable for every lwcond; each signal wakes all waiters to check their own flag. Fine for boot; give each lwcond its own channel if a profile shows wakeup storms.
