@@ -235,7 +235,9 @@ def ps3recomp_tree_hash(sub=None):
                                 text=True).stdout.split("\n")
     except (OSError, subprocess.CalledProcessError):
         return None
-    state = bytearray(diff)
+    # CMake's execute_process drops carriage returns from what it captures, so
+    # write_image.cmake hashes the diff without them; so does this (CRLF files exist).
+    state = bytearray(diff.replace(b"\r", b""))
     for f in others:
         if not f or "/__pycache__/" in "/" + f or f.endswith(".pyc"):
             continue

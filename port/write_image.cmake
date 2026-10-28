@@ -17,6 +17,9 @@ execute_process(COMMAND git -C "${SUB}" ls-files --others --exclude-standard
 if(NOT rc EQUAL 0)
     message(FATAL_ERROR "git ls-files in ${SUB} failed (${rc})")
 endif()
+# execute_process already drops carriage returns on capture; say so, and make sure of it
+# (scripts/boot_game.py removes them too, so CRLF files hash the same on both sides).
+string(REPLACE "\r" "" diff "${diff}")
 set(state "${diff}")
 string(REPLACE "\n" ";" others "${others}")
 foreach(f IN LISTS others)

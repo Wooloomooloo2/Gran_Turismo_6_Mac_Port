@@ -562,6 +562,31 @@ def test_tree_hash_follows_edits_and_untracked_files(tmp_path):
     assert len({h0, h1, h2}) == 3 and boot_game.ps3recomp_tree_hash(sub) == h2
 
 
+def test_tree_hash_python_and_cmake_agree_with_crlf(tmp_path):
+    """Review M-1: port/write_image.cmake and ps3recomp_tree_hash give the same value, also
+    for a diff with CRLF lines (CMake drops carriage returns from captured output, so both
+    hash the diff without them) and with an untracked file."""
+    import shutil
+    cmake = shutil.which("cmake")
+    if not cmake:
+        pytest.skip("cmake not installed")
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    subprocess.run(["git", "init", "-q", str(sub)], check=True)
+    (sub / "a.c").write_bytes(b"one\r\ntwo\r\n")
+    subprocess.run(["git", "-C", str(sub), "add", "a.c"], check=True)
+    subprocess.run(["git", "-C", str(sub), "-c", "user.name=t", "-c", "user.email=t@t",
+                    "commit", "-q", "-m", "a"], check=True)
+    (sub / "a.c").write_bytes(b"one\r\nTWO\r\n")
+    (sub / "new.c").write_text("z\n")
+    pending = tmp_path / "in.json"
+    pending.write_text('{"self_sha256": "x"}\n')
+    out = tmp_path / "out.json"
+    subprocess.run([cmake, f"-DSUB={sub}", f"-DIN={pending}", f"-DOUT={out}", "-P",
+                    str(boot_game.REPO / "port" / "write_image.cmake")], check=True)
+    assert json.loads(out.read_text())["ps3recomp_tree"] == boot_game.ps3recomp_tree_hash(sub)
+
+
 def test_tree_hash_ignores_external_diff_and_textconv(tmp_path):
     """Review M-2: a developer's diff.external or textconv driver must not change the hash
     (both hashers pass --no-ext-diff --no-textconv), or builds would differ between machines."""
