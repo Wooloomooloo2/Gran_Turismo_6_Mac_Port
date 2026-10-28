@@ -1,0 +1,40 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] ppu_fs tests: the AIO and read/write-switch fixtures name their /dev_hdd1 root
+
+Upstream: not yet submitted; written to be upstreamed (generic, no title names)
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0026)
+
+What: test only. runtime/ppu/tests/test_fs_aio.cpp and test_fs_rw_switch.cpp
+open /dev_hdd1/<file> for writing with no PS3_HDD1_ROOT, relying on
+host_path() resolving it under the VFS root. Since patch 0024 a write-open is
+allowed only on a writable mount with its own root (otherwise ENOTMOUNTED),
+so both fixtures now set PS3_HDD1_ROOT to the same scratch folder; the host
+file they check is unchanged.
+
+Why: both failed after 0024 at their first O_RDWR open.
+
+diff --git a/runtime/ppu/tests/test_fs_aio.cpp b/runtime/ppu/tests/test_fs_aio.cpp
+--- a/runtime/ppu/tests/test_fs_aio.cpp
++++ b/runtime/ppu/tests/test_fs_aio.cpp
+@@ -78,6 +78,8 @@
+     }
+ 
+     ppu_vfs_root = dir;
++    /* /dev_hdd1 is a writable mount only with its own root (patch 0024): the same folder. */
++    setenv("PS3_HDD1_ROOT", dir, 1);
+     strcpy((char*)mem + 0x100, "/dev_hdd1/ps3recomp_fs_aio.bin");
+     ppu_context ctx;
+     memset(&ctx, 0, sizeof ctx); ctx.gpr[3] = 0x100; ctx.gpr[4] = 0 /* O_RDONLY */; ctx.gpr[5] = 0x200;
+diff --git a/runtime/ppu/tests/test_fs_rw_switch.cpp b/runtime/ppu/tests/test_fs_rw_switch.cpp
+--- a/runtime/ppu/tests/test_fs_rw_switch.cpp
++++ b/runtime/ppu/tests/test_fs_rw_switch.cpp
+@@ -93,6 +93,8 @@
+     remove(host);
+ 
+     ppu_vfs_root = dir;
++    /* /dev_hdd1 is a writable mount only with its own root (patch 0024): the same folder. */
++    setenv("PS3_HDD1_ROOT", dir, 1);
+     strcpy((char*)mem + PATH, "/dev_hdd1/ps3recomp_fs_rw_switch.idx");
+ 
+     /* FIOS's open: O_RDWR | O_CREAT on a file that does not exist yet. */
