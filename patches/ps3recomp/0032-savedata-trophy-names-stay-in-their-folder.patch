@@ -1,0 +1,336 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] cellSaveData dirName and sceNpTrophy commId stay inside their folders
+
+Upstream: not yet submitted; written to be upstreamed (generic, no title names)
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0031)
+
+What: a save's dirName and a trophy context's communication id are joined
+into host paths (the save root, the trophy folder) as given. A name with a
+separator or ".." reached outside the folder. Now:
+- cellSaveData answers CELL_SAVEDATA_ERROR_PARAM, with no callback run, for a
+  dirName that is empty or holds '/', '\' or "..", in every entry point that
+  builds a save path (AutoSave/AutoLoad, their 2 and User forms, and the
+  shared execute path);
+- sceNpTrophyCreateContext answers SCE_NP_TROPHY_ERROR_INVALID_NP_COMM_ID
+  (0x80022918, the SDK's code) for an id that is empty or holds '/', '\' or
+  "..", and the trophy file name uses at most the id's 9 characters (the
+  structure's data has no terminator of its own).
+RPCS3 checks the save name against the system name rules (it answers BROKEN
+from its savedata_op) and the id's number; these guards are narrower: they
+refuse only names that would leave the folder.
+
+Why: the names come from the title. A title passes fixed ids, but nothing
+else kept a name like "../../x" from writing outside the play folder.
+
+Test: libs/system/tests/test_savedata_user_autosave.c (three bad names: PARAM,
+no funcStat) and libs/network/tests/test_trophy_sound_level.c (three bad ids:
+INVALID_NP_COMM_ID), run by their existing tools/test_*.py.
+
+diff --git a/libs/network/sceNpTrophy.c b/libs/network/sceNpTrophy.c
+index 0825dcf6..eab6dd2d 100644
+--- a/libs/network/sceNpTrophy.c
++++ b/libs/network/sceNpTrophy.c
+@@ -100,7 +100,10 @@ static void trophy_get_filepath(const SceNpCommunicationId* commId,
+                                  char* buf, size_t bufsize)
+ {
+     trophy_adopt_gamedata_root();
+-    snprintf(buf, bufsize, "%s/%s.json", s_storage_path, commId->data);
++    /* data holds up to SCE_NP_COMMUNICATION_ID_MAX_LENGTH characters with no
++     * terminator of its own; CreateContext checked them. */
++    snprintf(buf, bufsize, "%s/%.*s.json", s_storage_path,
++             (int)SCE_NP_COMMUNICATION_ID_MAX_LENGTH, commId->data);
+ }
+ 
+ static void trophy_save(TrophyContext* ctx)
+@@ -240,6 +243,17 @@ s32 sceNpTrophyCreateContext(SceNpTrophyContext* context,
+     if (!context || !commId)
+         return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
+     const SceNpCommunicationId* commId_h = GUEST_PTR(commId, const SceNpCommunicationId*);
++    /* The id names the trophy file in the host folder: it must be one plain name
++     * (not empty, no separator, no ".."), or it would reach outside the folder. */
++    {
++        size_t n = strnlen(commId_h->data, SCE_NP_COMMUNICATION_ID_MAX_LENGTH);
++        int bad = n == 0;
++        for (size_t k = 0; k < n && !bad; k++)
++            bad = commId_h->data[k] == '/' || commId_h->data[k] == '\\' ||
++                  (commId_h->data[k] == '.' && k + 1 < n && commId_h->data[k + 1] == '.');
++        if (bad)
++            return SCE_NP_TROPHY_ERROR_INVALID_NP_COMM_ID;
++    }
+ 
+     for (s32 i = 1; i <= SCE_NP_TROPHY_MAX_CONTEXTS; i++) {
+         if (!s_contexts[i].in_use) {
+@@ -248,8 +262,8 @@ s32 sceNpTrophyCreateContext(SceNpTrophyContext* context,
+             s_contexts[i].commId = *commId_h;
+             s_contexts[i].total_trophies = SCE_NP_TROPHY_MAX_NUM_TROPHIES;
+             vm_write32(GUEST_EA(context), (u32)i);
+-            printf("[sceNpTrophy] CreateContext(commId=\"%s\") -> ctx=%d\n",
+-                   commId_h->data, i);
++            printf("[sceNpTrophy] CreateContext(commId=\"%.*s\") -> ctx=%d\n",
++                   (int)SCE_NP_COMMUNICATION_ID_MAX_LENGTH, commId_h->data, i);
+             return CELL_OK;
+         }
+     }
+diff --git a/libs/network/sceNpTrophy.h b/libs/network/sceNpTrophy.h
+index 44c4932e..31476a26 100644
+--- a/libs/network/sceNpTrophy.h
++++ b/libs/network/sceNpTrophy.h
+@@ -26,6 +26,7 @@ extern "C" {
+ #define SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED  0x80022904
+ #define SCE_NP_TROPHY_ERROR_OUT_OF_MEMORY           0x80022905
+ #define SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT        0x80022906
++#define SCE_NP_TROPHY_ERROR_INVALID_NP_COMM_ID      0x80022918   /* SDK; RPCS3 sceNpTrophy.h */
+ #define SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT         0x8002290a
+ #define SCE_NP_TROPHY_ERROR_INVALID_CONTEXT         0x8002290e
+ #define SCE_NP_TROPHY_ERROR_ABORT                   0x80022910
+diff --git a/libs/network/tests/test_trophy_sound_level.c b/libs/network/tests/test_trophy_sound_level.c
+index 4224943b..3092d347 100644
+--- a/libs/network/tests/test_trophy_sound_level.c
++++ b/libs/network/tests/test_trophy_sound_level.c
+@@ -30,6 +30,16 @@ int main(void)
+     CHECK(sceNpTrophySetSoundLevel(1, 1, 50, 0) == (s32)SCE_NP_TROPHY_ERROR_NOT_INITIALIZED,
+           "before sceNpTrophyInit: NOT_INITIALIZED");
+     assert(sceNpTrophyInit(NULL, 0, 0, 0) == CELL_OK);
++    /* Review M-4: an id that is not one plain name never reaches a host path. */
++    memcpy(vm_base + 0x140, "../../xx\0", 10);
++    CHECK(sceNpTrophyCreateContext((void*)0x200, (void*)0x140, NULL, 0) == (s32)SCE_NP_TROPHY_ERROR_INVALID_NP_COMM_ID,
++          "commId \"../../xx\": INVALID_NP_COMM_ID");
++    memcpy(vm_base + 0x140, "NPWR/0000\0", 10);
++    CHECK(sceNpTrophyCreateContext((void*)0x200, (void*)0x140, NULL, 0) == (s32)SCE_NP_TROPHY_ERROR_INVALID_NP_COMM_ID,
++          "commId with a '/': INVALID_NP_COMM_ID");
++    memset(vm_base + 0x140, 0, 10);
++    CHECK(sceNpTrophyCreateContext((void*)0x200, (void*)0x140, NULL, 0) == (s32)SCE_NP_TROPHY_ERROR_INVALID_NP_COMM_ID,
++          "an empty commId: INVALID_NP_COMM_ID");
+     assert(sceNpTrophyCreateContext((void*)0x200, (void*)0x100, NULL, 0) == CELL_OK);
+     assert(sceNpTrophyCreateHandle((void*)0x204) == CELL_OK);
+     const u32 ctx = vm_read32(0x200), h = vm_read32(0x204);
+diff --git a/libs/system/cellSaveData.c b/libs/system/cellSaveData.c
+index 1fb1b120..6e7c5b17 100644
+--- a/libs/system/cellSaveData.c
++++ b/libs/system/cellSaveData.c
+@@ -84,8 +84,21 @@ static void ensure_dirs(const char* path)
+     HOST_MKDIR(tmp);
+ }
+ 
+-static void build_save_path(char* buf, size_t buf_size, const char* dirName)
++/* A guest dirName is one folder name inside the save root: never empty, no
++ * separator, no "..". Anything else would be joined into a host path outside
++ * the root; the caller answers CELL_SAVEDATA_ERROR_PARAM. */
++static int save_dir_name_ok(const char* dirName)
+ {
++    return dirName && dirName[0] && !strchr(dirName, '/') && !strchr(dirName, '\\') &&
++           !strstr(dirName, "..");
++}
++
++static int build_save_path(char* buf, size_t buf_size, const char* dirName)
++{
++    if (!save_dir_name_ok(dirName)) {
++        printf("[cellSaveData] refused dirName '%s': not one folder name\n", dirName ? dirName : "<null>");
++        return 0;
++    }
+     adopt_gamedata_root();
+     snprintf(buf, buf_size, "%s/%s", s_save_root, dirName);
+ #ifdef _WIN32
+@@ -93,6 +106,7 @@ static void build_save_path(char* buf, size_t buf_size, const char* dirName)
+         if (*p == '/') *p = '\\';
+     }
+ #endif
++    return 1;
+ }
+ 
+ /* The generic HLE adapter passes PPC register values raw, so string args
+@@ -531,50 +545,50 @@ static u32 savedata_content_type(const char* name)
+     return CELL_SAVEDATA_FILETYPE_NORMALFILE;
+ }
+ 
+-/* Which files were written as SECUREFILE. A real save records them in
+- * PARAM.PFD; ours keeps one name per line there, and the file stays hidden
+- * from the guest's list (savedata_system_file). Without it every file came
+- * back as NORMALFILE, and a title that looks for its secure payload in the
+- * stat list (The Simpsons Arcade Game) called its own fresh save corrupt. */
+-static void pfd_path(const char* save_path, char* out, size_t n)
+-{
+-    snprintf(out, n, "%s/PARAM.PFD", save_path);
+-#ifdef _WIN32
+-    for (char* p = out; *p; p++) if (*p == '/') *p = '\\';
+-#endif
+-}
+-
+-static int pfd_has(const char* save_path, const char* name)
+-{
+-    char path[1024], line[64];
+-    pfd_path(save_path, path, sizeof(path));
+-    FILE* fp = fopen(path, "rb");
+-    if (!fp) return 0;
+-    int found = 0;
+-    while (!found && fgets(line, sizeof(line), fp)) {
+-        line[strcspn(line, "\r\n")] = 0;
+-        found = !strcmp(line, name);
+-    }
+-    fclose(fp);
+-    return found;
+-}
+-
+-static void pfd_add(const char* save_path, const char* name)
+-{
+-    if (pfd_has(save_path, name)) return;
+-    char path[1024];
+-    pfd_path(save_path, path, sizeof(path));
+-    FILE* fp = fopen(path, "ab");
+-    if (fp) { fprintf(fp, "%s\n", name); fclose(fp); }
+-}
+-
+-static u32 savedata_file_type(const char* save_path, const char* name)
+-{
+-    u32 t = savedata_content_type(name);
+-    return t == CELL_SAVEDATA_FILETYPE_NORMALFILE && pfd_has(save_path, name)
+-         ? CELL_SAVEDATA_FILETYPE_SECUREFILE : t;
+-}
+-
++/* Which files were written as SECUREFILE. A real save records them in
++ * PARAM.PFD; ours keeps one name per line there, and the file stays hidden
++ * from the guest's list (savedata_system_file). Without it every file came
++ * back as NORMALFILE, and a title that looks for its secure payload in the
++ * stat list (The Simpsons Arcade Game) called its own fresh save corrupt. */
++static void pfd_path(const char* save_path, char* out, size_t n)
++{
++    snprintf(out, n, "%s/PARAM.PFD", save_path);
++#ifdef _WIN32
++    for (char* p = out; *p; p++) if (*p == '/') *p = '\\';
++#endif
++}
++
++static int pfd_has(const char* save_path, const char* name)
++{
++    char path[1024], line[64];
++    pfd_path(save_path, path, sizeof(path));
++    FILE* fp = fopen(path, "rb");
++    if (!fp) return 0;
++    int found = 0;
++    while (!found && fgets(line, sizeof(line), fp)) {
++        line[strcspn(line, "\r\n")] = 0;
++        found = !strcmp(line, name);
++    }
++    fclose(fp);
++    return found;
++}
++
++static void pfd_add(const char* save_path, const char* name)
++{
++    if (pfd_has(save_path, name)) return;
++    char path[1024];
++    pfd_path(save_path, path, sizeof(path));
++    FILE* fp = fopen(path, "ab");
++    if (fp) { fprintf(fp, "%s\n", name); fclose(fp); }
++}
++
++static u32 savedata_file_type(const char* save_path, const char* name)
++{
++    u32 t = savedata_content_type(name);
++    return t == CELL_SAVEDATA_FILETYPE_NORMALFILE && pfd_has(save_path, name)
++         ? CELL_SAVEDATA_FILETYPE_SECUREFILE : t;
++}
++
+ /* Enumerate files in a save directory. Returns count, fills fileList up to max. */
+ static u32 enumerate_save_files(const char* save_path,
+                                  CellSaveDataFileStat* fileList, u32 max)
+@@ -595,7 +609,7 @@ static u32 enumerate_save_files(const char* save_path,
+                 continue;
+             if (count < max && fileList) {
+                 memset(&fileList[count], 0, sizeof(CellSaveDataFileStat));
+-                fileList[count].fileType = savedata_file_type(save_path, fd.cFileName);
++                fileList[count].fileType = savedata_file_type(save_path, fd.cFileName);
+                 strncpy(fileList[count].fileName, fd.cFileName,
+                         CELL_SAVEDATA_FILENAME_SIZE - 1);
+                 ULARGE_INTEGER sz;
+@@ -632,7 +646,7 @@ static u32 enumerate_save_files(const char* save_path,
+ #endif
+             if (count < max && fileList) {
+                 memset(&fileList[count], 0, sizeof(CellSaveDataFileStat));
+-                fileList[count].fileType = savedata_file_type(save_path, de->d_name);
++                fileList[count].fileType = savedata_file_type(save_path, de->d_name);
+                 strncpy(fileList[count].fileName, de->d_name,
+                         CELL_SAVEDATA_FILENAME_SIZE - 1);
+                 fileList[count].st_size = (u64)st.st_size;
+@@ -737,8 +751,8 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
+         size_t wrote = fwrite(set->fileBuf, 1, write_size, fp);
+         int failed = wrote != write_size;
+         if (fclose(fp) != 0) failed = 1;
+-        if (!failed && set->fileType == CELL_SAVEDATA_FILETYPE_SECUREFILE)
+-            pfd_add(save_path, name);
++        if (!failed && set->fileType == CELL_SAVEDATA_FILETYPE_SECUREFILE)
++            pfd_add(save_path, name);
+         return failed ? CELL_SAVEDATA_ERROR_ACCESS_ERROR : (s32)wrote;
+     }
+ 
+@@ -875,7 +889,8 @@ static s32 savedata_execute_run(const char* dirName, int is_save,
+         return CELL_SAVEDATA_ERROR_PARAM;
+ 
+     char save_path[1024];
+-    build_save_path(save_path, sizeof(save_path), dirName);
++    if (!build_save_path(save_path, sizeof(save_path), dirName))
++        return CELL_SAVEDATA_ERROR_PARAM;
+ 
+     int is_new = !dir_has_save(save_path);
+ 
+@@ -1301,7 +1316,8 @@ s32 cellSaveDataAutoLoad2(u32 version, const char* dirName,
+      * Even on first-run-no-data, the game observes funcStat fire with
+      * isNewData=1 so its title state machine can advance. */
+     char save_path[1024];
+-    build_save_path(save_path, sizeof(save_path), dirName);
++    if (!build_save_path(save_path, sizeof(save_path), dirName))
++        return CELL_SAVEDATA_ERROR_PARAM;
+     int is_new = !dir_has_save(save_path);
+ 
+     (void)is_new;
+@@ -1410,7 +1426,8 @@ s32 cellSaveDataAutoSave(u32 version, const char* dirName,
+      * bytes needs the funcFile marshalling loop; the stat callback running is
+      * the correct, honest first step and matches the load path's behaviour.) */
+     char save_path[1024];
+-    build_save_path(save_path, sizeof(save_path), dirName);
++    if (!build_save_path(save_path, sizeof(save_path), dirName))
++        return CELL_SAVEDATA_ERROR_PARAM;
+     int is_new = !dir_has_save(save_path);
+ 
+     (void)is_new;
+@@ -1438,7 +1455,8 @@ s32 cellSaveDataAutoLoad(u32 version, const char* dirName,
+         return CELL_SAVEDATA_ERROR_PARAM;
+ 
+     char save_path[1024];
+-    build_save_path(save_path, sizeof(save_path), dirName);
++    if (!build_save_path(save_path, sizeof(save_path), dirName))
++        return CELL_SAVEDATA_ERROR_PARAM;
+     int is_new = !dir_has_save(save_path);
+ 
+     (void)is_new;
+diff --git a/libs/system/tests/test_savedata_user_autosave.c b/libs/system/tests/test_savedata_user_autosave.c
+index b1972b11..91a7eac1 100644
+--- a/libs/system/tests/test_savedata_user_autosave.c
++++ b/libs/system/tests/test_savedata_user_autosave.c
+@@ -103,6 +103,25 @@ int main(int argc, char** argv)
+     run("cellSaveDataUserAutoLoad", 0xCDC6AEFDu, 0x0001CAFEu);
+     run("cellSaveDataUserAutoSave", 0x52AAC4FAu, 0x0001BEEFu);
+ 
++    /* Review M-4: a dirName that is not one folder name is the SDK's PARAM error,
++     * and nothing runs. */
++    {
++        static const char* bad[] = { "../ESCAPE", "A/B", "" };
++        void (*fn)(ppu_context*) = find(0xCDC6AEFDu);
++        for (unsigned i = 0; fn && i < sizeof bad / sizeof *bad; i++) {
++            strcpy((char*)vm_base + 0x300, bad[i]);
++            ppu_context ctx = {0};
++            ctx.gpr[1] = 0x400; ctx.gpr[4] = 1; ctx.gpr[5] = 0x300; ctx.gpr[7] = 0x200;
++            ctx.gpr[8] = STAT_OPD; ctx.gpr[9] = 0xA00;
++            s_stat_calls = 0;
++            fn(&ctx);
++            char what[160];
++            snprintf(what, sizeof what, "dirName '%s': CELL_SAVEDATA_ERROR_PARAM and no funcStat (rc 0x%08X)",
++                     bad[i], (uint32_t)ctx.gpr[3]);
++            check((uint32_t)ctx.gpr[3] == CELL_SAVEDATA_ERROR_PARAM && s_stat_calls == 0, what);
++        }
++    }
++
+     free(vm_base);
+     if (s_failed) { printf("FAIL (%d failed)\n", s_failed); return 1; }
+     puts("PASS (0 failed)");
