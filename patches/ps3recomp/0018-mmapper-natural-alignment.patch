@@ -6,9 +6,11 @@ Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
 Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0017)
 
 What: sys_mmapper_allocate_address (lv2 330) now places a reservation whose
-size is a power of two larger than its alignment on its own size (natural
-alignment), and falls back to the requested alignment only when no such span
-is left. Other reservations are placed as before.
+size is a power of two of 256 MB or more (lv2's address-space granule) and
+larger than its alignment on its own size (natural alignment), and falls back
+to the requested alignment only when no such span is left. Smaller and other
+reservations are placed as before (tests/test_loaded_image_memory.cpp's 2 MB
+reservation still lands at 0x40300000).
 
 lv2 hands out address space first-fit from the bottom of user space (RPCS3's
 vm::find_map searches upward from 0x10000000 in alignment steps), so a
@@ -32,19 +34,19 @@ gains the reservation sequence above: a 512 MB reservation after a 256 MB one
 is 512 MB aligned, outside the runtime's windows, and its 16-bit page numbers
 do not wrap. A small or non-power-of-two reservation keeps the requested
 alignment. The new checks fail without the change, and the existing ones
-still pass.
+(and tools/test_loaded_image_memory.py) still pass.
 
 diff --git a/runtime/syscalls/sys_memory.c b/runtime/syscalls/sys_memory.c
-index 66eef25c..4b530718 100644
+index 66eef25c..d8225889 100644
 --- a/runtime/syscalls/sys_memory.c
 +++ b/runtime/syscalls/sys_memory.c
-@@ -344,7 +344,22 @@ int64_t sys_mmapper_allocate_address(ppu_context* ctx)
+@@ -344,7 +344,23 @@ int64_t sys_mmapper_allocate_address(ppu_context* ctx)
      int slot = -1;
      for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; ++i)
          if (!s_mapper_reservations[i].start) { slot = i; break; }
 -    uint32_t addr = slot < 0 ? 0 : mapper_address(size, alignment);
-+    /* A power-of-two reservation larger than its alignment is placed on its
-+     * own size first (falling back to the requested alignment if no such
++    /* A power-of-two reservation of 256 MB or more (lv2's address-space
++     * granule) that is larger than its alignment is placed on its own size first (falling back to the requested alignment if no such
 +     * span is left). lv2 hands out address space first-fit from the bottom
 +     * of user space, so a title's few early reservations land on large
 +     * boundaries; this runtime keeps its own windows at 0x50000000-0x6FFFFFFF
@@ -56,7 +58,8 @@ index 66eef25c..4b530718 100644
 +     * reservation never crosses a boundary of its own size. */
 +    uint32_t addr = 0;
 +    if (slot >= 0) {
-+        if (size > alignment && !(size & (size - 1u))) addr = mapper_address(size, size);
++        if (size >= 0x10000000u && size > alignment && !(size & (size - 1u)))
++            addr = mapper_address(size, size);
 +        if (!addr) addr = mapper_address(size, alignment);
 +    }
      if (addr) {

@@ -28,18 +28,9 @@ waking it with CELL_ECANCELED, ESRCH afterwards, and the slot reused once
 the receiver has left.
 
 diff --git a/runtime/syscalls/sys_event.c b/runtime/syscalls/sys_event.c
-index adabcc56..b4345c62 100644
+index adabcc56..5b277f96 100644
 --- a/runtime/syscalls/sys_event.c
 +++ b/runtime/syscalls/sys_event.c
-@@ -10,7 +10,7 @@
- #include "../spu/spu_workload.h"   /* spu_elf_image_size, spu_workload_dispatch_async */
- #include <string.h>
- #include <stdlib.h>               /* getenv */
--#include "ps3emu/log_first.h"
-+#include "ps3emu/log_first.h"
- 
- /* Recorded by sys_spu_thread_initialize (lv2_register.c): the SPURS kernel
-  * context EA the title's SPU task runtime is dispatched against. */
 @@ -157,7 +157,8 @@ int64_t sys_event_queue_create(ppu_context* ctx)
  
      int slot = -1;
