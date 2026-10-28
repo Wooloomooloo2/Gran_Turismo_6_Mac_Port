@@ -90,3 +90,6 @@ Shortcuts taken, with the proper fix logged. Priority order: 1) Stability, 2) Pe
 - Verify: duplicate or `../` manifest paths are unchecked; static 8 MiB buffer; the reader accepts trailing garbage; no test for empty files or size-only mismatch.
 - `manifest.cpp` has a redundant `<cstdio>` include.
 - The map CLI test should skip when capstone is missing; test fixture values copy real GT6 metadata (use invented ones); `requirements-dev.txt` copies ps3recomp's dependencies (update on a pin bump).
+- Two executables (D44): the player app must also run the build of whichever EMAIN.SELF the play folder holds, and the code map (D21) should map `TPPS-01.22/EMAIN.SELF`. The README's "Translate and boot" lists the second translation; a single script step that translates and builds both would stop them drifting apart.
+- Syscall 988 is treated by `ppu_loader.cpp` as a second `sys_tty_write`; under lv2/RPCS3 it is a debug PPU-exception-handler call (unimplemented in RPCS3). It reads a NULL buffer and logs "[tty] suspicious len". Make it a logged no-op.
+- Unresolved imports of the post-install EMAIN: 0x0DFBADFA, 0x8AF3825E, 0x13EFE7F5 (names not found in ps3recomp or RPCS3; FINDINGS round 6).
