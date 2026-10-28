@@ -380,12 +380,18 @@ def test_real_smoke(tmp_path):
 
 def test_parse_press_and_pad_script():
     """--press S:BUTTON maps to ps3recomp's PAD_SCRIPT masks (CELL_PAD_CTRL_*, D40)."""
-    assert boot_game.parse_press("480:cross") == (480.0, "cross")
-    assert boot_game.parse_press("2.5:START") == (2.5, "start")
-    for bad in ("cross", "10:", "10:x", "-1:cross", "abc:cross"):
+    assert boot_game.parse_press("480:cross") == (480.0, "cross", 1)
+    assert boot_game.parse_press("2.5:START") == (2.5, "start", 1)
+    assert boot_game.parse_press("2@30:cross") == (30.0, "cross", 2)
+    for bad in ("cross", "10:", "10:x", "-1:cross", "abc:cross", "inf:cross", "nan:cross",
+                "0@5:cross", "x@5:cross"):
         with pytest.raises(ValueError):
             boot_game.parse_press(bad)
     assert boot_game.pad_script([(30, "start"), (2.5, "cross")]) == "2.5:0x4000,30:0x0008"
+    # each image gets only its own presses (Task 5 batch 1 review, I3)
+    assert boot_game.press_env([(30, "start", 1), (5, "cross", 2), (2.5, "cross", 1)]) == {
+        "PAD_SCRIPT": "2.5:0x4000,30:0x0008", "GT6_PAD_SCRIPT_IMAGE2": "5:0x4000"}
+    assert boot_game.press_env([(5, "cross", 2)]) == {"GT6_PAD_SCRIPT_IMAGE2": "5:0x4000"}
     # the masks are cellPad.h's: START is DIGITAL1 bit 3, CROSS DIGITAL2 bit 6
     assert boot_game.PAD_BUTTONS["start"] == 1 << 3 and boot_game.PAD_BUTTONS["cross"] == 1 << 14
     assert boot_game.PAD_BUTTONS["circle"] == 1 << 13 and boot_game.PAD_BUTTONS["select"] == 1
@@ -398,7 +404,8 @@ def test_press_reaches_the_game_and_the_report(tree, tmp_path):
     assert rc == 0
     assert "PAD_SCRIPT=5:0x0008,45:0x4000" in (run / "stdout.log").read_text()
     rep = json.loads((run / "report.json").read_text())
-    assert rep["presses"] == [{"seconds": 5.0, "button": "start"}, {"seconds": 45.0, "button": "cross"}]
+    assert rep["presses"] == [{"image": 1, "seconds": 5.0, "button": "start"},
+                              {"image": 1, "seconds": 45.0, "button": "cross"}]
     assert "Pad presses" in (run / "summary.md").read_text()
 
 

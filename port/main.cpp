@@ -62,6 +62,7 @@
 #include <string.h>
 #include <sys/stat.h>   /* stat, mkdir: the /dev_hdd0 and /dev_hdd1 folders, see configure_vfs_roots */
 #include <unistd.h>     /* execv: exit-spawn, see gt6_exitspawn */
+#include <fcntl.h>      /* FD_CLOEXEC on guest files before the exec */
 #include <string>
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>   /* _NSGetExecutablePath */
@@ -508,6 +509,7 @@ typedef void (*ps3_exitspawn_host_fn)(const char*, const char* const*, const cha
 void ps3_exitspawn_set_host(ps3_exitspawn_host_fn fn);   /* libs/system/sysGameExitspawn.c */
 void rsx_metal_backend_export_window_state(void);        /* libs/video/rsx_metal_backend.m */
 }
+static const int GT6_EXITSPAWN_MAX = 16;   /* re-executions per process (M5 of the batch 1 review) */
 static char  s_self_exe[4096];
 static char* s_elf_arg;
 
@@ -537,12 +539,30 @@ static void gt6_exitspawn(const char* path, const char* const* argv, const char*
         fprintf(stderr, "[exitspawn] the new image gets no envp (ps3recomp starts every image with an empty one)\n");
     if (data_size)
         fprintf(stderr, "[exitspawn] the %u-byte data block is not passed on\n", data_size);
+    /* PS3_ARGV is ';'-separated (configure_guest_argv), so an argv entry holding a ';' would
+     * be split in two in the new image. GT6 passes only paths, which never hold one. */
     std::string rest;
     for (int i = 1; argv[i]; i++) { if (i > 1) rest += ';'; rest += argv[i]; }
     setenv("PS3_BOOT_PATH", argv[0], 1);
     setenv("PS3_ARGV", rest.c_str(), 1);
     const char* c = getenv("GT6_EXITSPAWN_COUNT");
     const int n = (c ? atoi(c) : 0) + 1;
+    /* A title that exit-spawns on every start would re-execute for ever outside the harness
+     * (whose --seconds bounds a run). 16 images is far more than GT6's two. */
+    if (n > GT6_EXITSPAWN_MAX) {
+        fprintf(stderr, "[exitspawn] %d exit-spawns already: refusing another; the process exits\n",
+                GT6_EXITSPAWN_MAX);
+        return;
+    }
+    /* Pad presses are per image (D40, D41): image n+1 gets GT6_PAD_SCRIPT_IMAGE<n+1> as its
+     * PAD_SCRIPT, or none, so presses meant for one image never replay in the next. */
+    {
+        char key[48];
+        snprintf(key, sizeof key, "GT6_PAD_SCRIPT_IMAGE%d", n + 1);
+        const char* ps = getenv(key);
+        if (ps && *ps) setenv("PAD_SCRIPT", ps, 1);
+        else unsetenv("PAD_SCRIPT");
+    }
     char nbuf[16];
     snprintf(nbuf, sizeof nbuf, "%d", n);
     setenv("GT6_EXITSPAWN_COUNT", nbuf, 1);
@@ -552,8 +572,18 @@ static void gt6_exitspawn(const char* path, const char* const* argv, const char*
     rsx_metal_backend_export_window_state();
     printf("[exitspawn] exec %s %s (image %d; guest argv %s%s%s)\n", s_self_exe, s_elf_arg, n + 1,
            argv[0], rest.empty() ? "" : ";", rest.c_str());
-    fflush(stdout);
-    fflush(stderr);
+    /* lv2's file writes are unbuffered system calls; the port's guest files are stdio streams
+     * (ppu_fs.cpp). Flush every stream so a file the guest still holds open keeps its tail,
+     * then keep the guest's descriptors (and any other the process opened) out of the new
+     * image: only stdin, stdout and stderr pass through the exec. */
+    fflush(NULL);
+    {
+        const int maxfd = (int)sysconf(_SC_OPEN_MAX);
+        for (int fd = 3; fd < (maxfd > 0 && maxfd < 65536 ? maxfd : 4096); fd++) {
+            const int fl = fcntl(fd, F_GETFD);
+            if (fl >= 0) fcntl(fd, F_SETFD, fl | FD_CLOEXEC);
+        }
+    }
     char* const args[] = { s_self_exe, s_elf_arg, nullptr };
     execv(s_self_exe, args);
     fprintf(stderr, "[exitspawn] exec %s failed: %s\n", s_self_exe, strerror(errno));

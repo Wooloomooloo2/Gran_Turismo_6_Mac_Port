@@ -5,7 +5,7 @@
 Usage:
     .venv/bin/python scripts/boot_game.py <tree> [--gt6 PATH] [--seconds N] [--idle N] [--window]
         [--until {flip,time}] [--frame-every N] [--frame-max N] [--png] [--prune]
-        [--press SECONDS:BUTTON ...]
+        [--press [IMAGE@]SECONDS:BUTTON ...]
 
 <tree> is the player's game folder ($GT6_TREE). It needs the play folder from
 prepare_play.py and the decrypted EMAIN.SELF.elf. The binary defaults to
@@ -39,10 +39,13 @@ When the game exit-spawns itself (D41) the port re-executes in the same process,
 goes on; the new image's milestone log, frames and draw statistics go to
 milestones.log.spawn<n>, frames/spawn<n>/ and draw_stats.txt.spawn<n>, and report.json
 "spawns" (and summary.md) describe each image after the first.
---press S:BUTTON (repeatable; D40) presses a pad button S seconds after the game first polls
-the pad, through ps3recomp's PAD_SCRIPT (cellPad: held for 40 polls, about 0.4 s at GT6's
-rate). BUTTON is a CELL_PAD_CTRL_* name: cross, circle, triangle, square, start, select,
-up, down, left, right, l1, l2, l3, r1, r2, r3. report.json records them in "presses".
+--press [N@]S:BUTTON (repeatable; D40) presses a pad button S seconds after image N (default 1,
+the first; 2 is the first exit-spawned image, D41) first polls the pad, through ps3recomp's
+PAD_SCRIPT (cellPad: held for 40 polls, about 0.4 s at GT6's rate). Each image gets only its
+own presses: the port hands image N the script in GT6_PAD_SCRIPT_IMAGE<N> and clears
+PAD_SCRIPT when there is none. BUTTON is a CELL_PAD_CTRL_* name: cross, circle, triangle,
+square, start, select, up, down, left, right, l1, l2, l3, r1, r2, r3. report.json records
+them in "presses".
 The run is recorded in <tree>/play/prepare.json as "booted": <run>. A play folder an earlier
 run used is not clean (the game's first run changes it): the boot still runs, but warns,
 names the earlier run in report.json ("play_reused") and summary.md, and points at
@@ -53,6 +56,7 @@ least one frame kept), otherwise 1.
 import argparse
 import datetime
 import json
+import math
 import os
 import re
 import shutil
@@ -145,21 +149,39 @@ PAD_BUTTONS = {
 
 
 def parse_press(text):
-    """'<seconds>:<button>' -> (seconds, button name); ValueError if either is bad."""
-    sec, sep, name = text.partition(":")
+    """'[<image>@]<seconds>:<button>' -> (seconds, button name, image); ValueError if bad.
+
+    The image is 1 (the first) unless given; 2 is the first exit-spawned image (D41)."""
+    image, at, rest = text.partition("@")
+    if not at:
+        image, rest = "1", text
+    if not image.strip().isdigit() or int(image) < 1:
+        raise ValueError(f"--press image must be 1 or more, not {image!r}")
+    sec, sep, name = rest.partition(":")
     name = name.strip().lower()
     if not sep or name not in PAD_BUTTONS:
-        raise ValueError(f"--press wants SECONDS:BUTTON with BUTTON one of "
+        raise ValueError(f"--press wants [IMAGE@]SECONDS:BUTTON with BUTTON one of "
                          f"{', '.join(sorted(PAD_BUTTONS))}, not {text!r}")
     t = float(sec)
-    if not t >= 0:
-        raise ValueError(f"--press time must be 0 or more seconds, not {sec!r}")
-    return t, name
+    if not (math.isfinite(t) and t >= 0):
+        raise ValueError(f"--press time must be a finite 0 or more seconds, not {sec!r}")
+    return t, name, int(image)
 
 
 def pad_script(presses):
     """ps3recomp's PAD_SCRIPT value for [(seconds, button), ...], in time order."""
     return ",".join(f"{t:g}:0x{PAD_BUTTONS[b]:04X}" for t, b in sorted(presses))
+
+
+def press_env(presses):
+    """The environment for [(seconds, button, image), ...]: PAD_SCRIPT for image 1 and
+    GT6_PAD_SCRIPT_IMAGE<n> for each later image with presses (the port moves it into
+    PAD_SCRIPT when it re-executes as image n, and clears PAD_SCRIPT otherwise)."""
+    env = {}
+    for image in sorted({i for _, _, i in presses}):
+        script = pad_script([(t, b) for t, b, i in presses if i == image])
+        env["PAD_SCRIPT" if image == 1 else f"GT6_PAD_SCRIPT_IMAGE{image}"] = script
+    return env
 
 
 def build_env(tree, run, headless, env, frame_every=60, frame_max=300):
@@ -461,9 +483,11 @@ def boot(gt6, tree, seconds=300, idle=60, headless=True, env=None, until="flip",
                 sizes = _sizes(run)
                 if sizes != last_sizes:
                     last_sizes, last_growth = sizes, now
-                    if flip_at is None and FLIP_KEY in parse_milestones(
-                            _read(run / "milestones.log"))["keys"]:
-                        flip_at = now
+                    if flip_at is None and any(
+                            FLIP_KEY in parse_milestones(_read(m))["keys"]
+                            for m in [run / "milestones.log"]
+                            + sorted(run.glob("milestones.log.spawn*"))):
+                        flip_at = now   # a flip by any image (D41) counts
                 if dump_stopped is None:
                     dump_stopped = _dump_check(frames_dir, frame_bytes)
                     if dump_stopped:
@@ -580,9 +604,10 @@ def main(argv=None):
                     help="convert the dumped frames to frames_png/*.png (sips) for viewing")
     ap.add_argument("--prune", action="store_true",
                     help=f"after the run, delete all but the newest {PRUNE_KEEP} runs")
-    ap.add_argument("--press", action="append", default=[], metavar="SECONDS:BUTTON",
-                    help="press a pad button SECONDS after the game first polls the pad "
-                         "(repeatable), e.g. 480:cross")
+    ap.add_argument("--press", action="append", default=[], metavar="[IMAGE@]SECONDS:BUTTON",
+                    help="press a pad button SECONDS after image IMAGE (default 1; 2 is the "
+                         "first exit-spawned one) first polls the pad (repeatable), "
+                         "e.g. 480:cross or 2@30:cross")
     args = ap.parse_args(argv)
     if args.frame_every < 1 or args.frame_max < 0:
         ap.error("--frame-every must be at least 1 and --frame-max at least 0")
@@ -590,18 +615,21 @@ def main(argv=None):
         presses = [parse_press(p) for p in args.press]
     except ValueError as e:
         ap.error(str(e))
-    env = {"PAD_SCRIPT": pad_script(presses)} if presses else None
+    env = press_env(presses) if presses else None
     tree = Path(args.tree).expanduser()
     gt6 = Path(args.gt6) if args.gt6 else tree / GT6_REL
     rep = boot(gt6, tree, args.seconds, args.idle, headless=not args.window, until=args.until,
                frame_every=args.frame_every, frame_max=args.frame_max, env=env)
     run = Path(rep["run"])
     if presses:
-        rep["presses"] = [{"seconds": t, "button": b} for t, b in sorted(presses)]
+        rep["presses"] = [{"image": i, "seconds": t, "button": b}
+                          for t, b, i in sorted(presses, key=lambda p: (p[2], p[0]))]
         (run / "report.json").write_text(json.dumps(rep, indent=2) + "\n")
         with open(run / "summary.md", "a") as f:
-            f.write("- Pad presses (seconds after the first pad poll): "
-                    + ", ".join(f"{t:g} s {b}" for t, b in sorted(presses)) + "\n")
+            f.write("- Pad presses (seconds after that image's first pad poll): "
+                    + ", ".join(f"image {i} {t:g} s {b}"
+                                for t, b, i in sorted(presses, key=lambda p: (p[2], p[0])))
+                    + "\n")
     if args.png:
         rep["frames_png"] = to_png(run)
         (run / "report.json").write_text(json.dumps(rep, indent=2) + "\n")

@@ -28,6 +28,8 @@ RPCS3 (sys_game_.cpp, sceNp.cpp, lv2/sys_process.cpp):
   not checked: the runtime runs executables that are already decrypted);
 - _sys_process_exit2 reads sys_exit2_param (args: argv, 0, envp, 0); with
   no argv it is a plain exit.
+- a NULL path (sys_game_process_exitspawn(2)) spawns nothing: the call
+  returns (EFAULT, logged) and the process goes on, instead of crashing.
 The runtime cannot load an executable by itself, so the spawn goes to a host
 handler that a port registers (ps3_exitspawn_set_host), for example one that
 execs its own binary on the target's lifted image. With no handler, or when
@@ -41,15 +43,15 @@ Test: tools/test_exitspawn.py (new) checks the names hash to the imported
 NIDs, then builds libs/system/tests/test_exitspawn.c with sysGameExitspawn.c,
 a recording host handler and guest caller: the argv and envp handed over,
 the flags that pick which guest function runs, the data block cap, the NP
-DRM refusals, _sys_process_exit2's parsing, and the exit when no handler
-starts the target.
+DRM refusals, _sys_process_exit2's parsing, the exit when no handler
+starts the target, and a NULL path returning without a spawn.
 
 diff --git a/libs/system/sysGameExitspawn.c b/libs/system/sysGameExitspawn.c
 new file mode 100644
-index 00000000..5cad68ef
+index 0000000..27662df
 --- /dev/null
 +++ b/libs/system/sysGameExitspawn.c
-@@ -0,0 +1,155 @@
+@@ -0,0 +1,159 @@
 +/*
 + * ps3recomp - process exit-spawn (see sysGameExitspawn.h)
 + *
@@ -107,6 +109,10 @@ index 00000000..5cad68ef
 + * no handler or it could not start the target; the process then exits. */
 +static void exitspawn(const char* path, u32 argv, u32 envp, u32 data, u32 data_size, s32 prio, u64 flags)
 +{
++    if (!path) {   /* nothing to start: the call fails (EFAULT) and returns, the process goes on */
++        fprintf(stderr, "[exitspawn] NULL path: EFAULT, nothing spawned\n");
++        return;
++    }
 +    u32 bytes = (((u32)strlen(path) + 0x10) & ~0xFu);
 +    u32 argc = count_strings(argv, &bytes), envc = count_strings(envp, &bytes);
 +    if ((argc + envc + 1) * 8 + bytes > EXITSPAWN_ARGS_MAX) { argc = envc = 0; }
@@ -207,7 +213,7 @@ index 00000000..5cad68ef
 +}
 diff --git a/libs/system/sysGameExitspawn.h b/libs/system/sysGameExitspawn.h
 new file mode 100644
-index 00000000..2851d732
+index 0000000..2851d73
 --- /dev/null
 +++ b/libs/system/sysGameExitspawn.h
 @@ -0,0 +1,55 @@
@@ -268,10 +274,10 @@ index 00000000..2851d732
 +#endif /* PS3RECOMP_SYS_GAME_EXITSPAWN_H */
 diff --git a/libs/system/tests/test_exitspawn.c b/libs/system/tests/test_exitspawn.c
 new file mode 100644
-index 00000000..b900d025
+index 0000000..4b9703f
 --- /dev/null
 +++ b/libs/system/tests/test_exitspawn.c
-@@ -0,0 +1,126 @@
+@@ -0,0 +1,132 @@
 +/*
 + * test_exitspawn - sys_game_process_exitspawn(2), sceNpDrmProcessExitSpawn2 and
 + * _sys_process_exit2 (libs/system/sysGameExitspawn.c), with a host handler that
@@ -393,13 +399,19 @@ index 00000000..b900d025
 +    SPAWN(ps3_sys_process_exit2(3, 0x5000, 0x60));
 +    CHECK(g_host == 0 && g_exit_code == 3, "_sys_process_exit2 with no argv is a plain exit");
 +
++    /* a NULL path spawns nothing and does not exit (EFAULT), rather than crashing */
++    SPAWN(sys_game_process_exitspawn2(NULL, NULL, NULL, 0, 0, 1001, 0));
++    CHECK(g_host == 0 && g_exit_code == -1, "exit-spawn with a NULL path returns without spawning or exiting");
++    SPAWN(sys_game_process_exitspawn(NULL, NULL, NULL, 0, 0, 1001, 0));
++    CHECK(g_host == 0 && g_exit_code == -1, "exit-spawn (v1) with a NULL path returns without spawning or exiting");
++
 +    remove(f); rmdir(g_root);
 +    if (fails) { printf("%d check(s) failed\n", fails); return 1; }
 +    puts("test_exitspawn: OK");
 +    return 0;
 +}
 diff --git a/runtime/ppu/ppu_sysprx.cpp b/runtime/ppu/ppu_sysprx.cpp
-index 5387d831..a18bbb42 100644
+index 5387d83..a18bbb4 100644
 --- a/runtime/ppu/ppu_sysprx.cpp
 +++ b/runtime/ppu/ppu_sysprx.cpp
 @@ -612,6 +612,10 @@ static void sys_mmapper_allocate_memory_from_container(ppu_context* ctx)
@@ -426,7 +438,7 @@ index 5387d831..a18bbb42 100644
      /* Lightweight mutex family (guards global/singleton init in the CRT). */
      ps3_hle_register_ctx(ps3_compute_nid("sys_lwmutex_create"),  "sys_lwmutex_create",  sys_lwmutex_create);
 diff --git a/runtime/syscalls/lv2_register.c b/runtime/syscalls/lv2_register.c
-index 96266731..c44d8c22 100644
+index 9626673..c44d8c2 100644
 --- a/runtime/syscalls/lv2_register.c
 +++ b/runtime/syscalls/lv2_register.c
 @@ -2275,6 +2275,16 @@ static int64_t sys_process_exit_handler(ppu_context* ctx)
@@ -455,7 +467,7 @@ index 96266731..c44d8c22 100644
      lv2_syscall_register(tbl, SYS_PROCESS_IS_SPU_LOCK_LINE_RESERVATION_ADDRESS,
                           sys_process_is_spu_lock_line_reservation_address);
 diff --git a/runtime/syscalls/lv2_syscall_table.h b/runtime/syscalls/lv2_syscall_table.h
-index 85d76de8..382d4326 100644
+index 85d76de..382d432 100644
 --- a/runtime/syscalls/lv2_syscall_table.h
 +++ b/runtime/syscalls/lv2_syscall_table.h
 @@ -37,6 +37,7 @@ extern "C" {
@@ -468,7 +480,7 @@ index 85d76de8..382d4326 100644
  #define SYS_PROCESS_GET_NUMBER_OF_OBJECT 12
 diff --git a/tools/test_exitspawn.py b/tools/test_exitspawn.py
 new file mode 100644
-index 00000000..9db4e15b
+index 0000000..9db4e15
 --- /dev/null
 +++ b/tools/test_exitspawn.py
 @@ -0,0 +1,58 @@
