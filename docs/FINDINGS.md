@@ -126,6 +126,104 @@ and rebuilding with patch 0010: `boot_game.py "$GT6_TREE" --until time --seconds
   faked `cellFiberPpuContext*` imports, then `cellFsGetFreeSize` (12 unresolved imports, one
   stubbed system call, 327).
 
+## RPCS3 reference: boot to the first menu (2026-10-28)
+
+**RPCS3 did not reach the first menu either.** It ran the first-run install to the end. After
+the player confirms it, the next boot stops at a fatal GT6 message: "Insufficient free space
+on Hard Disk Drive (HDD). At least 32MB required. 0x0000000b [68]". So there is a reference for
+the install screens, but none yet for the menu.
+
+**The main comparison: our port shows black where RPCS3 already shows the install screen.**
+At 0-3 minutes, RPCS3 shows the dimmed legal text with GT6's own "Installing..." dialog and
+progress bar. Our port draws one flat black full-screen quad per frame. RPCS3's display buffers
+stay 1280 x 720 the whole time; the port's presented size of 1440 x 1080, then 1536 x 1408,
+is not a display-buffer size.
+
+Run outputs are in `$GT6_TREE/reference/rpcs3-20261028-000710/`: `timeline.md`,
+`first-run-install.png`, `post-install-error.png`, `calls.txt`, the syscall lists and one folder
+per launch. RPCS3 0.0.43-20410 ran with firmware 4.50 on a fresh APFS clone of the verified
+`dev_hdd0/game/BCES01977`, as in the section below. It used a copy of the owner's config with
+every Cell log channel at Trace, in a window. The window was screenshotted every 10 s.
+RPCS3's log was read in place, and only through a filter that drops any line with 32 or more hex digits (once separators and
+`0x` are removed) or a key word. The log was deleted afterwards.
+
+**Timeline** (seconds from launch; full detail in `timeline.md`):
+
+- **Launch A**, pristine clone with cold caches. RPCS3 compiled for 72 s, then the EBOOT ran
+  and spawned EMAIN. RPCS3 compiled EMAIN until 145 s. At 149 s, after setting up SPURS,
+  EMAIN's main thread waited on a SPURS event that never came, and the screen stayed black. It
+  was stopped at 740 s. FINDINGS run 1 (below) saw the same thing on a cold first boot.
+- **Launch B**, the first-run install, with warm caches.
+  - From 2 to 11 s RPCS3 built its SPU cache.
+  - **The first non-black screen came at about 13 s.** It shows the legal text, dimmed, behind
+    a dialog that GT6 draws itself (it is not the system message dialog). The dialog reads
+    "Please wait... / Installing... / Please do not switch off the system while the HDD access
+    indicator is flashing." It has a progress bar, an "Approx. N mins. left" line, a greyed OK
+    button and a "Close" hint.
+  - The install began at 13.8 s and **finished between 430 and 440 s**, after about 7 minutes.
+    The dialog then read "Installation complete. / Done", with the OK button active.
+  - **One button press was needed: Cross** (the X key on RPCS3's default keyboard pad).
+    Enter, which RPCS3 maps to Start, did nothing.
+  - EMAIN then shut down its input, audio and network, and exit-spawned `EMAIN.SELF` again.
+    The new process was compiled fresh and stalled the same way as launch A, so it was stopped
+    at 1440 s.
+- **Launch C**, the boot after the install.
+  - The EBOOT found no `TPPS-01.07/update.txt` this time (the install removes it).
+  - EMAIN ran `cellSaveDataAutoLoad2` for `BCJS37016-GAME6` and `BCJS37016-BKUP6`. There is no
+    save yet, so the status callback returned -4.
+  - EMAIN registered trophy context NPWR04712, then created `USRDIR/db/userdb0101.dat` (8 MB)
+    and `/dev_hdd1/game024.db`.
+  - **At 14.6 s it opened the fatal error dialog** (type 0x80: an error with no buttons that
+    cannot be cancelled), over a faint "Sony Computer Entertainment" logo. Pressing X or Enter
+    did nothing.
+  - RPCS3 reports 40 GB free to every free-space query, so this message stands for some other
+    failure, which this run did not find. RPCS3's compatibility list rates GT6 "Ingame" and
+    advises against updates past 1.05.
+- No intro movie or title screen was reached, because none comes before this point.
+
+**Display.**
+- The EBOOT sets 2 display buffers of 1280 x 720 with pitch 5120.
+- EMAIN sets 3 display buffers of 1280 x 720 with pitch 6144, at RSX offsets 0, 0x660000 and
+  0xcc0000. 6144 is 1536 x 4, so the port's 1536-wide surface at 0xcc0000 is probably EMAIN's
+  third display buffer, sized from its pitch rather than its width. That is a lead for the
+  bring-up loop, not yet checked.
+- Video out is configured for 720p (resolutionId 2), the only mode this RPCS3 config offers.
+
+**Calls before the error.**
+- `calls.txt` lists 93 distinct HLE function names, from launches B and C.
+- In this RPCS3 setup, GT6 itself loads libgcm_sys, libsre (SPURS), libfiber, libfs, libnet,
+  libssl, libhttp, libusbd and libkey2char from `dev_flash`, and RPCS3 runs liblv2 as firmware
+  code. Calls into those libraries are not logged by name; only the lv2 syscalls they make
+  are. Those are listed in `syscalls-all.txt` (118); `syscalls-from-game.txt` (82) has the
+  ones made from GT6's own code.
+- Compared with the 12 imports the port fakes (BACKLOG), Task 4's audit script not being
+  written yet:
+  - `cellVideoOutGetScreenSize` is called, and **RPCS3 answers
+    `CELL_VIDEO_OUT_ERROR_VALUE_IS_NOT_SET` (0x8002b228), not CELL_OK**. The port's faked
+    success is therefore wrong for an ordinary TV setup.
+  - The other 11 live in libraries that run as firmware code here, so they are not logged by
+    name. Their use is visible from the syscalls instead:
+    - SPURS (libsre) creates SPU thread groups and starts and joins them 138,825 times during
+      the install.
+    - `sys_prx_get_module_list` reaches its syscall `_sys_prx_get_module_list` (6 calls).
+    - the `cellUsbd*Ldd` calls reach `sys_usbd_register_extra_ldd` (8 calls) and
+      `sys_usbd_unregister_extra_ldd`.
+    - fibers and `sys_mempool_create` make no syscall of their own.
+- Other calls on the path that later tasks must answer correctly:
+  - `cellNetCtlAddHandler`, `cellAudioOutGetDeviceInfo`, `cellMusicInitialize2` and
+    `sceNpTrophySetSoundLevel` are RPCS3 TODO stubs.
+  - `cellNetCtlGetInfo` returns `CELL_NET_CTL_ERROR_NOT_CONNECTED`.
+  - `cellSaveDataAutoLoad2` returns `CELL_SAVEDATA_ERROR_CBRESULT` when there is no save.
+  - `cellGameDataCheck` is called for `BCES01893` (absent) and for `BCES01977`.
+
+**RPCS3's state afterwards.**
+- RPCS3's `dev_hdd0/game/BCES01977` is now this post-install copy (12 GB on disk, mostly
+  clone-shared). Nothing was there before this run, and no GT6 save existed.
+- The run also added a trophy folder (NPWR04712_00) and `dev_hdd1/caches/BCES01977_BCES01977`.
+- `games.yml` was pointed at `$GT6_TREE/dev_bdvd` for the run and then restored. The SHA-256
+  of `config.yml` and `games.yml` match the values taken before the run.
+- RPCS3's GT6 playtime grew from 946,248 ms to 3,572,157 ms, about 44 minutes added.
+
 ## Where GT6's run-time SPU images come from (2026-10-27)
 
 The SPU images GT6 runs that the translate step did not find (D33) were dumped by the runtime on
