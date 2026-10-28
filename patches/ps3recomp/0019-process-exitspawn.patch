@@ -1,0 +1,532 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] Process exit-spawn: sys_game_process_exitspawn(2), sceNpDrmProcessExitSpawn(2), _sys_process_exit2
+
+Upstream: not yet submitted; written to be upstreamed (generic, no title names)
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0018)
+
+What: a title ends its process and has the system start another executable,
+or itself again, with a new argv and envp. sys_game_process_exitspawn2
+(0x67F9FEDB) and sceNpDrmProcessExitSpawn2 (0xE6C8F3F9), and their first
+versions, had no handler, so they faked CELL_OK and the title ran on past
+its own exit. lv2's _sys_process_exit2 (syscall 26) was not registered, so
+it fell through to the catch-all stub, which answered CELL_OK too.
+_sys_process_atexitspawn and _sys_process_at_Exitspawn were accepted and
+forgotten.
+
+libs/system/sysGameExitspawn.c (new) implements them. Behaviour follows
+RPCS3 (sys_game_.cpp, sceNp.cpp, lv2/sys_process.cpp):
+- the new argv is the target path, then the caller's argv entries, then
+  its envp; when these would take more than 4 KB, argv and envp are
+  dropped; the data block is kept, up to 4 KB;
+- the guest's atexitspawn function runs first when the flags' top two bits
+  are 0, its at_Exitspawn function when they are 1. sys_game_process_exitspawn
+  sets them to 2 (neither runs), and sys_game_process_exitspawn2 turns 2 or 3
+  into 0; the first registration of each is kept;
+- sceNpDrmProcessExitSpawn(2) answer SCE_NP_DRM_ERROR_INVALID_PARAM for a
+  NULL path and CELL_ENOENT for a target that is not there (the klicensee is
+  not checked: the runtime runs executables that are already decrypted);
+- _sys_process_exit2 reads sys_exit2_param (args: argv, 0, envp, 0); with
+  no argv it is a plain exit.
+The runtime cannot load an executable by itself, so the spawn goes to a host
+handler that a port registers (ps3_exitspawn_set_host), for example one that
+execs its own binary on the target's lifted image. With no handler, or when
+the handler returns, the process exits.
+
+Why: a title that restarts itself (a first-run install finishing and
+starting the game again) ran on after the faked spawn, in a process it had
+already shut down.
+
+Test: tools/test_exitspawn.py (new) checks the names hash to the imported
+NIDs, then builds libs/system/tests/test_exitspawn.c with sysGameExitspawn.c,
+a recording host handler and guest caller: the argv and envp handed over,
+the flags that pick which guest function runs, the data block cap, the NP
+DRM refusals, _sys_process_exit2's parsing, and the exit when no handler
+starts the target.
+
+diff --git a/libs/system/sysGameExitspawn.c b/libs/system/sysGameExitspawn.c
+new file mode 100644
+index 00000000..5cad68ef
+--- /dev/null
++++ b/libs/system/sysGameExitspawn.c
+@@ -0,0 +1,155 @@
++/*
++ * ps3recomp - process exit-spawn (see sysGameExitspawn.h)
++ *
++ * Behaviour follows RPCS3 (sys_game_.cpp, sceNp.cpp, lv2/sys_process.cpp):
++ * - the new argv is the target path followed by the caller's argv entries,
++ *   then its envp; when they would take more than 4 KB both are dropped;
++ *   the data block is kept up to 4 KB;
++ * - before the spawn the guest's atexitspawn function runs when the flags'
++ *   top two bits are 0, its at_Exitspawn function when they are 1;
++ *   sys_game_process_exitspawn sets them to 2 (neither runs),
++ *   sys_game_process_exitspawn2 keeps 0 or 1 and turns 2 or 3 into 0;
++ * - sceNpDrmProcessExitSpawn(2) answer SCE_NP_DRM_ERROR_INVALID_PARAM for a
++ *   NULL path and the file system's error for a target that is not there;
++ * - _sys_process_exit2 with no argv is a plain process exit.
++ * The klicensee is not checked: the runtime runs executables that are already
++ * decrypted.
++ */
++
++#include "sysGameExitspawn.h"
++#include "sysPrxForUser.h"            /* sys_process_exit */
++#include "../filesystem/cellFs.h"     /* cellfs_translate_path */
++#include "../../runtime/ppu/ppu_memory.h"   /* vm_read32/64, vm_base */
++#include "ps3emu/guest_call.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++
++#define EXITSPAWN_ARGS_MAX   0x1000u   /* argv + envp, as lv2's buffer */
++#define EXITSPAWN_DATA_MAX   0x1000u
++#define NP_DRM_INVALID_PARAM 0x80029502u
++
++static ps3_exitspawn_host_fn s_host;
++static u32 s_atexitspawn, s_at_exitspawn;
++
++void ps3_exitspawn_set_host(ps3_exitspawn_host_fn fn) { s_host = fn; }
++void ps3_exitspawn_register_atexitspawn(u32 opd) { if (!s_atexitspawn) s_atexitspawn = opd; }
++void ps3_exitspawn_register_at_exitspawn(u32 opd) { if (!s_at_exitspawn) s_at_exitspawn = opd; }
++
++static const char* gstr(u32 ea) { return ea ? (const char*)(vm_base + ea) : NULL; }
++
++/* Count a guest NULL-terminated array of u32 string pointers and the bytes its
++ * strings take (each with its NUL, rounded to 16 as lv2 lays them out). */
++static u32 count_strings(u32 arr, u32* bytes)
++{
++    u32 n = 0;
++    if (!arr) return 0;
++    for (u32 p; (p = vm_read32(arr + 4 * n)) != 0; n++)
++        *bytes += ((u32)strlen(gstr(p)) + 0x10) & ~0xFu;
++    return n;
++}
++
++/* Builds the host argv/envp, runs the registered guest function the flags
++ * select, and hands the spawn to the host handler. Returns only when there is
++ * no handler or it could not start the target; the process then exits. */
++static void exitspawn(const char* path, u32 argv, u32 envp, u32 data, u32 data_size, s32 prio, u64 flags)
++{
++    u32 bytes = (((u32)strlen(path) + 0x10) & ~0xFu);
++    u32 argc = count_strings(argv, &bytes), envc = count_strings(envp, &bytes);
++    if ((argc + envc + 1) * 8 + bytes > EXITSPAWN_ARGS_MAX) { argc = envc = 0; }
++
++    const char** hargv = (const char**)calloc(argc + 2, sizeof(char*));
++    const char** henvp = (const char**)calloc(envc + 1, sizeof(char*));
++    if (!hargv || !henvp) { fprintf(stderr, "[exitspawn] out of memory\n"); sys_process_exit(0); return; }
++    hargv[0] = path;
++    for (u32 i = 0; i < argc; i++) hargv[i + 1] = gstr(vm_read32(argv + 4 * i));
++    for (u32 i = 0; i < envc; i++) henvp[i] = gstr(vm_read32(envp + 4 * i));
++    const u32 dsize = data && data_size ? (data_size < EXITSPAWN_DATA_MAX ? data_size : EXITSPAWN_DATA_MAX) : 0;
++
++    printf("[exitspawn] %s (argc %u, envc %u, data %u bytes, prio %d, flags 0x%llX)\n",
++           path, argc + 1, envc, dsize, prio, (unsigned long long)flags);
++    fflush(stdout);
++
++    const u32 fn = (flags >> 62) == 0 ? s_atexitspawn : (flags >> 62) == 1 ? s_at_exitspawn : 0;
++    if (fn) ps3_invoke_guest(fn, 0, 0, 0, 0, 0, 0, 0, 0);
++
++    if (s_host)
++        s_host(path, hargv, henvp, dsize ? vm_base + data : NULL, dsize, prio, flags);
++    fprintf(stderr, "[exitspawn] no host handler started %s; the process exits\n", path);
++    free(hargv); free(henvp);
++    sys_process_exit(0);
++}
++
++void sys_game_process_exitspawn(const char* path, const char* const* argv, const char* const* envp,
++                                u32 data, u32 data_size, s32 prio, u64 flags)
++{
++    exitspawn(gstr((u32)(uintptr_t)path), (u32)(uintptr_t)argv, (u32)(uintptr_t)envp,
++              data, data_size, prio, (flags & 0xF0u) | (1ull << 63));
++}
++
++void sys_game_process_exitspawn2(const char* path, const char* const* argv, const char* const* envp,
++                                 u32 data, u32 data_size, s32 prio, u64 flags)
++{
++    const u64 f = (flags >> 62) >= 2 ? (flags & 0xF0u) : (flags & 0xC0000000000000F0ull);
++    exitspawn(gstr((u32)(uintptr_t)path), (u32)(uintptr_t)argv, (u32)(uintptr_t)envp,
++              data, data_size, prio, f);
++}
++
++/* The target must be there: a NULL path is INVALID_PARAM, a missing file the file system's ENOENT. */
++static s32 np_drm_target_check(const char* path)
++{
++    if (!path) return (s32)NP_DRM_INVALID_PARAM;
++    char host[1024];
++    struct stat st;
++    if (cellfs_translate_path(gstr((u32)(uintptr_t)path), host, sizeof host) != 0 || stat(host, &st) != 0)
++        return (s32)CELL_ENOENT;
++    return CELL_OK;
++}
++
++s32 sceNpDrmProcessExitSpawn(const u8* klicensee, const char* path, const char* const* argv,
++                             const char* const* envp, u32 data, u32 data_size, s32 prio, u64 flags)
++{
++    (void)klicensee;
++    s32 rc = np_drm_target_check(path);
++    if (rc) return rc;
++    sys_game_process_exitspawn(path, argv, envp, data, data_size, prio, flags);
++    return CELL_OK;
++}
++
++s32 sceNpDrmProcessExitSpawn2(const u8* klicensee, const char* path, const char* const* argv,
++                              const char* const* envp, u32 data, u32 data_size, s32 prio, u64 flags)
++{
++    (void)klicensee;
++    s32 rc = np_drm_target_check(path);
++    if (rc) return rc;
++    sys_game_process_exitspawn2(path, argv, envp, data, data_size, prio, flags);
++    return CELL_OK;
++}
++
++/* sys_exit2_param: u64 0x85, u64 this_size (0x30), u64 next_size, s64 prio,
++ * u64 flags, u64 args (a guest array of u64 string pointers: argv, 0, envp, 0).
++ * The data block, when there is one, is the last 4 KB of the argument area. */
++void ps3_sys_process_exit2(s32 status, u32 arg, u32 arg_size)
++{
++    if (!arg) { sys_process_exit(status); return; }
++    const u32 args = (u32)vm_read64(arg + 0x28);
++    const s32 prio = (s32)vm_read64(arg + 0x18);
++    const u64 flags = vm_read64(arg + 0x20);
++    u32 n = 0;
++    while (args && vm_read64(args + 8 * n)) n++;
++    if (!n) { sys_process_exit(status); return; }
++    u32 e = 0;
++    while (vm_read64(args + 8 * (n + 1 + e))) e++;
++    const char** hargv = (const char**)calloc(n + 1, sizeof(char*));
++    const char** henvp = (const char**)calloc(e + 1, sizeof(char*));
++    if (!hargv || !henvp) { sys_process_exit(status); return; }
++    for (u32 i = 0; i < n; i++) hargv[i] = gstr((u32)vm_read64(args + 8 * i));
++    for (u32 i = 0; i < e; i++) henvp[i] = gstr((u32)vm_read64(args + 8 * (n + 1 + i)));
++    const u8* data = arg_size > 0x1030 ? vm_base + arg + arg_size - EXITSPAWN_DATA_MAX : NULL;
++    printf("[exitspawn] _sys_process_exit2 -> %s (argc %u, envc %u)\n", hargv[0], n, e);
++    fflush(stdout);
++    if (s_host) s_host(hargv[0], hargv, henvp, data, data ? EXITSPAWN_DATA_MAX : 0, prio, flags);
++    fprintf(stderr, "[exitspawn] no host handler started %s; the process exits\n", hargv[0]);
++    sys_process_exit(status);
++}
+diff --git a/libs/system/sysGameExitspawn.h b/libs/system/sysGameExitspawn.h
+new file mode 100644
+index 00000000..2851d732
+--- /dev/null
++++ b/libs/system/sysGameExitspawn.h
+@@ -0,0 +1,55 @@
++/*
++ * ps3recomp - process exit-spawn: sys_game_process_exitspawn(2),
++ * sceNpDrmProcessExitSpawn(2) and lv2's _sys_process_exit2 (syscall 26)
++ *
++ * A title ends its process and has the system start another executable (or
++ * itself again) in its place, with a new argv and envp. The runtime cannot
++ * load an executable by itself: a port that can start one registers a host
++ * handler, which replaces the process (for example exec of its own binary).
++ * With no handler, or when the handler cannot start the target, the process
++ * exits, as it would after a spawn that fails.
++ */
++
++#ifndef PS3RECOMP_SYS_GAME_EXITSPAWN_H
++#define PS3RECOMP_SYS_GAME_EXITSPAWN_H
++
++#include "ps3emu/ps3types.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* The handler gets the target's guest path, its argv (argv[0] is the path,
++ * as lv2 builds it) and envp, each NULL-terminated, and the data block (up to
++ * 4 KB, data_size 0 for none). It does not return when it starts the target;
++ * a return means it could not, and the process then exits with status 0. */
++typedef void (*ps3_exitspawn_host_fn)(const char* path, const char* const* argv,
++                                      const char* const* envp, const u8* data,
++                                      u32 data_size, s32 prio, u64 flags);
++void ps3_exitspawn_set_host(ps3_exitspawn_host_fn fn);
++
++/* _sys_process_atexitspawn / _sys_process_at_Exitspawn: the guest functions
++ * (OPDs) run before an exit-spawn, the first for the first version's flags,
++ * the second for at_Exitspawn's. The first registration of each is kept. */
++void ps3_exitspawn_register_atexitspawn(u32 opd);
++void ps3_exitspawn_register_at_exitspawn(u32 opd);
++
++/* The calls themselves (guest addresses). They do not return when the
++ * target starts; the NP DRM forms answer an error for a bad argument. */
++void sys_game_process_exitspawn(const char* path, const char* const* argv, const char* const* envp,
++                                u32 data, u32 data_size, s32 prio, u64 flags);
++void sys_game_process_exitspawn2(const char* path, const char* const* argv, const char* const* envp,
++                                 u32 data, u32 data_size, s32 prio, u64 flags);
++s32 sceNpDrmProcessExitSpawn(const u8* klicensee, const char* path, const char* const* argv,
++                             const char* const* envp, u32 data, u32 data_size, s32 prio, u64 flags);
++s32 sceNpDrmProcessExitSpawn2(const u8* klicensee, const char* path, const char* const* argv,
++                              const char* const* envp, u32 data, u32 data_size, s32 prio, u64 flags);
++
++/* lv2 syscall 26: _sys_process_exit2(status, sys_exit2_param* arg, arg_size, arg4). */
++void ps3_sys_process_exit2(s32 status, u32 arg, u32 arg_size);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* PS3RECOMP_SYS_GAME_EXITSPAWN_H */
+diff --git a/libs/system/tests/test_exitspawn.c b/libs/system/tests/test_exitspawn.c
+new file mode 100644
+index 00000000..b900d025
+--- /dev/null
++++ b/libs/system/tests/test_exitspawn.c
+@@ -0,0 +1,126 @@
++/*
++ * test_exitspawn - sys_game_process_exitspawn(2), sceNpDrmProcessExitSpawn2 and
++ * _sys_process_exit2 (libs/system/sysGameExitspawn.c), with a host handler that
++ * records the spawn instead of starting anything. Run by tools/test_exitspawn.py.
++ */
++#include "../sysGameExitspawn.c"
++#include <setjmp.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++uint8_t* vm_base;
++int g_resv_store_active = 0;
++uint32_t g_ww_lo = 0, g_ww_hi = 0;
++void ppu_resv_break_store(uint64_t ea) { (void)ea; }
++int  spu_coh_is_reserved(uint32_t addr) { (void)addr; return 0; }
++void spu_lockline_lock(void) {}
++void spu_lockline_unlock(void) {}
++void spu_coh_notify_write(uint32_t addr) { (void)addr; }
++void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width) { (void)addr; (void)val; (void)width; }
++
++/* The guest caller runs atexitspawn functions; record which. */
++static uint32_t g_called[4]; static int n_called;
++static void caller(uint32_t opd, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
++                   uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
++{ (void)a0;(void)a1;(void)a2;(void)a3;(void)a4;(void)a5;(void)a6;(void)a7; g_called[n_called++ & 3] = opd; }
++ps3_guest_caller_fn g_ps3_guest_caller = caller;
++
++/* sys_process_exit does not return: jump back to the test. */
++static jmp_buf g_exit; static int g_exit_code = -1;
++void sys_process_exit(s32 code) { g_exit_code = code; longjmp(g_exit, 1); }
++
++/* /dev_hdd0/x maps to a scratch folder; anything else is not there. */
++static char g_root[256];
++int cellfs_translate_path(const char* p, char* out, size_t n)
++{
++    if (!p || strncmp(p, "/dev_hdd0/", 10)) return -1;
++    snprintf(out, n, "%s/%s", g_root, p + 10);
++    return 0;
++}
++
++static int fails;
++#define CHECK(c, ...) do { const int ok_ = (c); printf(ok_ ? "[PASS] " : "[FAIL] "); printf(__VA_ARGS__); \
++                           printf("\n"); if (!ok_) fails++; } while (0)
++
++static char g_path[256], g_argv[8][64], g_envp[8][64]; static int g_argc, g_envc, g_host; static u32 g_dsize;
++static void host(const char* path, const char* const* argv, const char* const* envp, const u8* data,
++                 u32 data_size, s32 prio, u64 flags)
++{
++    (void)data; (void)prio; (void)flags;
++    g_host++; snprintf(g_path, sizeof g_path, "%s", path);
++    for (g_argc = 0; argv[g_argc] && g_argc < 8; g_argc++) snprintf(g_argv[g_argc], 64, "%s", argv[g_argc]);
++    for (g_envc = 0; envp[g_envc] && g_envc < 8; g_envc++) snprintf(g_envp[g_envc], 64, "%s", envp[g_envc]);
++    g_dsize = data_size;
++}
++
++static void put_str(u32 ea, const char* s) { strcpy((char*)vm_base + ea, s); }
++static void reset(void) { g_host = 0; g_argc = g_envc = 0; g_exit_code = -1; n_called = 0; g_dsize = 0; }
++
++#define SPAWN(call) do { reset(); if (!setjmp(g_exit)) { call; } } while (0)
++
++int main(void)
++{
++    vm_base = calloc(1, 0x20000);
++    ps3_exitspawn_set_host(host);
++    const char* tmp = getenv("TMPDIR");
++    snprintf(g_root, sizeof g_root, "%s/ps3recomp-exitspawn-XXXXXX", tmp && *tmp ? tmp : "/tmp");
++    if (!mkdtemp(g_root)) { perror("mkdtemp"); return 1; }
++    char f[300]; snprintf(f, sizeof f, "%s/EMAIN.SELF", g_root); fclose(fopen(f, "w"));
++    put_str(0x1000, "/dev_hdd0/EMAIN.SELF");
++    put_str(0x1100, "-x"); put_str(0x1140, "two"); put_str(0x1180, "HOME=/");
++    vm_write32(0x1200, 0x1100); vm_write32(0x1204, 0x1140); vm_write32(0x1208, 0);   /* argv */
++    vm_write32(0x1210, 0x1180); vm_write32(0x1214, 0);                               /* envp */
++
++    SPAWN(sys_game_process_exitspawn2((const char*)0x1000, (const char* const*)0x1200, (const char* const*)0x1210,
++                                      0, 0, 1001, 0));
++    CHECK(g_host == 1 && !strcmp(g_path, "/dev_hdd0/EMAIN.SELF"), "exitspawn2 hands the target to the host (%s)", g_path);
++    CHECK(g_argc == 3 && !strcmp(g_argv[0], "/dev_hdd0/EMAIN.SELF") && !strcmp(g_argv[1], "-x") && !strcmp(g_argv[2], "two"),
++          "argv is the path, then the caller's (%d)", g_argc);
++    CHECK(g_envc == 1 && !strcmp(g_envp[0], "HOME=/"), "envp is passed (%d)", g_envc);
++    CHECK(g_exit_code == 0, "a host that returns leaves a process exit (%d)", g_exit_code);
++    CHECK(n_called == 0, "no atexitspawn function is registered yet");
++
++    /* atexitspawn runs for flags>>62 == 0, at_Exitspawn for 1; exitspawn2 turns 2 or 3 into 0, the
++     * first-version call sets 2 (neither runs); the first registration of each is kept */
++    ps3_exitspawn_register_atexitspawn(0x3000); ps3_exitspawn_register_atexitspawn(0x3010);
++    ps3_exitspawn_register_at_exitspawn(0x3100);
++    SPAWN(sys_game_process_exitspawn2((const char*)0x1000, 0, 0, 0, 0, 1001, 0));
++    CHECK(n_called == 1 && g_called[0] == 0x3000 && g_argc == 1, "flags 0: atexitspawn runs (0x%X), argv just the path", g_called[0]);
++    SPAWN(sys_game_process_exitspawn2((const char*)0x1000, 0, 0, 0, 0, 1001, 1ull << 62));
++    CHECK(n_called == 1 && g_called[0] == 0x3100, "flags 1<<62: at_Exitspawn runs (0x%X)", g_called[0]);
++    SPAWN(sys_game_process_exitspawn2((const char*)0x1000, 0, 0, 0, 0, 1001, 2ull << 62));
++    CHECK(n_called == 1 && g_called[0] == 0x3000 && g_host == 1, "exitspawn2 flags 2<<62 become 0: atexitspawn runs");
++    SPAWN(sys_game_process_exitspawn((const char*)0x1000, 0, 0, 0, 0, 1001, 0));
++    CHECK(n_called == 0 && g_host == 1, "the first-version call runs neither");
++
++    /* the data block goes along, up to 4 KB */
++    SPAWN(sys_game_process_exitspawn2((const char*)0x1000, 0, 0, 0x4000, 0x2000, 1001, 2ull << 62));
++    CHECK(g_dsize == 0x1000, "a data block is capped at 4 KB (%u)", g_dsize);
++
++    /* NP DRM: a NULL path is INVALID_PARAM, a missing target ENOENT, neither spawns */
++    reset();
++    CHECK((u32)sceNpDrmProcessExitSpawn2(NULL, NULL, 0, 0, 0, 0, 1001, 0) == 0x80029502u && !g_host,
++          "sceNpDrmProcessExitSpawn2(NULL path) is INVALID_PARAM");
++    put_str(0x1300, "/dev_hdd0/NONE.SELF");
++    CHECK((u32)sceNpDrmProcessExitSpawn2(NULL, (const char*)0x1300, 0, 0, 0, 0, 1001, 0) == CELL_ENOENT && !g_host,
++          "a target that is not there is ENOENT");
++    SPAWN(sceNpDrmProcessExitSpawn2(NULL, (const char*)0x1000, 0, 0, 0, 0, 1001, 2ull << 62));
++    CHECK(g_host == 1, "sceNpDrmProcessExitSpawn2 of a present target spawns it");
++
++    /* _sys_process_exit2: sys_exit2_param at 0x5000, args array (u64 pointers) at 0x5030 */
++    vm_write64(0x5000, 0x85); vm_write64(0x5008, 0x30); vm_write64(0x5018, 1001); vm_write64(0x5020, 0);
++    vm_write64(0x5028, 0x5030);
++    vm_write64(0x5030, 0x1000); vm_write64(0x5038, 0x1100); vm_write64(0x5040, 0);
++    vm_write64(0x5048, 0x1180); vm_write64(0x5050, 0);
++    SPAWN(ps3_sys_process_exit2(7, 0x5000, 0x60));
++    CHECK(g_host == 1 && g_argc == 2 && !strcmp(g_argv[1], "-x") && g_envc == 1 && g_exit_code == 7,
++          "_sys_process_exit2 spawns argv[0] with its argv and envp, then exits with its status (%d)", g_exit_code);
++    vm_write64(0x5030, 0);
++    SPAWN(ps3_sys_process_exit2(3, 0x5000, 0x60));
++    CHECK(g_host == 0 && g_exit_code == 3, "_sys_process_exit2 with no argv is a plain exit");
++
++    remove(f); rmdir(g_root);
++    if (fails) { printf("%d check(s) failed\n", fails); return 1; }
++    puts("test_exitspawn: OK");
++    return 0;
++}
+diff --git a/runtime/ppu/ppu_sysprx.cpp b/runtime/ppu/ppu_sysprx.cpp
+index 5387d831..a18bbb42 100644
+--- a/runtime/ppu/ppu_sysprx.cpp
++++ b/runtime/ppu/ppu_sysprx.cpp
+@@ -612,6 +612,10 @@ static void sys_mmapper_allocate_memory_from_container(ppu_context* ctx)
+ 
+ /* A handful of CRT helpers the early boot tends to hit; accept and continue. */
+ static void crt_ok(ppu_context* ctx) { ctx->gpr[3] = 0; }
++extern "C" void ps3_exitspawn_register_atexitspawn(uint32_t opd);
++extern "C" void ps3_exitspawn_register_at_exitspawn(uint32_t opd);
++static void sys_process_atexitspawn_rec(ppu_context* ctx)  { ps3_exitspawn_register_atexitspawn((uint32_t)ctx->gpr[3]); }
++static void sys_process_at_exitspawn_rec(ppu_context* ctx) { ps3_exitspawn_register_at_exitspawn((uint32_t)ctx->gpr[3]); }
+ static void sys_lwmutex_destroy_counted(ppu_context* ctx)
+ {
+     { static long long _n=0; _n++;
+@@ -1070,8 +1074,9 @@ extern "C" void ppu_sysprx_register(void)
+     ps3_hle_register_ctx(ps3_compute_nid("sys_time_get_system_time"), "sys_time_get_system_time", sys_time_get_system_time);
+     ps3_hle_register_ctx(ps3_compute_nid("sys_process_is_stack"),     "sys_process_is_stack",     sys_process_is_stack);
+     /* Atexit registration: nothing to do at boot, just succeed. */
+-    ps3_hle_register_ctx(ps3_compute_nid("_sys_process_atexitspawn"), "_sys_process_atexitspawn", crt_ok);
+-    ps3_hle_register_ctx(ps3_compute_nid("_sys_process_at_Exitspawn"),"_sys_process_at_Exitspawn",crt_ok);
++    /* The guest functions an exit-spawn runs first (libs/system/sysGameExitspawn.c). */
++    ps3_hle_register_ctx(ps3_compute_nid("_sys_process_atexitspawn"), "_sys_process_atexitspawn", sys_process_atexitspawn_rec);
++    ps3_hle_register_ctx(ps3_compute_nid("_sys_process_at_Exitspawn"),"_sys_process_at_Exitspawn",sys_process_at_exitspawn_rec);
+ 
+     /* Lightweight mutex family (guards global/singleton init in the CRT). */
+     ps3_hle_register_ctx(ps3_compute_nid("sys_lwmutex_create"),  "sys_lwmutex_create",  sys_lwmutex_create);
+diff --git a/runtime/syscalls/lv2_register.c b/runtime/syscalls/lv2_register.c
+index 96266731..c44d8c22 100644
+--- a/runtime/syscalls/lv2_register.c
++++ b/runtime/syscalls/lv2_register.c
+@@ -2275,6 +2275,16 @@ static int64_t sys_process_exit_handler(ppu_context* ctx)
+     return 0;
+ }
+ 
++/* _sys_process_exit2 (26): an exit-spawn (libs/system/sysGameExitspawn.c); with
++ * no argv a plain exit. Unregistered it fell through to the catch-all stub,
++ * which answered CELL_OK, and the guest ran on past its own exit. */
++extern void ps3_sys_process_exit2(int32_t status, uint32_t arg, uint32_t arg_size);
++static int64_t sys_process_exit2_handler(ppu_context* ctx)
++{
++    ps3_sys_process_exit2((int32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5]);
++    return 0;
++}
++
+ static int64_t sys_process_getpid_handler(ppu_context* ctx)
+ {
+     ctx->gpr[3] = (uint64_t)(uint32_t)sys_process_getpid();
+@@ -2491,6 +2501,7 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
+      * same handler as SYS_PROCESS_EXIT3 (3, the number bare-metal/newlib
+      * images issue; both spell the same call). */
+     lv2_syscall_register(tbl, SYS_PROCESS_EXIT,   sys_process_exit_handler);
++    lv2_syscall_register(tbl, SYS_PROCESS_EXIT2,  sys_process_exit2_handler);
+     lv2_syscall_register(tbl, SYS_PROCESS_GET_SDK_VERSION, sys_process_get_sdk_version_handler);
+     lv2_syscall_register(tbl, SYS_PROCESS_IS_SPU_LOCK_LINE_RESERVATION_ADDRESS,
+                          sys_process_is_spu_lock_line_reservation_address);
+diff --git a/runtime/syscalls/lv2_syscall_table.h b/runtime/syscalls/lv2_syscall_table.h
+index 85d76de8..382d4326 100644
+--- a/runtime/syscalls/lv2_syscall_table.h
++++ b/runtime/syscalls/lv2_syscall_table.h
+@@ -37,6 +37,7 @@ extern "C" {
+                                                * leading underscore; do not read
+                                                * this as "exit 2" -- 26 is a
+                                                * different call, _sys_process_exit2) */
++#define SYS_PROCESS_EXIT2               26  /* _sys_process_exit2: exit-spawn */
+ #define SYS_PROCESS_GET_STATUS          4
+ #define SYS_PROCESS_DETACH_CHILD        5
+ #define SYS_PROCESS_GET_NUMBER_OF_OBJECT 12
+diff --git a/tools/test_exitspawn.py b/tools/test_exitspawn.py
+new file mode 100644
+index 00000000..9db4e15b
+--- /dev/null
++++ b/tools/test_exitspawn.py
+@@ -0,0 +1,58 @@
++#!/usr/bin/env python3
++"""Process exit-spawn (libs/system/sysGameExitspawn.c).
++
++Titles import sys_game_process_exitspawn2 (0x67F9FEDB) and
++sceNpDrmProcessExitSpawn2 (0xE6C8F3F9) to end their process and start an
++executable (or themselves again) in its place. Neither had a handler, so each
++took the unresolved path and faked CELL_OK, and the title ran on past its own
++exit. Checks that the names hash to the imported NIDs, then builds
++libs/system/tests/test_exitspawn.c, which includes sysGameExitspawn.c, and runs it.
++"""
++import hashlib
++import os
++import shutil
++import struct
++import subprocess
++import sys
++import tempfile
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++SUFFIX = b"\x67\x59\x65\x99\x04\x25\x04\x90\x56\x64\x27\x49\x94\x89\x74\x1A"
++NIDS = (('sys_game_process_exitspawn2', 0x67F9FEDB), ('sceNpDrmProcessExitSpawn2', 0xE6C8F3F9),
++        ('sys_game_process_exitspawn', 0xFC52A7A9), ('sceNpDrmProcessExitSpawn', 0xAA16695F))
++
++
++def nid(name):
++    return struct.unpack('<I', hashlib.sha1(name.encode() + SUFFIX).digest()[:4])[0]
++
++
++def main():
++    if os.name == 'nt':
++        print('SKIP: the fixture is POSIX; run on macOS/Linux')
++        return 0
++    fails = 0
++    for name, want in NIDS:
++        got = nid(name)
++        fails += got != want
++        print(f"[{'PASS' if got == want else 'FAIL'}] {name} hashes to 0x{got:08X} (imported as 0x{want:08X})")
++    cc = os.environ.get('CC') or shutil.which('cc') or shutil.which('gcc') or shutil.which('clang')
++    if not cc:
++        print('SKIP: no C compiler')
++        return 1 if fails else 0
++    with tempfile.TemporaryDirectory() as tmp:
++        exe = Path(tmp) / 'test_exitspawn'
++        r = subprocess.run([cc, '-std=gnu17', '-O1', '-w', '-pthread', '-I' + str(ROOT / 'include'),
++                            str(ROOT / 'libs/system/tests/test_exitspawn.c'), '-o', str(exe)],
++                           capture_output=True, text=True)
++        if r.returncode:
++            print(r.stdout + r.stderr)
++            print('FAIL: fixture did not build')
++            return 1
++        r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=30)
++        sys.stdout.write(r.stdout + r.stderr)
++        return 1 if (fails or r.returncode) else 0
++
++
++if __name__ == '__main__':
++    sys.exit(main())

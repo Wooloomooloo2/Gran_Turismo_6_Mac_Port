@@ -61,6 +61,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>   /* stat, mkdir: the /dev_hdd0 and /dev_hdd1 folders, see configure_vfs_roots */
+#include <unistd.h>     /* execv: exit-spawn, see gt6_exitspawn */
+#include <string>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>   /* _NSGetExecutablePath */
+#endif
 #include <errno.h>
 
 #ifndef _WIN32
@@ -488,11 +493,86 @@ static int run_guest(uint32_t entry, uint32_t stack_top)
 static int run_guest(uint32_t entry, uint32_t stack_top) { return ppu_run(entry, stack_top); }
 #endif
 
+/* GT6: exit-spawn (D41). After its first-run install EMAIN ends its process and has the
+ * system start EMAIN.SELF again (sys_game_process_exitspawn2; RPCS3 reference, FINDINGS).
+ * The port starts the same native binary again on the same EMAIN.SELF.elf with exec, so the
+ * process keeps its pid, stdout and stderr: the new image reads the guest command line from
+ * $PS3_BOOT_PATH / $PS3_ARGV, set here from the spawn's argv. A run's per-image outputs (the
+ * milestone log, the frame series and the draw statistics) would start again from the
+ * beginning and overwrite the first image's, so the new image writes them under
+ * spawn<n>/ beside them (frames/spawn<n>/, <milestones>.spawn<n>, <stats>.spawn<n>).
+ * No other target is known to the port: for one, the call returns and the process exits. */
+extern "C" {
+typedef void (*ps3_exitspawn_host_fn)(const char*, const char* const*, const char* const*,
+                                      const uint8_t*, uint32_t, int32_t, uint64_t);
+void ps3_exitspawn_set_host(ps3_exitspawn_host_fn fn);   /* libs/system/sysGameExitspawn.c */
+void rsx_metal_backend_export_window_state(void);        /* libs/video/rsx_metal_backend.m */
+}
+static char  s_self_exe[4096];
+static char* s_elf_arg;
+
+static void gt6_exitspawn_output(const char* var, int n, bool dir)
+{
+    const char* v = getenv(var);
+    if (!v || !*v) return;
+    /* from the first image's value, so spawn2 lands beside spawn1, not inside it */
+    char base[64];
+    snprintf(base, sizeof base, "GT6_IMAGE1_%s", var);
+    if (!getenv(base)) setenv(base, v, 1);
+    char buf[4200];
+    snprintf(buf, sizeof buf, dir ? "%s/spawn%d" : "%s.spawn%d", getenv(base), n);
+    if (dir) mkdir(buf, 0755);
+    setenv(var, buf, 1);
+}
+
+static void gt6_exitspawn(const char* path, const char* const* argv, const char* const* envp,
+                          const uint8_t* data, uint32_t data_size, int32_t prio, uint64_t flags)
+{
+    (void)data; (void)prio; (void)flags;
+    if (strcmp(path, GT6_EMAIN_PATH) != 0) {
+        fprintf(stderr, "[exitspawn] %s is not EMAIN.SELF: the port has no executable for it\n", path);
+        return;
+    }
+    if (envp && envp[0])
+        fprintf(stderr, "[exitspawn] the new image gets no envp (ps3recomp starts every image with an empty one)\n");
+    if (data_size)
+        fprintf(stderr, "[exitspawn] the %u-byte data block is not passed on\n", data_size);
+    std::string rest;
+    for (int i = 1; argv[i]; i++) { if (i > 1) rest += ';'; rest += argv[i]; }
+    setenv("PS3_BOOT_PATH", argv[0], 1);
+    setenv("PS3_ARGV", rest.c_str(), 1);
+    const char* c = getenv("GT6_EXITSPAWN_COUNT");
+    const int n = (c ? atoi(c) : 0) + 1;
+    char nbuf[16];
+    snprintf(nbuf, sizeof nbuf, "%d", n);
+    setenv("GT6_EXITSPAWN_COUNT", nbuf, 1);
+    gt6_exitspawn_output("PS3_MILESTONE_OUT", n, false);
+    gt6_exitspawn_output("PS3RECOMP_DRAW_STATS", n, false);
+    gt6_exitspawn_output("PS3RECOMP_METAL_FRAME_DIR", n, true);
+    rsx_metal_backend_export_window_state();
+    printf("[exitspawn] exec %s %s (image %d; guest argv %s%s%s)\n", s_self_exe, s_elf_arg, n + 1,
+           argv[0], rest.empty() ? "" : ";", rest.c_str());
+    fflush(stdout);
+    fflush(stderr);
+    char* const args[] = { s_self_exe, s_elf_arg, nullptr };
+    execv(s_self_exe, args);
+    fprintf(stderr, "[exitspawn] exec %s failed: %s\n", s_self_exe, strerror(errno));
+}
+
 int main(int argc, char** argv)
 {
     if (argc < 2) {
         printf("usage: %s <path to EMAIN.SELF.elf>\n", argv[0]);
         return 2;
+    }
+    {   /* for an exit-spawn: the binary and the ELF to start again */
+#if defined(__APPLE__)
+        uint32_t sz = sizeof s_self_exe;
+        if (_NSGetExecutablePath(s_self_exe, &sz) != 0)
+#endif
+            snprintf(s_self_exe, sizeof s_self_exe, "%s", argv[0]);
+        s_elf_arg = argv[1];
+        ps3_exitspawn_set_host(gt6_exitspawn);
     }
 
 #ifdef _WIN32

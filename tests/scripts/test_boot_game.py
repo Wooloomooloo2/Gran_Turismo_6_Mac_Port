@@ -407,3 +407,30 @@ def test_bad_press_is_a_usage_error(tree, tmp_path):
         boot_game.main([str(tree), "--gt6", str(fake("padenv", tmp_path)), "--press", "5:jump"])
     assert e.value.code == 2
     assert not (tree / "runs").exists() or not any((tree / "runs").iterdir())
+
+
+def test_exit_spawned_image_is_reported(tree, tmp_path):
+    """An image the game exit-spawns (D41) writes under spawn<n>; the report keeps both."""
+    rc = boot_game.main([str(tree), "--gt6", str(fake("spawn", tmp_path)), "--until", "time",
+                         "--seconds", "2", "--png"])
+    run = sorted((tree / "runs").iterdir())[-1]
+    rep = json.loads((run / "report.json").read_text())
+    assert rc == 0 and rep["frames"] == 1 and rep["drawn_frames"] == 1
+    assert len(rep["spawns"]) == 1
+    sp = rep["spawns"][0]
+    assert sp["image"] == 2 and sp["flipped"] and sp["frames"] == 2 and sp["drawn_frames"] == 1
+    assert sp["last_keys"][-1] == "hle:cellPadInit"
+    assert (run / "frames_png" / "spawn1" / "frame_000061.png").is_file()
+    assert "Image 2 (after an exit-spawn" in (run / "summary.md").read_text()
+
+
+def test_stop_file_reaches_spawned_images(tmp_path):
+    frames = tmp_path / "frames"
+    (frames / "spawn1").mkdir(parents=True)
+    (frames / "spawn10").mkdir()
+    (frames / "spawnx").mkdir()
+    assert [d.name for d in boot_game.spawn_dirs(frames)] == ["spawn1", "spawn10"]
+    (frames / "spawn1" / "frame_000001.ppm").write_bytes(b"x" * 100)
+    assert boot_game._frames_bytes(frames) == 100
+    boot_game._stop_dumps(frames, "bytes")
+    assert (frames / boot_game.STOP_NAME).is_file() and (frames / "spawn10" / boot_game.STOP_NAME).is_file()

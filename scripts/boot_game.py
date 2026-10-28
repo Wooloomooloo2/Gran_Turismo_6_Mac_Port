@@ -35,6 +35,10 @@ clears and share of non-black pixels; a frame is "drawn" when it had at least on
 and more than 1% non-black pixels. --png converts the dumps to frames_png/*.png with sips;
 --prune then deletes all but the newest 10 runs.
 A process that exits by itself after a flip with no frame dumped is flip_no_frame too.
+When the game exit-spawns itself (D41) the port re-executes in the same process, so the run
+goes on; the new image's milestone log, frames and draw statistics go to
+milestones.log.spawn<n>, frames/spawn<n>/ and draw_stats.txt.spawn<n>, and report.json
+"spawns" (and summary.md) describe each image after the first.
 --press S:BUTTON (repeatable; D40) presses a pad button S seconds after the game first polls
 the pad, through ps3recomp's PAD_SCRIPT (cellPad: held for 40 polls, about 0.4 s at GT6's
 rate). BUTTON is a CELL_PAD_CTRL_* name: cross, circle, triangle, square, start, select,
@@ -78,6 +82,7 @@ UNTIL = ("flip", "time")
 FRAME_RE = re.compile(r"frame_(\d{6,})\.ppm")
 RUN_RE = re.compile(r"\d{8}-\d{6}")           # a run folder; anything else in runs/ is kept
 STATS_NAME = "draw_stats.txt"
+SPAWN_RE = re.compile(r"spawn[1-9][0-9]*")   # frames/spawn<n>/: image n+1 after an exit-spawn
 STOP_NAME = "STOP"           # in frames/: the renderer stops dumping when it appears (D35)
 FRAME_BYTES = 2 * 1024**3    # default cap on frames/ per run
 FREE_FLOOR = 20 * 1024**3    # stop dumping below this much free disk space
@@ -240,11 +245,12 @@ def frame_files(frames_dir):
     return sorted(found)
 
 
-def frames_report(run):
-    """report.json's frames_list, drawn_frames and first_drawn for a finished run."""
-    stats = parse_draw_stats(_read(run / STATS_NAME))
+def frames_report(run, frames_dir=None, stats_file=None):
+    """report.json's frames_list, drawn_frames and first_drawn for a finished run (or, with
+    frames_dir and stats_file, for one re-executed image of it)."""
+    stats = parse_draw_stats(_read(stats_file or run / STATS_NAME))
     rows = []
-    for presented, path in frame_files(run / "frames"):
+    for presented, path in frame_files(frames_dir or run / "frames"):
         try:
             share = nonzero_share(path.read_bytes())
         except OSError:
@@ -257,18 +263,29 @@ def frames_report(run):
     return rows, len(drawn), (drawn[0] if drawn else None)
 
 
+def spawn_dirs(frames_dir):
+    """frames/spawn<n>/ folders a re-executed game image dumps into (D41), in order."""
+    try:
+        found = [p for p in Path(frames_dir).iterdir()
+                 if SPAWN_RE.fullmatch(p.name) and p.is_dir() and not p.is_symlink()]
+    except OSError:
+        return []
+    return sorted(found, key=lambda p: int(p.name[5:]))
+
+
 def _frames_bytes(frames_dir):
     total = 0
-    try:
-        with os.scandir(frames_dir) as it:
-            for e in it:
-                try:
-                    if e.is_file(follow_symlinks=False):
-                        total += e.stat(follow_symlinks=False).st_size
-                except OSError:
-                    pass
-    except OSError:
-        pass
+    for d in [Path(frames_dir)] + spawn_dirs(frames_dir):
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    try:
+                        if e.is_file(follow_symlinks=False):
+                            total += e.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        pass
+        except OSError:
+            pass
     return total
 
 
@@ -287,11 +304,12 @@ def _dump_check(frames_dir, frame_bytes):
 def _stop_dumps(frames_dir, reason):
     """Ask the renderer to stop dumping. Never raises: a STOP file that cannot be written
     (disk full, frames/ gone) is reported, and the run goes on to write its report."""
-    try:
-        (Path(frames_dir) / STOP_NAME).write_text(reason + "\n")
-    except OSError as e:
-        print(f"warning: could not write {Path(frames_dir) / STOP_NAME} ({e}); "
-              f"the renderer may keep dumping", file=sys.stderr)
+    for d in [Path(frames_dir)] + spawn_dirs(frames_dir):
+        try:
+            (d / STOP_NAME).write_text(reason + "\n")
+        except OSError as e:
+            print(f"warning: could not write {d / STOP_NAME} ({e}); "
+                  f"the renderer may keep dumping", file=sys.stderr)
     print(f"note: frame dumps stopped ({reason}: "
           + ("frames/ passed its size cap" if reason == "bytes"
              else f"less than {FREE_FLOOR // 1024**3} GB of free disk space") + ")",
@@ -299,19 +317,24 @@ def _stop_dumps(frames_dir, reason):
 
 
 def to_png(run):
-    """Convert run/frames/*.ppm to run/frames_png/*.png with sips; returns how many."""
+    """Convert run/frames/*.ppm to run/frames_png/*.png with sips (frames/spawn<n>/ to
+    frames_png/spawn<n>/); returns how many."""
     out = Path(run) / "frames_png"
     out.mkdir(exist_ok=True)
+    todo = [(Path(run) / "frames", out)] + [(d, out / d.name)
+                                            for d in spawn_dirs(Path(run) / "frames")]
     n = 0
-    for _, ppm in frame_files(Path(run) / "frames"):
-        png = out / (ppm.stem + ".png")
-        r = subprocess.run(["sips", "-s", "format", "png", str(ppm), "--out", str(png)],
-                           capture_output=True, text=True)
-        if r.returncode == 0 and png.is_file():
-            n += 1
-        else:
-            print(f"warning: sips could not convert {ppm.name}: {r.stderr.strip()}",
-                  file=sys.stderr)
+    for src, dst in todo:
+        dst.mkdir(exist_ok=True)
+        for _, ppm in frame_files(src):
+            png = dst / (ppm.stem + ".png")
+            r = subprocess.run(["sips", "-s", "format", "png", str(ppm), "--out", str(png)],
+                               capture_output=True, text=True)
+            if r.returncode == 0 and png.is_file():
+                n += 1
+            else:
+                print(f"warning: sips could not convert {ppm.name}: {r.stderr.strip()}",
+                      file=sys.stderr)
     return n
 
 
@@ -377,6 +400,10 @@ def _summary(rep, tree):
                      + {"bytes": "frames/ reached its size cap",
                         "disk": "free disk space fell below the 20 GB floor",
                         "max": "the --frame-max cap was reached"}[rep["dump_stopped"]] + ")")
+    for sp in rep.get("spawns", []):
+        lines.append(f"- Image {sp['image']} (after an exit-spawn, D41): {sp['frames']} frame "
+                     f"dump(s) in frames/spawn{sp['image'] - 1}, {sp['drawn_frames']} drawn; "
+                     f"last milestones: {', '.join(sp['last_keys'][-5:]) or 'none'}")
     if rep.get("play_reused"):
         lines.append(f"- Warning: the play folder was already used by run {rep['play_reused']}; "
                      f"run scripts/prepare_play.py --force for a clean one")
@@ -441,6 +468,10 @@ def boot(gt6, tree, seconds=300, idle=60, headless=True, env=None, until="flip",
                     dump_stopped = _dump_check(frames_dir, frame_bytes)
                     if dump_stopped:
                         _stop_dumps(frames_dir, dump_stopped)
+                else:   # an image started since (D41) must stop too
+                    for d in spawn_dirs(frames_dir):
+                        if not (d / STOP_NAME).exists():
+                            _stop_dumps(d, dump_stopped)
                 if until == "flip" and flip_at is not None and now - flip_at >= FLIP_GRACE:
                     break
                 if now - start >= seconds:
@@ -481,6 +512,15 @@ def boot(gt6, tree, seconds=300, idle=60, headless=True, env=None, until="flip",
         "pid": proc.pid,
         "run": str(run),
     }
+    rep["spawns"] = []
+    for d in spawn_dirs(frames_dir):
+        n = d.name[5:]
+        sms = parse_milestones(_read(run / f"milestones.log.spawn{n}"))
+        flist, sdrawn, sfirst = frames_report(run, d, run / f"{STATS_NAME}.spawn{n}")
+        rep["spawns"].append({"image": int(n) + 1, "last_keys": sms["keys"][-20:],
+                              "flipped": FLIP_KEY in sms["keys"], "frames": len(flist),
+                              "frames_list": flist, "drawn_frames": sdrawn,
+                              "first_drawn": sfirst})
     (run / "report.json").write_text(json.dumps(rep, indent=2) + "\n")
     (run / "summary.md").write_text(_summary(rep, tree))
     return rep

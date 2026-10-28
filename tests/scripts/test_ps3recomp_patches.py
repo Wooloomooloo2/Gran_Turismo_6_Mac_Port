@@ -85,6 +85,7 @@ def test_runners_found():
     assert "tools/test_music2.py" in found   # patch 0016
     assert "tools/test_trophy_sound_level.py" in found   # patch 0017
     assert "tools/test_mmapper_hle_heap.py" in found   # patch 0018 (upstream runner, extended)
+    assert "tools/test_exitspawn.py" in found   # patch 0019
 
 
 @pytest.mark.parametrize("runner", runners())
