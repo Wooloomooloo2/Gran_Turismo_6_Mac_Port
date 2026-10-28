@@ -221,12 +221,14 @@ def current_patch_set():
 
 def ps3recomp_tree_hash(sub=None):
     """SHA-256 of the ps3recomp submodule's working tree as port/write_image.cmake records it
-    in gt6.image ("ps3recomp_tree"): `git diff HEAD --binary`, then "<path>\n<sha256>\n" for
+    in gt6.image ("ps3recomp_tree"): `git diff --no-ext-diff --no-textconv HEAD --binary` (no
+    user diff driver can change it, review M-2), then "<path>\n<sha256>\n" for
     each untracked file git lists (--exclude-standard; __pycache__ and .pyc left out). It
     changes with any edit, inside the patch series or not (D47). None without git."""
     sub = Path(sub or PS3RECOMP)
     try:
-        diff = subprocess.run(["git", "-C", str(sub), "diff", "HEAD", "--binary"],
+        diff = subprocess.run(["git", "-C", str(sub), "diff", "--no-ext-diff", "--no-textconv",
+                               "HEAD", "--binary"],
                               capture_output=True, check=True).stdout
         others = subprocess.run(["git", "-C", str(sub), "ls-files", "--others",
                                  "--exclude-standard"], capture_output=True, check=True,

@@ -4,9 +4,10 @@
 # Run by the gt6 target's POST_BUILD step:
 #   cmake -DSUB=<ps3recomp> -DIN=<gt6.image.pending> -DOUT=<gt6.image> -P write_image.cmake
 # The hash (scripts/boot_game.py ps3recomp_tree_hash computes the same): SHA-256 of
-# `git diff HEAD --binary`, then for each untracked file git lists (--exclude-standard, git's
+# `git diff --no-ext-diff --no-textconv HEAD --binary` (no user diff driver can change it,
+# review M-2), then for each untracked file git lists (--exclude-standard, git's
 # order, __pycache__ and .pyc left out) "<path>\n<sha256 of its content>\n".
-execute_process(COMMAND git -C "${SUB}" diff HEAD --binary
+execute_process(COMMAND git -C "${SUB}" diff --no-ext-diff --no-textconv HEAD --binary
                 OUTPUT_VARIABLE diff RESULT_VARIABLE rc)
 if(NOT rc EQUAL 0)
     message(FATAL_ERROR "git diff in ${SUB} failed (${rc})")

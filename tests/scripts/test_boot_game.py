@@ -562,6 +562,30 @@ def test_tree_hash_follows_edits_and_untracked_files(tmp_path):
     assert len({h0, h1, h2}) == 3 and boot_game.ps3recomp_tree_hash(sub) == h2
 
 
+def test_tree_hash_ignores_external_diff_and_textconv(tmp_path):
+    """Review M-2: a developer's diff.external or textconv driver must not change the hash
+    (both hashers pass --no-ext-diff --no-textconv), or builds would differ between machines."""
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    subprocess.run(["git", "init", "-q", str(sub)], check=True)
+    (sub / "a.c").write_text("x\n")
+    subprocess.run(["git", "-C", str(sub), "add", "a.c"], check=True)
+    subprocess.run(["git", "-C", str(sub), "-c", "user.name=t", "-c", "user.email=t@t",
+                    "commit", "-q", "-m", "a"], check=True)
+    (sub / "a.c").write_text("y\n")
+    plain = boot_game.ps3recomp_tree_hash(sub)
+    tool = tmp_path / "junk-diff.sh"
+    tool.write_text("#!/bin/sh\necho junk\n")
+    tool.chmod(0o755)
+    (sub / ".gitattributes").write_text("*.c diff=junk\n")
+    subprocess.run(["git", "-C", str(sub), "add", ".gitattributes"], check=True)
+    subprocess.run(["git", "-C", str(sub), "-c", "user.name=t", "-c", "user.email=t@t",
+                    "commit", "-q", "-m", "attr"], check=True)
+    subprocess.run(["git", "-C", str(sub), "config", "diff.junk.textconv", str(tool)], check=True)
+    subprocess.run(["git", "-C", str(sub), "config", "diff.external", str(tool)], check=True)
+    assert boot_game.ps3recomp_tree_hash(sub) == plain
+
+
 def test_gt6_outside_port_build_is_checked(tree, tmp_path, monkeypatch, capsys):
     """D47 (review m4): --gt6 outside port-build* is refused when its image is stale and runs
     with a warning when it has none."""
