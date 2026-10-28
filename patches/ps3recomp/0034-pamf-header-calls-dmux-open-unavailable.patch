@@ -1,0 +1,443 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] cellPamf header calls on the real layout; cellDmux attribute/open answer FATAL (no core)
+
+Upstream: not yet submitted; written to be upstreamed (generic, no title names)
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0033)
+
+What: five imports a PAMF movie player calls had no handler, so each answered
+CELL_OK and wrote nothing: cellPamfGetHeaderSize2 (0x90FC9A59),
+cellPamfGetStreamOffsetAndSize (0x44F5C9E3), cellPamfVerify (0xD1A40EF4),
+cellDmuxQueryAttr (0xA2D4189B) and cellDmuxOpenEx (0xF6C23560).
+- The PAMF calls (and cellPamfGetHeaderSize) now read the file's real header:
+  "PAMF", version "0040"/"0041", header and data sizes in 2048-byte units at
+  0x08/0x0C, marks and unknown extents at 0x10-0x1C, the sequence info's size
+  at 0x50. Codes as libpamf: UNKNOWN_TYPE, UNSUPPORTED_VERSION, INVALID_PAMF;
+  MINIMUM_HEADER gives the size up to the end of the sequence info. Verify
+  checks the top level only, not each stream and EP entry (a departure).
+- The PAMF error codes become the SDK's (0x80610501-0x80610508); ps3recomp
+  had invented 0x806103xx values.
+- ps3recomp has no PAMF demuxer core: its slots hold host function pointers
+  and never deliver a title's callbacks. cellDmuxQueryAttr(2), cellDmuxOpenEx
+  and cellDmuxOpen2 now check their arguments as libdmux does (ARG), then
+  answer CELL_DMUX_ERROR_FATAL and write nothing, so a title takes its own
+  "could not play" path instead of feeding a demuxer that never reports.
+  The PAMF stream type is CELL_DMUX_STREAM_TYPE_PAMF, 1 (0 is UNDEF).
+Behaviour reference: RPCS3 cellPamf.cpp / cellDmux.cpp (no code from them).
+
+Why: with CELL_OK and nothing written, a title read sizes and a demuxer
+handle that were never set, then waited for ever for demux events.
+
+Test: tools/test_pamf_header_dmux.py (new) builds tests/test_pamf_header_dmux.c
+with the real cellPamf.c and cellDmux.c.
+
+diff --git a/libs/codec/cellDmux.c b/libs/codec/cellDmux.c
+index b0553858..60272bd7 100644
+--- a/libs/codec/cellDmux.c
++++ b/libs/codec/cellDmux.c
+@@ -45,6 +45,66 @@ static DmuxEsSlot s_es[CELL_DMUX_MAX_ES];
+  * Demuxer lifecycle
+  * -----------------------------------------------------------------------*/
+ 
++/* ---------------------------------------------------------------------------
++ * The guest-ABI attribute and open calls.
++ *
++ * There is no PAMF demuxer core here: the slots below hand host function
++ * pointers to the title and cannot deliver its callbacks. Answering CELL_OK
++ * with no handle written (what an unresolved import did) left the title
++ * feeding a demuxer that never reports, and waiting for ever. So these calls
++ * check their arguments as libdmux does (CELL_DMUX_ERROR_ARG; RPCS3's
++ * cellDmux.cpp is the behaviour reference, no code from it), then answer
++ * CELL_DMUX_ERROR_FATAL, libdmux's answer when its core cannot be opened, and
++ * write nothing. A title then takes its own "movie could not be played" path.
++ * -----------------------------------------------------------------------*/
++#define DMUX_STREAM_TYPE_PAMF 1u   /* CELL_DMUX_STREAM_TYPE_PAMF (0 is UNDEF) */
++
++s32 cellDmuxQueryAttr(u32 demuxerType, u32 demuxerAttr)
++{
++    if (!demuxerType || !demuxerAttr || vm_read32(demuxerType) != DMUX_STREAM_TYPE_PAMF)
++        return (s32)CELL_DMUX_ERROR_ARG;
++    printf("[cellDmux] QueryAttr: no PAMF demuxer core -> FATAL\n");
++    return (s32)CELL_DMUX_ERROR_FATAL;
++}
++
++s32 cellDmuxQueryAttr2(u32 demuxerType2, u32 demuxerAttr)
++{
++    if (!demuxerType2 || !demuxerAttr || vm_read32(demuxerType2) != DMUX_STREAM_TYPE_PAMF)
++        return (s32)CELL_DMUX_ERROR_ARG;
++    printf("[cellDmux] QueryAttr2: no PAMF demuxer core -> FATAL\n");
++    return (s32)CELL_DMUX_ERROR_FATAL;
++}
++
++/* CellDmuxResourceEx: memAddr 0, memSize 4, ppuThreadPriority 8,
++ * ppuThreadStackSize 0xC, spurs 0x10, priority (u64, packed) 0x14,
++ * maxContention 0x1C. */
++s32 cellDmuxOpenEx(u32 demuxerType, u32 demuxerResourceEx, u32 demuxerCb, u32 demuxerHandle)
++{
++    if (!demuxerType || vm_read32(demuxerType) != DMUX_STREAM_TYPE_PAMF ||
++        !demuxerResourceEx || !vm_read32(demuxerResourceEx) ||
++        vm_read32(demuxerResourceEx + 4) == 0xFFFFFFFFu ||
++        vm_read32(demuxerResourceEx + 0xC) == 0xFFFFFFFFu ||
++        !vm_read32(demuxerResourceEx + 0x10) ||
++        ((((u64)vm_read32(demuxerResourceEx + 0x14) << 32) | vm_read32(demuxerResourceEx + 0x18))
++            & 0xF0F0F0F0F0F0F0F0ull) != 0 ||
++        vm_read32(demuxerResourceEx + 0x1C) == 0 ||
++        !demuxerCb || !demuxerHandle)
++        return (s32)CELL_DMUX_ERROR_ARG;
++    printf("[cellDmux] OpenEx: no PAMF demuxer core -> FATAL\n");
++    return (s32)CELL_DMUX_ERROR_FATAL;
++}
++
++/* CellDmuxResource2: isResourceEx (b8) 0, then the resource; checked only for
++ * presence here. */
++s32 cellDmuxOpen2(u32 demuxerType2, u32 demuxerResource2, u32 demuxerCb, u32 demuxerHandle)
++{
++    if (!demuxerType2 || vm_read32(demuxerType2) != DMUX_STREAM_TYPE_PAMF ||
++        !demuxerResource2 || !demuxerCb || !demuxerHandle)
++        return (s32)CELL_DMUX_ERROR_ARG;
++    printf("[cellDmux] Open2: no PAMF demuxer core -> FATAL\n");
++    return (s32)CELL_DMUX_ERROR_FATAL;
++}
++
+ s32 cellDmuxOpen(const CellDmuxType* type, const CellDmuxResource* res,
+                   CellDmuxCbMsg cbFunc, void* cbArg, CellDmuxHandle* handle)
+ {
+diff --git a/libs/codec/cellDmux.h b/libs/codec/cellDmux.h
+index 8f1ecf39..394f7f75 100644
+--- a/libs/codec/cellDmux.h
++++ b/libs/codec/cellDmux.h
+@@ -109,6 +109,14 @@ s32 cellDmuxOpen(const CellDmuxType* type, const CellDmuxResource* res,
+                   CellDmuxCbMsg cbFunc, void* cbArg, CellDmuxHandle* handle);
+ s32 cellDmuxClose(CellDmuxHandle handle);
+ 
++/* The SDK's guest-ABI entry points (EAs). The PAMF demuxer core is not
++ * implemented, so after the SDK's argument checks these answer
++ * CELL_DMUX_ERROR_FATAL and write nothing (D57 in the GT6 port). */
++s32 cellDmuxQueryAttr(u32 demuxerType, u32 demuxerAttr);
++s32 cellDmuxQueryAttr2(u32 demuxerType2, u32 demuxerAttr);
++s32 cellDmuxOpenEx(u32 demuxerType, u32 demuxerResourceEx, u32 demuxerCb, u32 demuxerHandle);
++s32 cellDmuxOpen2(u32 demuxerType2, u32 demuxerResource2, u32 demuxerCb, u32 demuxerHandle);
++
+ /* ES management */
+ s32 cellDmuxEnableEs(CellDmuxHandle handle, const CellDmuxEsFilterId* esFilterId,
+                       const CellDmuxEsResource* esRes,
+diff --git a/libs/codec/cellPamf.c b/libs/codec/cellPamf.c
+index 1b6275d3..5a8017e8 100644
+--- a/libs/codec/cellPamf.c
++++ b/libs/codec/cellPamf.c
+@@ -504,3 +504,105 @@ s32 cellPamfReaderGetEp(CellPamfReader* reader, u32 epIndex, CellPamfEp* ep)
+     vm_write32((u32)(uintptr_t)ep + 4, be32(epData + 4));
+     return CELL_OK;
+ }
++
++/* ---------------------------------------------------------------------------
++ * Header-only calls, on the PAMF file's real layout (big-endian):
++ *   0x00 "PAMF"   0x04 version "0040" or "0041"
++ *   0x08 header size, 0x0C data size (both in 2048-byte units)
++ *   0x10 marks offset, 0x14 marks size, 0x18 unknown offset, 0x1C its size
++ *   0x50 the sequence info, starting with its size (not counting that word)
++ * Behaviour as libpamf answers (RPCS3's cellPamf.cpp is the reference; no
++ * code from it): an unknown magic is UNKNOWN_TYPE, another version
++ * UNSUPPORTED_VERSION, a zero header size or a file size that is not header +
++ * data INVALID_PAMF; a file size of 0 skips that check.
++ * -----------------------------------------------------------------------*/
++#define PAMF_MAGIC_BE   0x50414D46u   /* "PAMF" */
++#define PAMF_V40_BE     0x30303430u   /* "0040" */
++#define PAMF_V41_BE     0x30303431u   /* "0041" */
++#define PAMF_SEQ_INFO   0x50u
++
++static s32 pamf_magic_version(u32 ea)
++{
++    if (vm_read32(ea) != PAMF_MAGIC_BE)
++        return (s32)CELL_PAMF_ERROR_UNKNOWN_TYPE;
++    const u32 v = vm_read32(ea + 4);
++    if (v != PAMF_V40_BE && v != PAMF_V41_BE)
++        return (s32)CELL_PAMF_ERROR_UNSUPPORTED_VERSION;
++    return CELL_OK;
++}
++
++static s32 pamf_sizes(u32 ea, u64 fileSize, u64* header, u64* data)
++{
++    if (!ea)
++        return (s32)CELL_PAMF_ERROR_INVALID_ARG;
++    s32 rc = pamf_magic_version(ea);
++    if (rc != CELL_OK)
++        return rc;
++    const u64 hs = (u64)vm_read32(ea + 8) * 0x800u;
++    const u64 ds = (u64)vm_read32(ea + 12) * 0x800u;
++    if (hs == 0 || (fileSize != 0 && hs + ds != fileSize))
++        return (s32)CELL_PAMF_ERROR_INVALID_PAMF;
++    if (header) *header = hs;
++    if (data) *data = ds;
++    return CELL_OK;
++}
++
++s32 cellPamfGetStreamOffsetAndSize(u32 pAddr, u64 fileSize, u32 pOffset, u32 pSize)
++{
++    u64 hs = 0, ds = 0;
++    s32 rc = pamf_sizes(pAddr, fileSize, &hs, &ds);
++    printf("[cellPamf] GetStreamOffsetAndSize(addr=0x%X, fileSize=0x%llX) -> 0x%X offset=0x%llX size=0x%llX\n",
++           pAddr, (unsigned long long)fileSize, (u32)rc, (unsigned long long)hs, (unsigned long long)ds);
++    if (rc != CELL_OK)
++        return rc;
++    if (pOffset) vm_write64(pOffset, hs);
++    if (pSize) vm_write64(pSize, ds);
++    return CELL_OK;
++}
++
++s32 cellPamfGetHeaderSize(u32 pAddr, u64 fileSize, u32 pSize)
++{
++    return cellPamfGetStreamOffsetAndSize(pAddr, fileSize, pSize, 0);
++}
++
++s32 cellPamfGetHeaderSize2(u32 pAddr, u64 fileSize, u32 attribute, u32 pSize)
++{
++    u64 hs = 0;
++    s32 rc = pamf_sizes(pAddr, fileSize, &hs, NULL);
++    if (rc == CELL_OK && (attribute & CELL_PAMF_ATTRIBUTE_MINIMUM_HEADER)) {
++        /* Everything up to the end of the sequence info: no EP tables. */
++        const u64 min = PAMF_SEQ_INFO + 4u + (u64)vm_read32(pAddr + PAMF_SEQ_INFO);
++        if (min > hs)
++            rc = (s32)CELL_PAMF_ERROR_INVALID_PAMF;
++        else
++            hs = min;
++    }
++    printf("[cellPamf] GetHeaderSize2(addr=0x%X, fileSize=0x%llX, attr=0x%X) -> 0x%X size=0x%llX\n",
++           pAddr, (unsigned long long)fileSize, attribute, (u32)rc, (unsigned long long)hs);
++    if (rc != CELL_OK)
++        return rc;
++    if (pSize) vm_write64(pSize, hs);
++    return CELL_OK;
++}
++
++/* The checks of the file's top level: magic, version, sizes, and the marks,
++ * unknown and sequence-info extents lying inside the header. Departure (D57):
++ * libpamf goes on to check every stream and EP table entry; those checks are
++ * not made here (BACKLOG), so a file broken only inside its tables verifies. */
++s32 cellPamfVerify(u32 pAddr, u64 fileSize)
++{
++    u64 hs = 0;
++    s32 rc = pamf_sizes(pAddr, fileSize, &hs, NULL);
++    if (rc == CELL_OK) {
++        const u32 mo = vm_read32(pAddr + 0x10), ms = vm_read32(pAddr + 0x14);
++        const u32 uo = vm_read32(pAddr + 0x18), us = vm_read32(pAddr + 0x1C);
++        const u64 seq_end = PAMF_SEQ_INFO + 4u + (u64)vm_read32(pAddr + PAMF_SEQ_INFO);
++        if ((mo == 0) != (ms == 0) || (mo && hs < (u64)mo + ms) ||
++            (uo == 0) != (us == 0) || (uo && hs < (u64)uo + us) ||
++            seq_end > hs)
++            rc = (s32)CELL_PAMF_ERROR_INVALID_PAMF;
++    }
++    printf("[cellPamf] Verify(addr=0x%X, fileSize=0x%llX) -> 0x%X\n",
++           pAddr, (unsigned long long)fileSize, (u32)rc);
++    return rc;
++}
+diff --git a/libs/codec/cellPamf.h b/libs/codec/cellPamf.h
+index acf393ca..eff05fcf 100644
+--- a/libs/codec/cellPamf.h
++++ b/libs/codec/cellPamf.h
+@@ -19,11 +19,20 @@ extern "C" {
+ /* ---------------------------------------------------------------------------
+  * Error codes
+  * -----------------------------------------------------------------------*/
+-#define CELL_PAMF_ERROR_INVALID_ARG          0x80610301
+-#define CELL_PAMF_ERROR_INVALID_HEADER       0x80610302
+-#define CELL_PAMF_ERROR_STREAM_NOT_FOUND     0x80610303
+-#define CELL_PAMF_ERROR_EP_NOT_FOUND         0x80610304
+-#define CELL_PAMF_ERROR_NOT_AVAILABLE        0x80610305
++/* The SDK's values (libpamf; RPCS3 cellPamf.h agrees). ps3recomp had its own
++ * 0x806103xx numbers, which are no PAMF error a title checks for. */
++#define CELL_PAMF_ERROR_STREAM_NOT_FOUND     0x80610501
++#define CELL_PAMF_ERROR_INVALID_PAMF         0x80610502
++#define CELL_PAMF_ERROR_INVALID_ARG          0x80610503
++#define CELL_PAMF_ERROR_UNKNOWN_TYPE         0x80610504
++#define CELL_PAMF_ERROR_UNSUPPORTED_VERSION  0x80610505
++#define CELL_PAMF_ERROR_UNKNOWN_STREAM       0x80610506
++#define CELL_PAMF_ERROR_EP_NOT_FOUND         0x80610507
++#define CELL_PAMF_ERROR_NOT_AVAILABLE        0x80610508
++#define CELL_PAMF_ERROR_INVALID_HEADER       CELL_PAMF_ERROR_INVALID_PAMF
++
++#define CELL_PAMF_ATTRIBUTE_VERIFY_ON        1
++#define CELL_PAMF_ATTRIBUTE_MINIMUM_HEADER   2
+ 
+ /* ---------------------------------------------------------------------------
+  * Stream types
+@@ -135,6 +144,12 @@ s32 cellPamfStreamTypeToEsFilterId(u8 streamType, u8 streamIndex,
+ 
+ /* Entry point navigation */
+ s32 cellPamfReaderGetNumberOfEp(CellPamfReader* reader, s32* numEp);
++
++/* Header-only calls, on the file's real layout (guest EAs; u64 out-values). */
++s32 cellPamfGetHeaderSize(u32 pAddr, u64 fileSize, u32 pSize);
++s32 cellPamfGetHeaderSize2(u32 pAddr, u64 fileSize, u32 attribute, u32 pSize);
++s32 cellPamfGetStreamOffsetAndSize(u32 pAddr, u64 fileSize, u32 pOffset, u32 pSize);
++s32 cellPamfVerify(u32 pAddr, u64 fileSize);
+ s32 cellPamfReaderGetEp(CellPamfReader* reader, u32 epIndex, CellPamfEp* ep);
+ 
+ #ifdef __cplusplus
+diff --git a/tests/test_pamf_header_dmux.c b/tests/test_pamf_header_dmux.c
+new file mode 100644
+index 00000000..1256194e
+--- /dev/null
++++ b/tests/test_pamf_header_dmux.c
+@@ -0,0 +1,106 @@
++/* cellPamf's header-only calls and cellDmux's attribute/open calls, through the
++ * real libs/codec/cellPamf.c and cellDmux.c. Run by tools/test_pamf_header_dmux.py.
++ *  - GetStreamOffsetAndSize / GetHeaderSize(2) / Verify read the PAMF file's
++ *    real layout: sizes in 2048-byte units at 0x08 and 0x0C, the SDK's codes.
++ *  - QueryAttr / OpenEx check their arguments (ARG), then answer FATAL (no
++ *    demuxer core) and write nothing. */
++#include "../libs/codec/cellPamf.h"
++#include "../libs/codec/cellDmux.h"
++#include <stdio.h>
++#include <string.h>
++#include <sys/mman.h>
++
++uint8_t* vm_base;
++uint32_t ppu_vm_size;
++int g_resv_store_active;
++uint32_t g_ww_lo, g_ww_hi;
++
++static int fails;
++#define CHECK(c, ...) do { const int ok_ = (c); printf(ok_ ? "[PASS] " : "[FAIL] "); printf(__VA_ARGS__); \
++                           printf("\n"); if (!ok_) fails++; } while (0)
++
++static void be32w(uint32_t ea, uint32_t v) { uint8_t* p = vm_base + ea; p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v; }
++static uint64_t be64r(uint32_t ea) { uint64_t v = 0; for (int i = 0; i < 8; i++) v = v << 8 | vm_base[ea + i]; return v; }
++
++#define HDR 0x10000u
++#define OUT 0x20000u
++
++static void make_header(void)
++{
++    memset(vm_base + HDR, 0, 0x1800);
++    memcpy(vm_base + HDR, "PAMF0041", 8);
++    be32w(HDR + 8, 3);            /* header: 3 x 2048 = 0x1800 */
++    be32w(HDR + 12, 261476);      /* data: 261476 x 2048 */
++    be32w(HDR + 0x50, 0x200);     /* sequence info: 0x200 bytes after its size word */
++}
++
++int main(void)
++{
++    setvbuf(stdout, NULL, _IONBF, 0);
++    vm_base = (uint8_t*)mmap(NULL, 0x100000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
++    const uint64_t file = 0x1800ull + 261476ull * 0x800;
++    make_header();
++
++    memset(vm_base + OUT, 0xAA, 32);
++    CHECK(cellPamfGetStreamOffsetAndSize(HDR, file, OUT, OUT + 8) == CELL_OK, "offset and size: OK");
++    CHECK(be64r(OUT) == 0x1800 && be64r(OUT + 8) == 261476ull * 0x800, "offset 0x1800, size data_size x 2048");
++    CHECK(cellPamfGetStreamOffsetAndSize(HDR, 0, OUT, 0) == CELL_OK, "file size 0 skips the size check");
++    CHECK((uint32_t)cellPamfGetStreamOffsetAndSize(HDR, file + 0x800, OUT, OUT + 8) == CELL_PAMF_ERROR_INVALID_PAMF,
++          "a file size that is not header + data: INVALID_PAMF");
++
++    memset(vm_base + OUT, 0xAA, 16);
++    CHECK(cellPamfGetHeaderSize2(HDR, file, 0, OUT) == CELL_OK && be64r(OUT) == 0x1800, "header size 2: 0x1800");
++    CHECK(cellPamfGetHeaderSize2(HDR, file, CELL_PAMF_ATTRIBUTE_MINIMUM_HEADER, OUT) == CELL_OK && be64r(OUT) == 0x254,
++          "minimum header: up to the end of the sequence info (0x50 + 4 + 0x200)");
++    CHECK(cellPamfGetHeaderSize(HDR, file, OUT) == CELL_OK && be64r(OUT) == 0x1800, "header size: 0x1800");
++
++    CHECK(cellPamfVerify(HDR, file) == CELL_OK, "verify: a well-formed header is OK");
++    be32w(HDR + 0x10, 0x100);
++    CHECK((uint32_t)cellPamfVerify(HDR, file) == CELL_PAMF_ERROR_INVALID_PAMF, "verify: marks offset without a size is INVALID_PAMF");
++    be32w(HDR + 0x10, 0);
++    be32w(HDR + 0x50, 0x2000);
++    CHECK((uint32_t)cellPamfVerify(HDR, file) == CELL_PAMF_ERROR_INVALID_PAMF, "verify: sequence info past the header is INVALID_PAMF");
++    be32w(HDR + 0x50, 0x200);
++
++    memcpy(vm_base + HDR + 4, "0042", 4);
++    CHECK((uint32_t)cellPamfVerify(HDR, file) == CELL_PAMF_ERROR_UNSUPPORTED_VERSION, "version 0042: UNSUPPORTED_VERSION");
++    memcpy(vm_base + HDR + 4, "0040", 4);
++    CHECK(cellPamfVerify(HDR, file) == CELL_OK, "version 0040 is accepted");
++    memcpy(vm_base + HDR, "PSMF", 4);
++    CHECK((uint32_t)cellPamfGetHeaderSize2(HDR, file, 0, OUT) == CELL_PAMF_ERROR_UNKNOWN_TYPE, "another magic: UNKNOWN_TYPE");
++    make_header();
++    be32w(HDR + 8, 0);
++    CHECK((uint32_t)cellPamfGetHeaderSize2(HDR, 0, 0, OUT) == CELL_PAMF_ERROR_INVALID_PAMF, "header size 0: INVALID_PAMF");
++
++    /* cellDmux: type {streamType 1 = CELL_DMUX_STREAM_TYPE_PAMF}, a filled CellDmuxResourceEx, a callback block, a handle slot. */
++    const uint32_t type = 0x30000, res = 0x30100, cb = 0x30200, handle = 0x30300, attr = 0x30400;
++    memset(vm_base + 0x30000, 0, 0x1000);
++    be32w(type, 1);
++    be32w(res + 0, 0x40000); be32w(res + 4, 0x10000); be32w(res + 8, 1000); be32w(res + 0xC, 0x4000);
++    be32w(res + 0x10, 0x50000); be32w(res + 0x14, 0x01010101); be32w(res + 0x18, 0x01010101); be32w(res + 0x1C, 1);
++    be32w(handle, 0xAAAAAAAA); memset(vm_base + attr, 0xAA, 12);
++
++    CHECK((uint32_t)cellDmuxQueryAttr(type, attr) == CELL_DMUX_ERROR_FATAL, "QueryAttr: FATAL (no demuxer core)");
++    CHECK(vm_base[attr] == 0xAA && vm_base[attr + 11] == 0xAA, "QueryAttr writes no attribute");
++    CHECK((uint32_t)cellDmuxQueryAttr(0, attr) == CELL_DMUX_ERROR_ARG, "QueryAttr with no type: ARG");
++    be32w(type, 0);
++    CHECK((uint32_t)cellDmuxQueryAttr(type, attr) == CELL_DMUX_ERROR_ARG, "QueryAttr for stream type 0 (UNDEF): ARG");
++    be32w(type, 2);
++    CHECK((uint32_t)cellDmuxOpenEx(type, res, cb, handle) == CELL_DMUX_ERROR_ARG, "OpenEx for another stream type: ARG");
++    be32w(type, 1);
++
++    CHECK((uint32_t)cellDmuxOpenEx(type, res, cb, handle) == CELL_DMUX_ERROR_FATAL, "OpenEx: FATAL (no demuxer core)");
++    CHECK(vm_base[handle] == 0xAA && vm_base[handle + 3] == 0xAA, "OpenEx writes no handle");
++    CHECK((uint32_t)cellDmuxOpenEx(type, res, cb, 0) == CELL_DMUX_ERROR_ARG, "OpenEx with no handle slot: ARG");
++    CHECK((uint32_t)cellDmuxOpenEx(type, res, 0, handle) == CELL_DMUX_ERROR_ARG, "OpenEx with no callback: ARG");
++    be32w(res + 0x1C, 0);
++    CHECK((uint32_t)cellDmuxOpenEx(type, res, cb, handle) == CELL_DMUX_ERROR_ARG, "OpenEx with maxContention 0: ARG");
++    be32w(res + 0x1C, 1); be32w(res + 0x14, 0x10000000);
++    CHECK((uint32_t)cellDmuxOpenEx(type, res, cb, handle) == CELL_DMUX_ERROR_ARG, "OpenEx with a priority byte of 0x10: ARG");
++    be32w(res + 0x14, 0); be32w(res + 0x10, 0);
++    CHECK((uint32_t)cellDmuxOpenEx(type, res, cb, handle) == CELL_DMUX_ERROR_ARG, "OpenEx with no SPURS: ARG");
++
++    if (fails) { printf("%d check(s) failed\n", fails); return 1; }
++    puts("test_pamf_header_dmux: OK");
++    return 0;
++}
+diff --git a/tools/test_pamf_header_dmux.py b/tools/test_pamf_header_dmux.py
+new file mode 100644
+index 00000000..e4a183ff
+--- /dev/null
++++ b/tools/test_pamf_header_dmux.py
+@@ -0,0 +1,49 @@
++#!/usr/bin/env python3
++"""cellPamf's header-only calls and cellDmux's attribute and open calls.
++
++The five were unresolved imports answering CELL_OK and writing nothing. The
++PAMF header calls now read the file's real layout and give the SDK's codes;
++the demuxer, which has no core here, checks its arguments and answers
++CELL_DMUX_ERROR_FATAL with nothing written. Builds tests/test_pamf_header_dmux.c
++with the real cellPamf.c and cellDmux.c and runs it.
++"""
++import os
++import platform
++import subprocess
++import sys
++import tempfile
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++def main():
++    if os.name == 'nt':
++        print('SKIP: the fixture is POSIX; run on macOS/Linux')
++        return 0
++    with tempfile.TemporaryDirectory(prefix='pamf-dmux-') as tmp:
++        exe = Path(tmp) / 'test_pamf_header_dmux'
++        link = ['-Wl,-undefined,dynamic_lookup'] if platform.system() == 'Darwin' else ['-Wl,--unresolved-symbols=ignore-all']
++        r = subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-w',
++                            '-I' + str(ROOT / 'include'), '-I' + str(ROOT / 'runtime'),
++                            '-I' + str(ROOT / 'libs/codec'),
++                            '-I' + str(ROOT / 'libs'),
++                            str(ROOT / 'tests/test_pamf_header_dmux.c'), str(ROOT / 'libs/codec/cellPamf.c'), str(ROOT / 'libs/codec/cellDmux.c'),
++                            *link, '-o', str(exe)],
++                           capture_output=True, text=True)
++        if r.returncode:
++            print(r.stdout + r.stderr)
++            print('FAIL: fixture did not build')
++            return 1
++        rc = 0
++        for args, extra in (([], {}),):
++            env = {k: v for k, v in os.environ.items() if k not in ('PS3_NET_ONLINE', 'PS3_NETCTL_OFFLINE_FAIL')}
++            env.update(extra)
++            r = subprocess.run([str(exe), *args], capture_output=True, text=True, timeout=30, env=env)
++            sys.stdout.write(r.stdout + r.stderr)
++            rc |= r.returncode
++        return rc
++
++
++if __name__ == '__main__':
++    sys.exit(main())
