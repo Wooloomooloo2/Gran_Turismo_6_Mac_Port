@@ -26,8 +26,12 @@ SetPlaybackCommand2 with nothing selected fails with GENERIC, in its return
 and its event; GetPlaybackStatus2 is STOP; SetVolume2 reports its result
 (its level is in f1, which the generic handler does not read; nothing plays).
 Calls other than Initialize2 before it are GENERIC; Finalize2 reports its
-result and ends the session. Behaviour and error codes follow RPCS3 with no
-music chosen (RPCS3 keeps the callback after Finalize2).
+result and ends the session. The callback and its user data are guarded by a
+mutex (guest threads are host threads). Behaviour and error codes follow RPCS3
+with no music chosen, with three departures (D37 in the superproject):
+Finalize2 clears the callback (RPCS3 keeps it), SetVolume2 ignores its level
+(RPCS3 keeps it), and SelectContents2 answers CANCELED at once, a deliberate
+"no music library" answer (RPCS3 opens its own selection dialog).
 
 Why: a title that starts the music player at boot and waits for its
 initialise result stalled on the faked success.
@@ -38,10 +42,10 @@ sysutil queue: each answer and each callback event above.
 
 diff --git a/libs/misc/cellMusic.c b/libs/misc/cellMusic.c
 new file mode 100644
-index 00000000..ab04f99d
+index 00000000..15bd459b
 --- /dev/null
 +++ b/libs/misc/cellMusic.c
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,120 @@
 +/*
 + * ps3recomp - cellMusic (cellMusicUtility), the in-game music player: second API
 + *
@@ -63,11 +67,28 @@ index 00000000..ab04f99d
 +
 +static u32 s_func;       /* the title's callback (an OPD), 0: not initialised */
 +static u32 s_userdata;
++/* s_func and s_userdata: guest threads are host threads. */
++#ifdef _WIN32
++#include <windows.h>
++static SRWLOCK s_music_lock = SRWLOCK_INIT;
++static void music_lock(void)   { AcquireSRWLockExclusive(&s_music_lock); }
++static void music_unlock(void) { ReleaseSRWLockExclusive(&s_music_lock); }
++#else
++#include <pthread.h>
++static pthread_mutex_t s_music_lock = PTHREAD_MUTEX_INITIALIZER;
++static void music_lock(void)   { pthread_mutex_lock(&s_music_lock); }
++static void music_unlock(void) { pthread_mutex_unlock(&s_music_lock); }
++#endif
 +
-+static void music_event(u32 event, u32 param)
++/* Queue `event` for the title's callback; 0 (nothing queued) when not initialised. */
++static int music_event(u32 event, u32 param)
 +{
++    music_lock();
++    const u32 func = s_func;
 +    const u64 args[8] = { event, param, s_userdata, 0, 0, 0, 0, 0 };
-+    if (s_func) cellSysutilQueueGuestCallbackArgs(s_func, args);
++    if (func) cellSysutilQueueGuestCallbackArgs(func, args);
++    music_unlock();
++    return func != 0;
 +}
 +
 +/* NID 0xBE50B11E. */
@@ -75,8 +96,10 @@ index 00000000..ab04f99d
 +{
 +    if (mode != CELL_MUSIC2_PLAYER_MODE_NORMAL || !func || spuPriority < 16 || spuPriority > 255)
 +        return (s32)CELL_MUSIC2_ERROR_PARAM;
++    music_lock();
 +    s_func = (u32)(uintptr_t)func;
 +    s_userdata = (u32)(uintptr_t)userData;
++    music_unlock();
 +    printf("[cellMusic] Initialize2: no music library; nothing will play\n");
 +    music_event(CELL_MUSIC2_EVENT_INITIALIZE_RESULT, CELL_OK);
 +    return CELL_OK;
@@ -85,19 +108,20 @@ index 00000000..ab04f99d
 +/* NID 0x7BE4DC31. */
 +s32 cellMusicFinalize2(void)
 +{
-+    if (s_func) music_event(CELL_MUSIC2_EVENT_FINALIZE_RESULT, CELL_OK);
++    music_event(CELL_MUSIC2_EVENT_FINALIZE_RESULT, CELL_OK);
++    music_lock();
 +    s_func = 0;
 +    s_userdata = 0;
++    music_unlock();
 +    return CELL_OK;
 +}
 +
 +/* cellMusicSetVolume2(float level): the level is in f1, which this generic
-+ * handler does not read; nothing plays, so there is no volume to set. NID
-+ * 0x4014C246. */
++ * handler does not read; nothing plays, so there is no volume to set (RPCS3
++ * keeps the level; recorded as a departure). NID 0x4014C246. */
 +s32 cellMusicSetVolume2(void)
 +{
-+    if (!s_func) return (s32)CELL_MUSIC2_ERROR_GENERIC;
-+    music_event(CELL_MUSIC2_EVENT_SET_VOLUME_RESULT, CELL_OK);
++    if (!music_event(CELL_MUSIC2_EVENT_SET_VOLUME_RESULT, CELL_OK)) return (s32)CELL_MUSIC2_ERROR_GENERIC;
 +    return CELL_OK;
 +}
 +
@@ -112,8 +136,8 @@ index 00000000..ab04f99d
 +/* The selection list has nothing in it: the user's answer is "cancel". NID 0xAD04CDDD. */
 +s32 cellMusicSelectContents2(void)
 +{
-+    if (!s_func) return (s32)CELL_MUSIC2_ERROR_GENERIC;
-+    music_event(CELL_MUSIC2_EVENT_SELECT_CONTENTS_RESULT, CELL_MUSIC2_CANCELED);
++    if (!music_event(CELL_MUSIC2_EVENT_SELECT_CONTENTS_RESULT, CELL_MUSIC2_CANCELED))
++        return (s32)CELL_MUSIC2_ERROR_GENERIC;
 +    return CELL_OK;
 +}
 +
@@ -128,8 +152,8 @@ index 00000000..ab04f99d
 +s32 cellMusicSetSelectionContext2(void* context)
 +{
 +    if (!context) return (s32)CELL_MUSIC2_ERROR_PARAM;
-+    if (!s_func) return (s32)CELL_MUSIC2_ERROR_GENERIC;
-+    music_event(CELL_MUSIC2_EVENT_SET_SELECTION_CONTEXT_RESULT, CELL_MUSIC2_ERROR_INVALID_CONTEXT);
++    if (!music_event(CELL_MUSIC2_EVENT_SET_SELECTION_CONTEXT_RESULT, CELL_MUSIC2_ERROR_INVALID_CONTEXT))
++        return (s32)CELL_MUSIC2_ERROR_GENERIC;
 +    return CELL_OK;
 +}
 +
@@ -139,7 +163,6 @@ index 00000000..ab04f99d
 +    (void)param;
 +    if (command < CELL_MUSIC2_PB_CMD_STOP || command > CELL_MUSIC2_PB_CMD_FASTREVERSE)
 +        return (s32)CELL_MUSIC2_ERROR_PARAM;
-+    if (!s_func) return (s32)CELL_MUSIC2_ERROR_GENERIC;
 +    music_event(CELL_MUSIC2_EVENT_SET_PLAYBACK_COMMAND_RESULT, CELL_MUSIC2_ERROR_GENERIC);
 +    return (s32)CELL_MUSIC2_ERROR_GENERIC;
 +}
