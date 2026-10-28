@@ -8,7 +8,8 @@
  * The GT6 runner: gt6 <path to EMAIN.SELF.elf>. Changes from the template, and nothing
  * else: the usage line and banner, the window title, and the VFS roots (the disc tree and
  * /dev_hdd0 default to the gt6unpack tree this build was configured for, gt6_paths.h, with
- * /dev_hdd0 on its play folder; PS3_VFS_ROOT and PS3_HDD0_ROOT override; a /dev_hdd0 folder
+ * /dev_hdd0 on its play folder, /dev_hdd1 beside it; PS3_VFS_ROOT, PS3_HDD0_ROOT and PS3_HDD1_ROOT
+ * override; a /dev_hdd0 folder
  * without prepare.json beside it stops the start), and the guest command line (the launch
  * contract, configure_guest_argv), and the SPURS set-up call (gt6_configure_spurs). The
  * template's Windows and Linux paths are kept so the file stays diffable against the
@@ -59,7 +60,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>   /* stat: the /dev_hdd0 folder check, see configure_vfs_roots */
+#include <sys/stat.h>   /* stat, mkdir: the /dev_hdd0 and /dev_hdd1 folders, see configure_vfs_roots */
+#include <errno.h>
 
 #ifndef _WIN32
 #include <sys/mman.h>   /* mmap: the guest arena, see alloc_guest_vm */
@@ -295,6 +297,8 @@ static DWORD WINAPI frame_clock(LPVOID)
  * EBOOT's on-disk effects, made by scripts/prepare_play.py (D31, D32). The verified tree is
  * never run: EMAIN's first run changes thousands of files there. */
 static char s_hdd0_mapping[1024];
+static char s_hdd1_root[1100];
+static char s_hdd1_mapping[1110];
 
 static bool configure_vfs_roots(void)
 {
@@ -323,6 +327,30 @@ static bool configure_vfs_roots(void)
     }
     snprintf(s_hdd0_mapping, sizeof s_hdd0_mapping, "%s/", hdd0);
     cellfs_add_path_mapping("/dev_hdd0/", s_hdd0_mapping);
+
+    /* /dev_hdd1, the cache partition GT6's first-run install decodes into (D39): the play
+     * folder's dev_hdd1, beside dev_hdd0, made empty here when missing; $PS3_HDD1_ROOT
+     * overrides. Both file layers need it. Without it ppu_fs.cpp resolved /dev_hdd1/... into
+     * the disc layer (<tree>/dev_bdvd/cache/..., inside the verified tree) while cellFs.c had
+     * no mapping at all, so the install's rename of a decoded file failed (ENOENT) and GT6
+     * stopped the install with a warning. */
+    const char* hdd1 = getenv("PS3_HDD1_ROOT");
+    if (!hdd1 || !*hdd1) {
+        snprintf(s_hdd1_root, sizeof s_hdd1_root, "%s/../dev_hdd1", hdd0);
+        setenv("PS3_HDD1_ROOT", s_hdd1_root, 1);
+        hdd1 = getenv("PS3_HDD1_ROOT");
+    }
+    if (mkdir(hdd1, 0755) != 0 && errno != EEXIST) {
+        fprintf(stderr, "ERROR: cannot make the /dev_hdd1 folder %s: %s\n", hdd1, strerror(errno));
+        return false;
+    }
+    if (stat(hdd1, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        fprintf(stderr, "ERROR: /dev_hdd1 at %s is not a folder\n", hdd1);
+        return false;
+    }
+    snprintf(s_hdd1_mapping, sizeof s_hdd1_mapping, "%s/", hdd1);
+    cellfs_add_path_mapping("/dev_hdd1/", s_hdd1_mapping);
+    printf("[boot] /dev_hdd1: %s\n", hdd1);
     return true;
 }
 

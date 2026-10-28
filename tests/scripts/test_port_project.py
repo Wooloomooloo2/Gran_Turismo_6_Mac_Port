@@ -235,6 +235,9 @@ def test_real_port_builds(tmp_path):
         assert p.returncode != 0   # the ELF does not exist; the line comes first
         assert ("[boot] guest argv: argc=2 /dev_hdd0/game/BCES01977/USRDIR/EMAIN.SELF "
                 "/dev_hdd0/game/BCES01977/USRDIR/EMAIN.SELF; envp empty") in out, out[-2000:]
+        # /dev_hdd1 is the play folder's dev_hdd1, beside dev_hdd0, never the disc layer (D39).
+        assert f"[boot] /dev_hdd1: {tree}/play/dev_hdd0/../dev_hdd1" in out, out[-2000:]
+        assert (tree / "play" / "dev_hdd1").is_dir()
 
 
 def test_port_runs_on_the_play_folder():
@@ -244,6 +247,9 @@ def test_port_runs_on_the_play_folder():
     main = (REPO / "port" / "main.cpp").read_text()
     assert "run scripts/prepare_play.py first" in main
     assert "prepare.json" in main and "S_ISDIR" in main
+    # /dev_hdd1 (the cache partition) is mapped for both file layers, beside dev_hdd0 (D39).
+    assert 'cellfs_add_path_mapping("/dev_hdd1/"' in main
+    assert 'setenv("PS3_HDD1_ROOT"' in main and '"%s/../dev_hdd1"' in main
 
 
 def test_port_passes_the_launch_contract():
