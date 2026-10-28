@@ -1,0 +1,235 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] Page-fault 57 takes a slot that detached between its scans; SPU interrupt executes a non-branch LS 0
+
+Upstream: not yet submitted; written to be upstreamed (generic, no title names)
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0037)
+
+What (1), lv2 57: its second scan now takes a DETACHED slot too (DETACHED to
+FREEING, freed, CELL_OK), and re-reads the state when a CAS fails. Before, a
+host thread that detached after the first scan passed its WAITING slot made
+57 answer CELL_EINVAL and left the slot DETACHED for ever; 64 such losses hang
+the fault-slot claim loop. A test-only hook (ps3_pf_test_57_hook, NULL
+otherwise) lets a test force the detach into exactly the two windows.
+What (2), the SPU interpreter: an interrupt whose LS 0 word is no br/bra is
+now taken and executed from LS 0, as hardware does (before: reported and not
+taken). A br/bra there is still followed at once (same target).
+What (3), comments: the destroy hook's unsynchronised addr/qid reads; the
+interrupt comment no longer cites a section number.
+Behaviour reference: lv2 page-fault notification as RPCS3 models it, the Cell
+Broadband Engine Architecture and SPU ISA (the SPU interrupt facility);
+RPCS3 read only, no code from it.
+Tests: tests/test_mmapper_page_fault.c (forced detach between 57's scans and
+between its read and CAS: 57 answers OK and frees the slot; both fail on the
+old code) and runtime/spu/tests/test_spu_interp_takes_interrupt.c (a non-branch
+LS 0 runs, then the handler, then iret returns).
+diff --git a/runtime/syscalls/sys_mmapper_pf.c b/runtime/syscalls/sys_mmapper_pf.c
+--- a/runtime/syscalls/sys_mmapper_pf.c
++++ b/runtime/syscalls/sys_mmapper_pf.c
+@@ -78,8 +78,8 @@
+ } pf_area;
+ 
+ /* A fault slot's state. One word, changed by compare-and-swap, so a 57 that
+- * lands while a host thread detaches cannot leave the slot taken for ever
+- * (batch 7 review I-1). A free slot (tid 0) may hold any state; the thread
++ * lands while a host thread detaches does not leave the slot taken
++ * (batch 7 review I-1; batch 8 review I-1). A free slot (tid 0) may hold any state; the thread
+  * that claims it sets WAITING. */
+ enum {
+     PF_WAITING   = 0,   /* the thread waits for 57 */
+@@ -268,6 +268,8 @@
+ #endif
+ }
+ 
++void (*ps3_pf_test_57_hook)(int where);
++
+ static int pf_cas_state(pf_fault* f, int from, int to)
+ {
+     return __atomic_compare_exchange_n(&f->state, &from, to, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+@@ -455,16 +457,33 @@
+     /* A detached slot (its host thread already went on) answers first: its
+      * event was sent first, and the pager answers events in order. */
+     if (!tid) return (int64_t)(int32_t)CELL_EINVAL;
+-    for (int pass = 0; pass < 2; pass++)
++    for (int pass = 0; pass < 2; pass++) {
++        if (pass && ps3_pf_test_57_hook) ps3_pf_test_57_hook(0);
+         for (int i = 0; i < PF_FAULT_MAX; i++) {
+             pf_fault* f = &s_fault[i];
+             if ((__atomic_load_n(&f->tid, __ATOMIC_ACQUIRE) & 0xFFFFFFFFull) != tid) continue;
+             if (!pass) {   /* detached: nobody waits on it, free the slot */
+                 if (pf_cas_state(f, PF_DETACHED, PF_FREEING)) { pf_free(f); return CELL_OK; }
+-            } else if (pf_cas_state(f, PF_WAITING, PF_RECOVERED)) {
+-                return CELL_OK;
++                continue;
++            }
++            /* Pass 1 takes a waiting slot, or a detached one: its host thread
++             * may have detached after pass 0 looked, or between the read and
++             * the CAS here (batch 8 review I-1). A failed CAS means the state
++             * moved (WAITING to DETACHED or ORPHANED): look again. Bounded:
++             * a slot's state only moves forward until it is freed. */
++            for (;;) {
++                int st = __atomic_load_n(&f->state, __ATOMIC_ACQUIRE);
++                if (ps3_pf_test_57_hook) ps3_pf_test_57_hook(1);
++                if (st == PF_WAITING) {
++                    if (pf_cas_state(f, PF_WAITING, PF_RECOVERED)) return CELL_OK;
++                } else if (st == PF_DETACHED) {
++                    if (pf_cas_state(f, PF_DETACHED, PF_FREEING)) { pf_free(f); return CELL_OK; }
++                } else {
++                    break;     /* recovered, orphaned or being freed: not ours to answer */
++                }
+             }
+         }
++    }
+     return (int64_t)(int32_t)CELL_EINVAL;
+ }
+ 
+@@ -484,6 +503,11 @@
+      * dropped. */
+     if (!queue_id || queue_id > SYS_EVENT_QUEUE_MAX) return;
+     const sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
++    /* addr and qid are read without synchronising with a thread claiming the
++     * slot (batch 8 review M-4): between its tid claim and its `qid = 0` store
++     * they may still be a previous fault's. That is harmless: acting needs a
++     * queued event matching that stale addr AND the new tid, and the CASes
++     * below only move a slot that is WAITING or DETACHED. */
+     for (int i = 0; i < PF_FAULT_MAX; i++) {
+         pf_fault* f = &s_fault[i];
+         uint64_t tid = __atomic_load_n(&f->tid, __ATOMIC_ACQUIRE);
+diff --git a/runtime/syscalls/sys_mmapper_pf.h b/runtime/syscalls/sys_mmapper_pf.h
+--- a/runtime/syscalls/sys_mmapper_pf.h
++++ b/runtime/syscalls/sys_mmapper_pf.h
+@@ -42,6 +42,11 @@
+ /* sys_event_queue_destroy tells the page-fault areas their queue is gone. */
+ void ps3_pf_queue_destroyed(uint32_t queue_id);
+ 
++/* Tests only (NULL otherwise): lv2 57 calls it between its two scans (0) and
++ * in its second scan between reading a slot's state and its CAS (1), so a
++ * test can force a host thread's detach into exactly those windows. */
++extern void (*ps3_pf_test_57_hook)(int where);
++
+ void sys_mmapper_pf_init(lv2_syscall_table* tbl);
+ 
+ #ifdef __cplusplus
+diff --git a/runtime/spu/spu_interp.c b/runtime/spu/spu_interp.c
+--- a/runtime/spu/spu_interp.c
++++ b/runtime/spu/spu_interp.c
+@@ -513,7 +513,7 @@
+                 fflush(stderr); _g1--;
+             }
+         }
+-        /* The SPU interrupt facility (CBEA 18.6, SPU ISA "SPU interrupt
++        /* The SPU interrupt facility (CBEA, SPU ISA "SPU interrupt
+          * facility"): with interrupts enabled, a pending enabled event is taken
+          * at this instruction boundary -- srr0 <- the next pc, interrupts off,
+          * execution goes to LS 0. The lifted path takes it at every trampoline
+@@ -521,9 +521,9 @@
+          * so an interpreted image that sleeps with interrupts enabled waiting
+          * for its handler (a SPURS policy module's DMA-list stall-and-notify)
+          * never woke. As on hardware the guest's handler saves its own
+-         * registers: interpreted, the save code it plants runs too. LS 0 not
+-         * holding a branch (br/bra) is reported once and not taken, as
+-         * spu_take_interrupt does. */
++         * registers: interpreted, the save code it plants runs too. A br/bra at
++         * LS 0 is followed at once (the same target); any other word there is
++         * executed from LS 0, as hardware does (batch 8 review M-1). */
+         if (__builtin_expect(ctx->int_enable != 0, 0) &&
+             (__atomic_load_n(&ctx->event_status, __ATOMIC_ACQUIRE) & ctx->event_mask) != 0) {
+             const uint32_t w = ((uint32_t)ctx->ls[0] << 24) | ((uint32_t)ctx->ls[1] << 16) |
+@@ -537,8 +537,12 @@
+             } else {
+                 static int s_nv = 0;
+                 if (s_nv++ < 4)
+-                    fprintf(stderr, "[spu_interp] interrupt pending (st=0x%X mask=0x%X) but LS 0 word 0x%08X "
+-                            "is no branch -- not taken\n", ctx->event_status, ctx->event_mask, w);
++                    fprintf(stderr, "[spu_interp] interrupt taken (st=0x%X mask=0x%X) with LS 0 word 0x%08X "
++                            "(no branch): executing from LS 0\n", ctx->event_status, ctx->event_mask, w);
++                ctx->srr0 = ctx->pc & SPU_LS_MASK;
++                ctx->int_enable = 0;
++                ctx->pc = 0;
++                continue;
+             }
+         }
+         if (_tr>0) { ring[rc&63]=ctx->pc; rc++; if(rn<64)rn++; }
+diff --git a/runtime/spu/tests/test_spu_interp_takes_interrupt.c b/runtime/spu/tests/test_spu_interp_takes_interrupt.c
+--- a/runtime/spu/tests/test_spu_interp_takes_interrupt.c
++++ b/runtime/spu/tests/test_spu_interp_takes_interrupt.c
+@@ -1,8 +1,9 @@
+ /* The interpreter takes SPU interrupts (CBEA, SPU ISA "SPU interrupt
+  * facility"): with interrupts enabled, a pending enabled event sends execution
+  * to the branch at LS 0 with srr0 holding the interrupted pc and interrupts
+- * off; the handler's iret (E) returns there. Disabled, or with no branch at
+- * LS 0, nothing is taken. Real interpreter bytes; no title assets. */
++ * off; the handler's iret (E) returns there. Disabled, or masked, nothing is
++ * taken. Another word at LS 0 is executed from there, as hardware does.
++ * Real interpreter bytes; no title assets. */
+ #include "../spu_helpers.h"
+ #include "../spu_interp.h"
+ #include <assert.h>
+@@ -72,9 +73,12 @@
+     spu_interp_run(&ctx, 0x1000);
+     CHECK(ctx.gpr[4]._u32[0] == 0 && ctx.gpr[3]._u32[0] == 1, "a pending event outside the mask is not taken");
+ 
+-    setup(0, 1, 0x2, 0x2);          /* LS 0 holds no branch */
++    setup(il(6, 9), 1, 0x2, 0x2);   /* LS 0: il r6,9 ; LS 4: br to the handler */
++    be32(ctx.ls + 4, (0x064u << 23) | ((((0x200u - 4u) >> 2) & 0xFFFFu) << 7));
+     spu_interp_run(&ctx, 0x1000);
+-    CHECK(ctx.gpr[4]._u32[0] == 0 && ctx.gpr[3]._u32[0] == 1, "no branch at LS 0: not taken");
++    CHECK(ctx.gpr[6]._u32[0] == 9 && ctx.gpr[4]._u32[0] == 7 && ctx.gpr[3]._u32[0] == 1 && ctx.srr0 == 0x1000,
++          "no branch at LS 0: executed from LS 0, then the handler, then back (r6=%u r4=%u srr0=0x%X)",
++          ctx.gpr[6]._u32[0], ctx.gpr[4]._u32[0], ctx.srr0);
+ 
+     if (fails) { printf("%d check(s) failed\n", fails); return 1; }
+     puts("test_spu_interp_takes_interrupt: OK");
+diff --git a/tests/test_mmapper_page_fault.c b/tests/test_mmapper_page_fault.c
+--- a/tests/test_mmapper_page_fault.c
++++ b/tests/test_mmapper_page_fault.c
+@@ -206,6 +206,21 @@
+     g_round_seen = *(volatile uint32_t*)vm_to_host(g_round_addr);
+     _exit(0);                             /* reached only if the fault was answered */
+     return NULL;
++}
++
++/* Batch 8 review I-1, forced: the hook runs inside 57 at the window under
++ * test; it maps the page and waits until the host thread has detached (it
++ * returns from its fault only after the WAITING to DETACHED CAS). */
++static int g_hook_where = -1, g_hook_fired;
++static pthread_t g_hook_thread;
++static uint32_t g_hook_page;
++static void hook_detach_now(int where)
++{
++    if (where != g_hook_where || g_hook_fired) return;
++    g_hook_fired = 1;
++    ps3_mm_map(g_hook_page, ps3_mm_object_create(0x10000));
++    *(volatile uint32_t*)vm_to_host(g_hook_page + 0x10) = 0xD00Du;
++    pthread_join(g_hook_thread, NULL);
+ }
+ 
+ int main(void)
+@@ -382,6 +397,27 @@
+         }
+         CHECK(good == 100, "I-1: 100 rounds of map-then-57 against a detaching host thread all complete (%d)", good);
+         CHECK(second_einval == 100, "I-1: every slot came free, a second 57 is EINVAL each time (%d)", second_einval);
++    }
++
++    {   /* Batch 8 review I-1: the host thread detaches (0) after 57's first scan
++         * passed its WAITING slot, (1) after the second scan read WAITING but
++         * before its CAS. Either way 57 answers OK and the slot comes free. */
++        for (int where = 0; where < 2; where++) {
++            g_hook_page = g_area4 + 0x700000u + (uint32_t)where * 0x10000u;
++            g_round_addr = g_hook_page + 0x10;
++            g_round_seen = 0xFFFFFFFFu;
++            g_hook_where = where; g_hook_fired = 0;
++            pthread_create(&g_hook_thread, NULL, host_round, NULL);
++            uint64_t e[4];
++            if (receive_into(g_q4, e) != CELL_OK) { CHECK(0, "I-1 forced: event received"); break; }
++            ps3_pf_test_57_hook = hook_detach_now;
++            int64_t rc = recover(e[2] & 0xFFFFFFFFu);
++            ps3_pf_test_57_hook = NULL;
++            CHECK(g_hook_fired && rc == CELL_OK && g_round_seen == 0xD00Du,
++                  "I-1 forced (%s): 57 answers OK for a slot that detached in the window (rc=0x%llX seen=0x%X)",
++                  where ? "between read and CAS" : "between the scans", (unsigned long long)rc, g_round_seen);
++            CHECK((uint32_t)recover(e[2] & 0xFFFFFFFFu) == CELL_EINVAL, "I-1 forced (%d): and freed the slot", where);
++        }
+     }
+ 
+     {   /* M-2: a destroy with a PPU thread's event still queued stops the process;
