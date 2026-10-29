@@ -1,0 +1,86 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] cellFiber: PS3_FIBER_TRACE logs context Run, Switch and ReturnToThread
+
+Upstream: not yet submitted; written to be upstreamed (generic)
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0049)
+
+What: a diagnostic, off unless PS3_FIBER_TRACE is set: one stderr line per
+cellFiberPpuContextRun (and its return, with the cause and the context that
+returned), Switch and ReturnToThread, the first 400, with the guest thread
+id and LR. For a title whose context is parked and never run again (GT6's
+second boot).
+Reference: none needed (logging only).
+Tests: tools/test_cellfiber_ppu.py still passes (the trace is off).
+diff --git a/libs/spurs/cellFiber.c b/libs/spurs/cellFiber.c
+index eb880b72..9c24cfdb 100644
+--- a/libs/spurs/cellFiber.c
++++ b/libs/spurs/cellFiber.c
+@@ -775,6 +775,38 @@ static void xctx_join_thread(XCtx* c)
+ #endif
+ }
+ 
++/* PS3_FIBER_TRACE=1: one stderr line per context Run, Switch, ReturnToThread
++ * and return of a Run (the first 400), with the guest thread and LR, for a
++ * title whose context is never resumed. */
++static int xtrace_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("PS3_FIBER_TRACE"); on = (e && *e && *e != '0'); }
++    return on;
++}
++static void xtrace(const char* what, u32 ctx_ea, s32 v)
++{
++    static int n;
++    if (!xtrace_on() || n >= 4000) return;
++    n++;
++    const ppu_context* a = g_active_ctx;
++    /* The guest callers above the import: each frame's back chain (r1 + 0)
++     * and the LR its caller saved (back chain + 16). */
++    u32 up[4] = {0, 0, 0, 0};
++    if (a) {
++        u32 sp = (u32)a->gpr[1];
++        for (int i = 0; i < 4 && sp; i++) {
++            const u32 back = (u32)vm_read64(sp);
++            if (!back || back <= sp) break;
++            up[i] = (u32)vm_read64(back + 16u);
++            sp = back;
++        }
++    }
++    fprintf(stderr, "[cellFiber] %s ctx=0x%08X v=%d thread=0x%llX lr=0x%08X < 0x%08X < 0x%08X < 0x%08X < 0x%08X\n",
++            what, ctx_ea, (int)v, a ? (unsigned long long)a->thread_id : 0ull, a ? (u32)a->lr : 0u,
++            up[0], up[1], up[2], up[3]);
++}
++
+ int ps3_fiber_context_host_threads(void)
+ {
+     XLOCK();
+@@ -907,10 +939,12 @@ s32 cellFiberPpuContextRun(CellFiberPpuContext* context, s32* cause, CellFiberPp
+     XRun r;
+     memset(&r, 0, sizeof r);
+     XCINIT(&r.cv);
++    xtrace("Run", ea, c->state);
+     xctx_resume_locked(c, &r, 0, g_active_ctx);
+     while (!r.done) XWAIT(&r.cv);
+     XUNLOCK();
+     XCDESTROY(&r.cv);
++    xtrace("Run returned", r.from, r.cause);
+ 
+     vm_write32((u32)(uintptr_t)cause, (u32)r.cause);
+     if (fiberFrom) vm_write32((u32)(uintptr_t)fiberFrom, r.from);
+@@ -931,6 +965,7 @@ s32 cellFiberPpuContextSwitch(CellFiberPpuContext* context, CellFiberPpuContext*
+     XCtx* to = find_xctx(ea);
+     if (!to) { XUNLOCK(); return (s32)CELL_FIBER_ERROR_INVAL; }
+     if (to == me || to->state == X_RUNNING || to->state == X_ENDED) { XUNLOCK(); return (s32)CELL_FIBER_ERROR_STAT; }
++    xtrace("Switch", ea, (s32)me->ea);
+     XRun* run = me->run;
+     me->run   = NULL;
+     me->state = X_SUSPENDED;
+@@ -947,6 +982,7 @@ s32 cellFiberPpuContextReturnToThread(s32 cause)
+ {
+     XCtx* me = t_xcur;
+     if (!me) return (s32)CELL_FIBER_ERROR_PERM;
++    xtrace("ReturnToThread", me->ea, cause);
+     XLOCK();
+     me->state = X_SUSPENDED;
+     xctx_return_locked(me, cause);

@@ -162,6 +162,21 @@ def test_default_environment(tree, tmp_path, monkeypatch):
     assert "PS3RECOMP_METAL_HEADLESS" not in boot_game.build_env(tree, tmp_path, False, None)
 
 
+def test_osk_text_answers_the_keyboards_in_order(tree, tmp_path, monkeypatch):
+    """D75: --osk-text becomes PS3_OSK_TEXT; a keyboard variable left in the shell is dropped."""
+    assert boot_game.osk_env(["John", "Smith"]) == {"PS3_OSK_TEXT": "John,Smith"}
+    assert boot_game.osk_env([]) == {}
+    for bad in ("a,b", "Jos\u00e9", "tab\t"):
+        with pytest.raises(ValueError):
+            boot_game.osk_env([bad])
+    monkeypatch.setenv("PS3_OSK_TEXT", "Left,Over")
+    monkeypatch.setenv("PS3_OSK_CANCEL", "1")
+    env = boot_game.build_env(tree, tmp_path, True, None)
+    assert "PS3_OSK_TEXT" not in env and "PS3_OSK_CANCEL" not in env
+    env = boot_game.build_env(tree, tmp_path, True, boot_game.osk_env(["John"]))
+    assert env["PS3_OSK_TEXT"] == "John"
+
+
 def test_host_pads_are_ignored_unless_asked(tree, tmp_path, monkeypatch):
     """D65: an unattended run reads no controller paired with the Mac; --host-pad allows it."""
     monkeypatch.delenv("PAD_NO_HOST", raising=False)

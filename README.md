@@ -142,6 +142,9 @@ Options for long runs (D35):
 - `--press SECONDS:BUTTON` (repeatable) presses a pad button that many seconds after the game
   first polls the pad, e.g. `--press 480:cross` for GT6's "Installation complete." dialog.
   Buttons: cross, circle, triangle, square, start, select, the d-pad, l1-l3, r1-r3 (D40).
+- `--osk-text TEXT` (repeatable) answers the game's on-screen keyboards in order, e.g.
+  `--osk-text John --osk-text Smith` for GT6's player-name page; without it each keyboard is
+  confirmed with the text it opened with (D75).
 
 Each boot writes `$GT6_TREE/runs/<date-time>/` with `report.json` (outcome, frames, unresolved
 imports), `summary.md`, the logs, the dumped frames (`frames/frame_<present>.ppm`) and

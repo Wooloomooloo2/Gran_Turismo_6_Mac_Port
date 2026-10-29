@@ -406,3 +406,8 @@ target_compile_definitions(gt6_window PRIVATE HOST_WINDOW_TITLE="Gran Turismo 6"
 target_compile_options(gt6_window PRIVATE -fobjc-arc -Wall -Wextra -Wno-unused-parameter)
 target_link_libraries(gt6_window PRIVATE
     "-framework AppKit" "-framework Metal" "-framework QuartzCore" "-framework IOSurface")
+# The launcher is built from a submodule source too, so it follows the tree stamp (D72; batch
+# 12 review M-2): a restored host_window.m or libs/video header recompiles it as well.
+add_dependencies(gt6_window gt6_tree_stamp)
+set_property(SOURCE "${PS3RECOMP_DIR}/tools/host_window/host_window.m" TARGET_DIRECTORY gt6_window
+             APPEND PROPERTY OBJECT_DEPENDS "${GT6_TREE_STAMP}")

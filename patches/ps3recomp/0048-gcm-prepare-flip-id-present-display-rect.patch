@@ -1,0 +1,614 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] GCM/RSX: flip the prepared buffer, present the display buffer's rectangle
+
+Upstream: not yet submitted; written to be upstreamed (generic)
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0047)
+
+What: four things that decide what a flip shows.
+(1) cellGcmSetPrepareFlip returned CELL_OK; the SDK returns the prepared
+buffer's id (0 or more) or an error. GT6 keeps that value as the id its
+vblank handler passes to cellGcmSetFlipImmediate, so every one of its flips
+showed buffer 0, whatever buffer 0 held at that moment (often a 1024x1024
+scene target aliased there): about 30 % of presents were the wrong surface.
+(1b) cellGcmSetPrepareFlip now writes the flip into the context, as libgcm
+does, so the drain presents the buffer where it meets it, once the RSX has
+executed the frame; cellGcmSetFlipImmediate of a buffer prepared that way
+only reports the flip (status, vblank completion) instead of presenting it
+again at call time, which showed frames the drain had not finished (the
+scene stage, or the UI over a black surface). A context that is not a
+mapped command buffer, or is full, keeps the old immediate path.
+(2) The engine presented the whole surface at the display buffer's address.
+The video out scans only the buffer, cellGcmSetDisplayBuffer's width x
+height at its pitch; GT6 draws its 1280x720 buffers through a 1440x1080 or
+1536x1408 clip of the same pitch, so the picture sat in the top-left of a
+stretched frame. A new optional backend call, present_rect, presents that
+rectangle (scaled for an antialiased surface); the Metal backend copies it
+into a texture of that size after the frame's draws, and the window, the
+frame dumps and the series all get it. A surface whose pitch matches the
+buffer's is preferred, and a mismatch is logged (8 times).
+(3) A two-sided stencil draw whose back faces write (BACK_STENCIL_MASK
+non-zero, a non-KEEP back op) marks the zeta written even when the front
+cannot (batch 12 review M-4).
+Reference: the SDK's cellGcmSetPrepareFlip return and cellGcmSetDisplayBuffer
+documentation; RPCS3's cellGcmSys.cpp (gcmSetPrepareFlip returns the id) as
+the behaviour reference only; no emulator code.
+Tests: libs/video/tests/test_gcm_prepare_flip.c (tools/test_gcm_prepare_flip.py:
+the return, fails on the old one; an immediate flip of a stream-prepared
+buffer reports without presenting); test_rsx_draw_engine.c test_present_display_rectangle,
+the two-sided and Z16 stencil checks (test_stencil_draw_leaves_z16_alone);
+libs/video/tests/test_metal_present_rect.m (tools/test_metal_present_rect.py).
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 9e282daf..c2f3d315 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -3117,6 +3117,10 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
+         s_flip_pending = 1;   /* ticker: present BEFORE the next drain */
+         gcm_note_flip_request();
+         s_flip_direct_pending = 1;
++    } else if (in_fifo == 2) {
++        /* cellGcmSetFlipImmediate of a buffer the stream already presents:
++         * the next vblank completes it, nothing is presented here. */
++        s_flip_direct_pending = 1;
+     }
+     /* Flip requested but not yet shown: a subsequent cellGcmSetWaitFlip blocks
+      * until the present thread's cellGcmTickFlip marks it done (vsync). */
+@@ -3215,10 +3219,12 @@ s32 cellGcmSetFlipCommandWithWaitLabel(u32 bufferId, u32 labelIndex, u32 labelVa
+ }
+ 
+ /* NID: 0xA2478CA3 */
++/* Buffers a cellGcmSetPrepareFlip put into the command stream, for the
++ * cellGcmSetFlipImmediate that shows them. */
++static volatile u32 s_prepared_in_fifo;
++
+ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
+ {
+-    (void)ctx;  /* command buffer context -- not used in HLE */
+-
+     if (bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM)
+         return CELL_GCM_ERROR_INVALID_VALUE;
+ 
+@@ -3227,9 +3233,19 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
+ 
+     printf("[cellGcmSys] SetPrepareFlip(bufferId=%u)\n", bufferId);
+ 
+-    gcm_set_current_display_buffer(bufferId);
++    /* libgcm writes the flip into the context: the buffer is ready once the
++     * RSX has executed every command before it. The drain presents it there
++     * (the marker case), so a flip never shows a frame the RSX has not
++     * finished; cellGcmSetFlipImmediate then only switches to it. A context
++     * that is not a mapped command buffer, or is full, flips here instead. */
++    if (gcm_flip_into_fifo((u32)(uintptr_t)ctx, bufferId)) {
++        s_prepared_in_fifo |= 1u << bufferId;
++    } else {
++        s_prepared_in_fifo &= ~(1u << bufferId);
++        gcm_set_current_display_buffer(bufferId);
++        gcm_note_flip_request();
++    }
+     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+-    gcm_note_flip_request();
+     s_last_flip_time = get_timestamp_ns();
+ 
+     /* Invoke the guest flip handler via OPD resolution -- s_flip_handler holds
+@@ -3239,7 +3255,11 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
+     if (s_flip_handler_opd && g_ps3_guest_caller && !gcm_flipcb_on_tick_only())
+         g_ps3_guest_caller(s_flip_handler_opd, 0, 0, 0, 0, 0, 0, 0, 0);
+ 
+-    return CELL_OK;
++    /* The SDK's return is the prepared buffer's id (0 or more), an error
++     * otherwise, and titles keep it: GT6 stores it as the id its vblank
++     * handler later hands cellGcmSetFlipImmediate. CELL_OK (0) here made
++     * every one of its flips show buffer 0, whatever was in it. */
++    return (s32)bufferId;
+ }
+ 
+ /* NID: 0x1BFAB6EE */
+@@ -4243,6 +4263,13 @@ u32 cellGcmGetDefaultSegmentWordSize(void)
+ s32 cellGcmSetFlipImmediate(u32 bufferId)
+ {
+     printf("[cellGcmSys] SetFlipImmediate(bufferId=%u)\n", bufferId);
++    /* A buffer cellGcmSetPrepareFlip queued in the stream is presented where
++     * the drain reaches it; here the flip is only reported (status, handler,
++     * vblank completion), not presented a second time and early. */
++    if (bufferId < CELL_GCM_MAX_DISPLAY_BUFFER_NUM && (s_prepared_in_fifo & (1u << bufferId))) {
++        s_prepared_in_fifo &= ~(1u << bufferId);
++        return gcm_flip_request(bufferId, 2);
++    }
+     return cellGcmSetFlipCommand(bufferId);
+ }
+ 
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+index 7c70a47a..49ddadcb 100644
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -77,6 +77,7 @@ extern u32 ppu_vm_size;
+ #define M_STENCIL_OP_ZFAIL    0x0340
+ #define M_STENCIL_OP_ZPASS    0x0344
+ #define M_TWO_SIDED_STENCIL   0x0348
++#define M_BACK_STENCIL_MASK   0x034C
+ #define M_BACK_STENCIL_FUNC   0x0350
+ #define M_BACK_STENCIL_OP_FAIL  0x035C
+ #define M_BACK_STENCIL_OP_ZFAIL 0x0360
+@@ -1573,10 +1574,13 @@ static int eng_zdepth_to_guest(u32 slot)
+  * and depth writes off, then reads the zeta as A8R8G8B8). */
+ static int eng_stencil_writes(const rsx_be_render_state* rs)
+ {
+-    if (!rs->stencil_enable || !(rs->s_write_mask & 0xFFu)) return 0;
++    if (!rs->stencil_enable) return 0;
+     const u32 keep = 0x1E00u;
+-    if (rs->s_fail != keep || rs->s_zfail != keep || rs->s_zpass != keep) return 1;
+-    return rs->stencil_two_sided &&
++    if ((rs->s_write_mask & 0xFFu) &&
++        (rs->s_fail != keep || rs->s_zfail != keep || rs->s_zpass != keep)) return 1;
++    /* Two-sided: back faces use their own ops and write mask
++     * (SET_BACK_STENCIL_MASK), which may write when the front's cannot. */
++    return rs->stencil_two_sided && (rsx_dsp_reg(&g.rsx, M_BACK_STENCIL_MASK) & 0xFFu) &&
+            (rs->bs_fail != keep || rs->bs_zfail != keep || rs->bs_zpass != keep);
+ }
+ 
+@@ -3415,10 +3419,28 @@ static u32 eng_present_surface(u32 buffer_id)
+ {
+     if (buffer_id < 8 && g.display_buffers[buffer_id].valid) {
+         const eng_display_buffer* d = &g.display_buffers[buffer_id];
+-        for (u32 i = 0; i < g.n_surfaces; i++)
+-            if (g.surfaces[i].handle && g.surfaces[i].location == d->location &&
+-                g.surfaces[i].offset == d->offset)
+-                return i;
++        /* The video out reads the buffer's memory with the buffer's pitch, so
++         * a surface laid out with that pitch is the picture; among several at
++         * the address, the one written last. Any surface there otherwise. */
++        u32 best = ENG_INVALID, any = ENG_INVALID;
++        for (u32 i = 0; i < g.n_surfaces; i++) {
++            const eng_surface* s = &g.surfaces[i];
++            if (!s->handle || s->location != d->location || s->offset != d->offset) continue;
++            if (any == ENG_INVALID || s->color_serial > g.surfaces[any].color_serial) any = i;
++            if (s->pitch == d->pitch &&
++                (best == ENG_INVALID || s->color_serial > g.surfaces[best].color_serial))
++                best = i;
++        }
++        if (best != ENG_INVALID) return best;
++        if (any != ENG_INVALID) {
++            static u32 logs = 0;
++            if (PS3_LOG_FIRST(logs, 8))
++                fprintf(stderr, "[rsx engine] flip of buffer %u (0x%08X, pitch %u): the surface"
++                                " there has pitch %u (%ux%u); presenting it\n",
++                        buffer_id, d->offset, d->pitch, g.surfaces[any].pitch,
++                        g.surfaces[any].w, g.surfaces[any].h);
++            return any;
++        }
+     }
+     return eng_current_surface();
+ }
+@@ -3443,7 +3465,22 @@ static void eng_present(u32 buffer_id)
+     g.last_frame_draws  = g.frame_draws;
+     g.last_frame_clears = g.frame_clears;
+     g.frame_draws = g.frame_clears = 0;
+-    g.be->present(g.be->user, g.surfaces[target].handle);
++    /* The display buffer is width x height at the surface's top left; a
++     * larger target at its address (a 1440x1080 pass over a 1280x720 buffer)
++     * shows only that rectangle (cellGcmSetDisplayBuffer). */
++    const eng_display_buffer* d = buffer_id < 8 && g.display_buffers[buffer_id].valid
++                                ? &g.display_buffers[buffer_id] : NULL;
++    const eng_surface* ps = &g.surfaces[target];
++    /* An antialiased surface is stored at sample resolution. */
++    const u32 ax = (ps->aa_grid & 0xFFu) ? (ps->aa_grid & 0xFFu) : 1u;
++    const u32 ay = (ps->aa_grid >> 8) ? (ps->aa_grid >> 8) : 1u;
++    const u32 dw = d ? d->width * ax : 0, dh = d ? d->height * ay : 0;
++    if (d && g.be->present_rect && ps->location == d->location && ps->offset == d->offset &&
++        (dw < ps->w || dh < ps->h))
++        g.be->present_rect(g.be->user, ps->handle, dw < ps->w ? dw : ps->w,
++                           dh < ps->h ? dh : ps->h);
++    else
++        g.be->present(g.be->user, ps->handle);
+     g.frames++;
+     g.last_guest_draws = g.guest_draws;
+     g.guest_draws = 0;
+diff --git a/libs/video/rsx_draw_engine.h b/libs/video/rsx_draw_engine.h
+index 076c7de8..eaa639f9 100644
+--- a/libs/video/rsx_draw_engine.h
++++ b/libs/video/rsx_draw_engine.h
+@@ -302,6 +302,14 @@ typedef struct rsx_draw_backend {
+                                      float depth_value, u8 stencil,
+                                      u32 x, u32 y, u32 w, u32 h);
+ 
++    /* Optional. Present only the top-left w x h of the surface (w, h no
++     * larger than it): the display buffer the guest flipped
++     * (cellGcmSetDisplayBuffer's width and height) when the engine surface at
++     * its address is larger, as a 1280x720 buffer inside a 1440x1080 render
++     * target of the same pitch. The video out scans that rectangle and
++     * nothing else. NULL presents the whole surface, as before. */
++    void (*present_rect)(void* user, u32 surface, u32 w, u32 h);
++
+ } rsx_draw_backend;
+ 
+ /* ---- the engine --------------------------------------------------------- */
+diff --git a/libs/video/rsx_metal_backend.m b/libs/video/rsx_metal_backend.m
+index 31d03816..45fcef6e 100644
+--- a/libs/video/rsx_metal_backend.m
++++ b/libs/video/rsx_metal_backend.m
+@@ -4290,9 +4290,14 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
+  * in-flight semaphore instead, the same bound the vtable path uses, because
+  * waiting on every frame is the one pattern where a driver cannot hide its
+  * encoding work. */
++static id<MTLTexture> s_eng_crop_from;   /* present_rect's source, for one commit */
++static id<MTLTexture> s_eng_crop_tex;    /* the presented rectangle, reused while its size holds */
++
+ static void eng_encode_and_commit(id<MTLTexture> present_dst)
+ {
+     s_eng_checked_completed = 0;
++    id<MTLTexture> crop_from = s_eng_crop_from;
++    s_eng_crop_from = nil;
+     @autoreleasepool {
+         id<CAMetalDrawable> drawable = nil;
+         id<MTLTexture> dst = nil;
+@@ -4334,6 +4339,19 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
+         const uint64_t ft_e0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+         const u32 ft_nrec = s_eng_rec_count;
+         eng_encode_records(cb, stage);
++        /* present_rect: the display buffer's rectangle of the surface, copied
++         * after every draw recorded for the frame, is what is presented. */
++        if (crop_from && present_dst) {
++            id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
++            if (b) {
++                [b copyFromTexture:crop_from sourceSlice:0 sourceLevel:0
++                      sourceOrigin:MTLOriginMake(0, 0, 0)
++                        sourceSize:MTLSizeMake([present_dst width], [present_dst height], 1)
++                         toTexture:present_dst destinationSlice:0 destinationLevel:0
++                 destinationOrigin:MTLOriginMake(0, 0, 0)];
++                [b endEncoding];
++            }
++        }
+         if (present_dst && dst) eng_blit_to_display(cb, present_dst, dst);
+         if (drawable) { fps_track_drawable(drawable); [cb presentDrawable:drawable]; }
+         if (ft_e0) ps3_ft_span(PS3_FT_GPU_ENCODE, 0, present_dst ? 1u : 0u, ft_nrec, ft_e0, ps3_ft_now());
+@@ -4472,6 +4490,37 @@ static void eng_present(void* user, u32 surface)
+     eng_series_present(src);
+ }
+ 
++/* The display buffer is the top-left w x h of a larger surface: that
++ * rectangle alone goes to the window, the frame dumps and the series, as the
++ * video out scans only the buffer (cellGcmSetDisplayBuffer). One copy per
++ * present into a texture kept while the size and format hold; queue order
++ * keeps an in-flight frame's read of it before the next frame's copy. */
++static void eng_present_rect(void* user, u32 surface, u32 w, u32 h)
++{
++    id<MTLTexture> src = eng_obj(surface);
++    if (!src || !w || !h || w > [src width] || h > [src height] || [src sampleCount] != 1 ||
++        [src textureType] != MTLTextureType2D) {
++        eng_present(user, surface);
++        return;
++    }
++    if (!s_eng_crop_tex || [s_eng_crop_tex width] != w || [s_eng_crop_tex height] != h ||
++        [s_eng_crop_tex pixelFormat] != [src pixelFormat]) {
++        MTLTextureDescriptor* td =
++            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:[src pixelFormat]
++                                                               width:w height:h mipmapped:NO];
++        td.usage       = MTLTextureUsageShaderRead;
++        td.storageMode = [src storageMode];
++        id<MTLTexture> t = [s_dev newTextureWithDescriptor:td];
++        if (!t) { eng_present(user, surface); return; }
++        s_eng_crop_tex = t;
++    }
++    rsx_metal_backend_note_guest_frame();
++    s_eng_crop_from = src;
++    eng_encode_and_commit(s_eng_crop_tex);
++    eng_dump_frame(s_eng_crop_tex);
++    eng_series_present(s_eng_crop_tex);
++}
++
+ static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
+                          void* out, u32 out_pitch)
+ {
+@@ -4580,6 +4629,7 @@ static const rsx_draw_backend s_engine_backend = {
+     .clear_color_rect     = eng_clear_color_rect,
+     .clear_depth_stencil_rect = eng_clear_depth_stencil_rect,
+     .present              = eng_present,
++    .present_rect         = eng_present_rect,
+     .readback             = eng_readback,
+ };
+ 
+diff --git a/libs/video/tests/test_gcm_prepare_flip.c b/libs/video/tests/test_gcm_prepare_flip.c
+new file mode 100644
+index 00000000..ce0faa3e
+--- /dev/null
++++ b/libs/video/tests/test_gcm_prepare_flip.c
+@@ -0,0 +1,50 @@
++/* cellGcmSetPrepareFlip's return value and the immediate flip that shows it:
++ * the SDK returns the prepared buffer's id (0 or more) or an error, and a
++ * title may keep it. GT6 stores it as the
++ * id its vblank handler later passes to cellGcmSetFlipImmediate; returning
++ * CELL_OK (0) made every flip show buffer 0. Built and run by
++ * tools/test_gcm_prepare_flip.py, which compiles cellGcmSys.c in. */
++#include "../cellGcmSys.c"
++void ps3_ms(const char* key) { (void)key; }   /* the milestone log is not under test */
++#include <assert.h>
++uint8_t* vm_base;
++uint32_t ppu_vm_size;
++int g_resv_store_active;
++uint32_t g_ww_lo, g_ww_hi;
++void ppu_resv_break_store(uint64_t ea) { (void)ea; }
++void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
++int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
++void spu_coh_notify_write(uint32_t a) { (void)a; }
++void spu_lockline_lock(void) {}
++void spu_lockline_unlock(void) {}
++ps3_guest_caller_fn g_ps3_guest_caller;
++PPU_THREAD_LOCAL ppu_context* g_active_ctx;
++void ppu_dump_bctrl_ring(uint32_t n, const char* why) { (void)n; (void)why; }
++void ppu_dump_guest_stack(ppu_context* c, const char* why) { (void)c; (void)why; }
++static uint32_t noted = 0xFFu;
++int  rsx_draw_engine_enabled(void) { return 1; }
++void rsx_draw_engine_note_flip(uint32_t buffer_id) { noted = buffer_id; }
++int main(void)
++{
++    s_display_buffer_set[1] = 1;
++    s_display_buffer_set[2] = 1;
++    assert(cellGcmSetPrepareFlip(NULL, 2) == 2);
++    assert(cellGcmGetCurrentDisplayBufferId() == 2 && noted == 2);
++    assert(cellGcmSetPrepareFlip(NULL, 1) == 1 && noted == 1);
++    assert(cellGcmSetPrepareFlip(NULL, 3) == (s32)CELL_GCM_ERROR_INVALID_VALUE);   /* not set */
++    assert(cellGcmSetPrepareFlip(NULL, 9) == (s32)CELL_GCM_ERROR_INVALID_VALUE);
++    /* No mapped command buffer: the prepare names the buffer at once and the
++     * immediate flip presents it. */
++    s_flip_pending = 0;
++    assert(cellGcmSetPrepareFlip(NULL, 2) == 2 && !(s_prepared_in_fifo & 4u));
++    assert(cellGcmSetFlipImmediate(2) == CELL_OK && s_flip_pending == 1 && noted == 2);
++    /* Prepared in the stream: the drain presents it where it meets the
++     * marker, so the immediate flip only reports it (no second, early present). */
++    s_flip_pending = 0; s_flip_direct_pending = 0; noted = 0xFF;
++    s_prepared_in_fifo = 1u << 1;
++    assert(cellGcmSetFlipImmediate(1) == CELL_OK);
++    assert(s_flip_pending == 0 && noted == 0xFF && s_flip_direct_pending == 1 && !s_prepared_in_fifo);
++    assert(cellGcmGetFlipStatus() == CELL_GCM_FLIP_STATUS_WAITING);
++    puts("cellGcmSetPrepareFlip returns the buffer id; a prepared flip is presented once: passed");
++    return 0;
++}
+diff --git a/libs/video/tests/test_metal_present_rect.m b/libs/video/tests/test_metal_present_rect.m
+new file mode 100644
+index 00000000..8050d2a9
+--- /dev/null
++++ b/libs/video/tests/test_metal_present_rect.m
+@@ -0,0 +1,63 @@
++/* present_rect: a display buffer smaller than the engine surface at its
++ * address (GT6's 1280x720 buffers inside a 1440x1080 render target) presents
++ * that top-left rectangle and nothing else: the presented texture is w x h
++ * and holds exactly the surface's top-left w x h pixels. A rectangle as large
++ * as the surface, or larger, presents the surface itself. Needs a Metal
++ * device; no window or game data.
++ * (tools/test_metal_present_rect.py builds and runs it.) */
++#include "../rsx_metal_backend.m"
++#include <stdio.h>
++
++float cellAvconfExt_display_gamma(void) { return 1.0f; }
++void rsx_draw_engine_frame_counts(u32* draws, u32* clears) { *draws = 0; *clears = 0; }
++
++static int failures, checks;
++#define CHECK(v, name) do { checks++; if (!(v)) { failures++; fprintf(stderr, "FAIL %s\n", name); } } while (0)
++enum { SW = 48, SH = 40, DW = 30, DH = 17 };
++
++int main(void)
++{
++    @autoreleasepool {
++        s_headless = 1;
++        s_dev = MTLCreateSystemDefaultDevice();
++        if (!s_dev) { puts("SKIP: no Metal device"); return 0; }
++        s_queue = [s_dev newCommandQueue];
++        s_inflight = dispatch_semaphore_create(3);
++        CHECK(eng_init(NULL, SW, SH) == 0, "backend helpers");
++
++        static unsigned char seed[SW * SH * 4];
++        for (int y = 0; y < SH; y++)
++            for (int x = 0; x < SW; x++) {
++                unsigned char* p = seed + (y * SW + x) * 4;
++                p[0] = (unsigned char)x; p[1] = (unsigned char)y;
++                p[2] = (unsigned char)(x * 3 + y); p[3] = 0xFF;
++            }
++        const u32 surface = eng_color_target_create(NULL, RSX_BE_FMT_R8G8B8A8, SW, SH, seed, SW * 4);
++        CHECK(surface != 0, "a 48x40 colour target");
++
++        eng_present_rect(NULL, surface, DW, DH);
++        id<MTLTexture> shown = s_eng_crop_tex;
++        CHECK(shown && [shown width] == DW && [shown height] == DH, "the presented texture is 30x17");
++        if (shown) {
++            static unsigned char got[DW * DH * 4];
++            [shown getBytes:got bytesPerRow:DW * 4 fromRegion:MTLRegionMake2D(0, 0, DW, DH) mipmapLevel:0];
++            int same = 1;
++            for (int y = 0; y < DH; y++)
++                for (int x = 0; x < DW; x++)
++                    if (memcmp(got + (y * DW + x) * 4, seed + (y * SW + x) * 4, 4)) same = 0;
++            CHECK(same, "it holds the surface's top-left 30x17 pixels");
++        }
++        CHECK(s_eng_crop_from == nil, "the source is not kept past the commit");
++
++        /* The same rectangle again reuses the texture; a whole-surface one
++         * presents the surface (no copy). */
++        eng_present_rect(NULL, surface, DW, DH);
++        CHECK(s_eng_crop_tex == shown, "the presented texture is reused while its size holds");
++        id<MTLTexture> before = s_eng_crop_tex;
++        eng_present_rect(NULL, surface, SW + 1, SH);
++        CHECK(s_eng_crop_tex == before, "a rectangle past the surface presents it whole");
++        CHECK(!s_eng_encoding_failed, "no command buffer failed");
++    }
++    printf("%d of %d checks passed\n", checks - failures, checks);
++    return failures ? 1 : 0;
++}
+diff --git a/libs/video/tests/test_rsx_draw_engine.c b/libs/video/tests/test_rsx_draw_engine.c
+index 29299c3f..92247881 100644
+--- a/libs/video/tests/test_rsx_draw_engine.c
++++ b/libs/video/tests/test_rsx_draw_engine.c
+@@ -272,6 +272,13 @@ static void stub_present(void* u, u32 s)
+     rsx_draw_engine_frame_counts(&stub.present_draws, &stub.present_clears);
+ }
+ 
++static struct { int n; u32 surface, w, h; } g_present_rect;
++static void stub_present_rect(void* u, u32 s, u32 w, u32 h)
++{
++    g_present_rect.n++; g_present_rect.surface = s; g_present_rect.w = w; g_present_rect.h = h;
++    stub_present(u, s);
++}
++
+ /* One pixel of a surface, in the R,G,B,A order rsx_texture_decode produces:
+  * the readback hook has to put those back into the guest's A8R8G8B8. */
+ static u8 g_stub_pixel[4] = { 0x11, 0x22, 0x33, 0x44 };
+@@ -1170,6 +1177,37 @@ static void test_queued_flip_buffer(void)
+     engine_down();
+ }
+ 
++/* A flip shows the display buffer, cellGcmSetDisplayBuffer's width x height
++ * at its address and pitch: a larger render target of the same pitch there
++ * (GT6 draws its 1280x720 buffers through a 1440x1080 clip) is presented as
++ * that top-left rectangle only, and a target the same size as a whole. */
++static void test_present_display_rectangle(void)
++{
++    printf("-- a flip presents the display buffer's rectangle of a larger target\n");
++    engine_up();
++    rsx_draw_backend be = g_stub_backend;
++    be.present_rect = stub_present_rect;
++    rsx_draw_engine_set_backend(&be);
++    memset(&g_present_rect, 0, sizeof g_present_rect);
++
++    m(M_COLOR_A_PITCH, 1024u);
++    draw_triangle();                               /* 256x256 at 0x40000, pitch 1024 */
++    const u32 big = stub.bound_rt[0];
++    rsx_draw_engine_set_display_buffer(0, RSX_LOCATION_LOCAL, 0x40000, 1024, 200, 150);
++    rsx_draw_engine_present_buffer(0);
++    CHECK(g_present_rect.n == 1 && g_present_rect.surface == big &&
++          g_present_rect.w == 200 && g_present_rect.h == 150,
++          "presented the 200x150 display rectangle of the 256x256 target (%d, %ux%u)",
++          g_present_rect.n, g_present_rect.w, g_present_rect.h);
++
++    rsx_draw_engine_set_display_buffer(1, RSX_LOCATION_LOCAL, 0x40000, 1024, 256, 256);
++    const int presents = stub.n_present;
++    rsx_draw_engine_present_buffer(1);
++    CHECK(g_present_rect.n == 1 && stub.n_present == presents + 1 && presented_surface == big,
++          "a display buffer the target's size presents it whole");
++    engine_down();
++}
++
+ /* A 2D transfer reads and writes guest memory; the pixels it touches live in
+  * the engine's surfaces, so they are synced both ways around it. */
+ static void test_transfer_coherence(void)
+@@ -2007,6 +2045,48 @@ static void test_stencil_write_changes_zeta_bytes(void)
+     m(M_CLEAR_BUFFERS, 0x02u);                    /* the stencil alone */
+     draw_triangle();
+     CHECK(g_argb_calls == 3, "a stencil-only clear: converted again (%d calls)", g_argb_calls);
++
++    /* Two-sided: the front keeps (or cannot write), the back inverts. */
++    m(0x0348 /* TWO_SIDED_STENCIL_TEST_ENABLE */, 1u);
++    m(0x034C /* BACK_STENCIL_MASK */, 0xFFu);
++    m(0x035C /* BACK_OP_FAIL */, 0x1E00u);
++    m(0x0360 /* BACK_OP_ZFAIL */, 0x1E00u);
++    m(0x0364 /* BACK_OP_ZPASS */, 0x150Au);
++    stencil_only_draw(0xFFu, 0x1E00u);
++    draw_triangle();
++    CHECK(g_argb_calls == 4, "front KEEP, back INVERT: converted again (%d calls)", g_argb_calls);
++    stencil_only_draw(0x00u, 0x150Au);
++    draw_triangle();
++    CHECK(g_argb_calls == 5, "front mask 0, back mask 0xFF INVERT: converted again (%d calls)",
++          g_argb_calls);
++    m(0x034C, 0u);
++    stencil_only_draw(0x00u, 0x150Au);
++    draw_triangle();
++    CHECK(g_argb_calls == 5, "neither side writable: reused (%d calls)", g_argb_calls);
++    m(0x0348, 0u);
++    engine_down();
++}
++
++/* A Z16 zeta has no stencil: a stencil-only draw through it writes nothing,
++ * so its DEPTH16 conversion is reused. */
++static void test_stencil_draw_leaves_z16_alone(void)
++{
++    printf("-- a stencil-only draw through a Z16 zeta is no write\n");
++    engine_up();
++    rsx_draw_backend be = g_stub_backend;
++    be.depth_as_color = stub_depth_as_color;
++    rsx_draw_engine_set_backend(&be);
++    g_argb_calls = 0; g_argb_fail = 0;
++
++    depth_pass_then_read_as(1u, 0x92u, 256u * 2u, 1);
++    draw_triangle();
++    CHECK(g_argb_calls == 1, "converted once (%d calls)", g_argb_calls);
++    stencil_only_draw(0xFFu, 0x150Au);
++    draw_triangle();
++    CHECK(g_argb_calls == 1, "a stencil INVERT through Z16: reused (%d calls)", g_argb_calls);
++    m(M_CLEAR_BUFFERS, 0x02u);                    /* a stencil-only clear of Z16 */
++    draw_triangle();
++    CHECK(g_argb_calls == 1, "a stencil-only clear of Z16: reused (%d calls)", g_argb_calls);
+     engine_down();
+ }
+ 
+@@ -2559,6 +2639,7 @@ int main(void)
+     test_custom_guest_mapping();
+     test_polygon_offset();
+     test_queued_flip_buffer();
++    test_present_display_rectangle();
+     test_transfer_coherence();
+     test_transfer_rows();
+     test_transfer_reads_fp16();
+@@ -2572,6 +2653,7 @@ int main(void)
+     test_depth_read_as_argb_on_gpu();
+     test_z16_read_as_depth16_on_gpu();
+     test_stencil_write_changes_zeta_bytes();
++    test_stencil_draw_leaves_z16_alone();
+     test_full_tables_evict_the_oldest();
+     test_color_read_as_float();
+     test_engine_rewrite_reuploads();
+diff --git a/tools/test_gcm_prepare_flip.py b/tools/test_gcm_prepare_flip.py
+new file mode 100644
+index 00000000..f2364d02
+--- /dev/null
++++ b/tools/test_gcm_prepare_flip.py
+@@ -0,0 +1,26 @@
++#!/usr/bin/env python3
++"""cellGcmSetPrepareFlip returns the prepared buffer's id (libs/video/tests/
++test_gcm_prepare_flip.c, which compiles cellGcmSys.c in)."""
++import os
++from pathlib import Path
++import subprocess
++import sys
++import tempfile
++
++root = Path(__file__).resolve().parents[1]
++if os.name == 'nt':
++    print('SKIP: the GCM flip fixture uses POSIX linking')
++    raise SystemExit(0)
++with tempfile.TemporaryDirectory(prefix='gcm-prepare-flip-') as tmp:
++    binary = Path(tmp) / 'test'
++    linker = ['-Wl,-dead_strip'] if sys.platform == 'darwin' else ['-Wl,--gc-sections', '-pthread', '-lm']
++    subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG',
++                    '-ffunction-sections', '-fdata-sections',
++                    '-I' + str(root / 'include'), '-I' + str(root / 'libs/video'),
++                    str(root / 'libs/video/tests/test_gcm_prepare_flip.c'), *linker,
++                    '-o', str(binary)], check=True)
++    result = subprocess.run([str(binary)], timeout=30, capture_output=True, text=True)
++    print(result.stdout.strip())
++    if result.returncode:
++        print(result.stderr[-2000:])
++        raise SystemExit('test_gcm_prepare_flip failed')
+diff --git a/tools/test_metal_present_rect.py b/tools/test_metal_present_rect.py
+new file mode 100644
+index 00000000..e0830e52
+--- /dev/null
++++ b/tools/test_metal_present_rect.py
+@@ -0,0 +1,21 @@
++#!/usr/bin/env python3
++"""The Metal backend's present_rect: a display buffer smaller than the surface at
++its address presents exactly that top-left rectangle."""
++import pathlib
++import platform
++import subprocess
++import tempfile
++ROOT = pathlib.Path(__file__).resolve().parents[1]
++if platform.system() != "Darwin":
++    print("SKIP: Metal requires macOS")
++    raise SystemExit(0)
++with tempfile.TemporaryDirectory(prefix="metal-present-rect-") as tmp:
++    binary = pathlib.Path(tmp) / "test"
++    subprocess.run(["clang", "-fobjc-arc", "-Iinclude", "-Ilibs/video",
++                    "libs/video/tests/test_metal_present_rect.m",
++                    "libs/video/rsx_texture_layout.c", "libs/video/rsx_shader_msl.cpp",
++                    "-lc++", "-Wl,-dead_strip",
++                    "-framework", "Metal", "-framework", "Cocoa",
++                    "-framework", "QuartzCore", "-o", str(binary)],
++                   cwd=ROOT, check=True, timeout=120)
++    subprocess.run([str(binary)], check=True, timeout=30)

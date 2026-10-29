@@ -46,6 +46,9 @@ own presses: the port hands image N the script in GT6_PAD_SCRIPT_IMAGE<N> and cl
 PAD_SCRIPT when there is none. BUTTON is a CELL_PAD_CTRL_* name: cross, circle, triangle,
 square, start, select, up, down, left, right, l1, l2, l3, r1, r2, r3. report.json records
 them in "presses".
+--osk-text TEXT (repeatable; D75) answers the game's on-screen keyboards in order (ps3recomp's
+PS3_OSK_TEXT); without it each keyboard is confirmed with its initial text. report.json
+records them in "osk_text".
 Host controllers (a pad paired with the Mac) are ignored unless --host-pad is given (D65):
 cellPad is told PAD_NO_HOST=1, so only --press drives the game's pad.
 The run is recorded in <tree>/play/prepare.json as "booted": <run>. A play folder an earlier
@@ -169,6 +172,15 @@ def parse_press(text):
     if not (math.isfinite(t) and t >= 0):
         raise ValueError(f"--press time must be a finite 0 or more seconds, not {sec!r}")
     return t, name, int(image)
+
+
+def osk_env(texts):
+    """The environment for --osk-text answers (D75): PS3_OSK_TEXT, one entry per keyboard
+    in order. ValueError for a text the list cannot carry (a comma) or that is not ASCII."""
+    for t in texts:
+        if "," in t or not t.isascii() or not t.isprintable():
+            raise ValueError(f"--osk-text wants printable ASCII without commas, not {t!r}")
+    return {"PS3_OSK_TEXT": ",".join(texts)} if texts else {}
 
 
 def pad_script(presses):
@@ -332,6 +344,9 @@ def build_env(tree, run, headless, env, frame_every=60, frame_max=300, play=None
     e["PS3_MILESTONE_OUT"] = str(run / "milestones.log")
     # The numbered series (patch 0010) replaces milestone 2's single overwritten dump.
     e.pop("PS3RECOMP_METAL_FRAME_DUMP", None)
+    # D75: only --osk-text answers the game's keyboard, never a variable left in the shell.
+    for k in ("PS3_OSK_TEXT", "PS3_OSK_CANCEL", "PS3_OSK_DELAY_MS"):
+        e.pop(k, None)
     e["PS3RECOMP_METAL_FRAME_DIR"] = str(run / "frames")
     e["PS3RECOMP_METAL_FRAME_EVERY"] = str(frame_every)
     e["PS3RECOMP_METAL_FRAME_MAX"] = str(frame_max)
@@ -794,6 +809,10 @@ def main(argv=None):
                          "<tree>/play (D49)")
     ap.add_argument("--host-pad", action="store_true",
                     help="let a controller paired with this Mac reach the game (default: ignored, D65)")
+    ap.add_argument("--osk-text", action="append", default=[], metavar="TEXT",
+                    help="answer the game's next on-screen keyboard with TEXT (repeatable, one "
+                         "per keyboard in order; ASCII, no commas; D75). Without it each "
+                         "keyboard is confirmed with its initial text")
     ap.add_argument("--press", action="append", default=[], metavar="[IMAGE@]SECONDS:BUTTON",
                     help="press a pad button SECONDS after image IMAGE (default 1; 2 is the "
                          "first exit-spawned one) first polls the pad (repeatable), "
@@ -806,6 +825,12 @@ def main(argv=None):
     except ValueError as e:
         ap.error(str(e))
     env = press_env(presses) if presses else None
+    try:
+        osk = osk_env(args.osk_text)
+    except ValueError as e:
+        ap.error(str(e))
+    if osk:
+        env = dict(env or {}, **osk)
     tree = Path(args.tree).expanduser()
     gt6 = Path(args.gt6) if args.gt6 else tree / GT6_REL
     rep = boot(gt6, tree, args.seconds, args.idle, headless=not args.window, until=args.until,
@@ -821,6 +846,12 @@ def main(argv=None):
                     + ", ".join(f"image {i} {t:g} s {b}"
                                 for t, b, i in sorted(presses, key=lambda p: (p[2], p[0])))
                     + "\n")
+    if args.osk_text:
+        rep["osk_text"] = list(args.osk_text)
+        (run / "report.json").write_text(json.dumps(rep, indent=2) + "\n")
+        with open(run / "summary.md", "a") as f:
+            f.write("- On-screen keyboard answers, in order: "
+                    + ", ".join(f'"{t}"' for t in args.osk_text) + "\n")
     if args.png:
         rep["frames_png"] = to_png(run)
         (run / "report.json").write_text(json.dumps(rep, indent=2) + "\n")

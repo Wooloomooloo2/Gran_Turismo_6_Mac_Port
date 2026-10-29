@@ -1,0 +1,1026 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] cellOskDialog: the on-screen keyboard's events, result and text
+
+Upstream: not yet submitted; written to be upstreamed (generic)
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0048)
+
+What: the module was a stub that needed a cellOskDialogInit no SDK has, so
+LoadAsync answered NOT_INITIALIZED, posted no event, and four of GT6's
+imports (DisableDimmer, SetKeyLayoutOption, ExtSetInitialScale,
+ExtRegisterForceFinishCallback) were unresolved: its player-name page never
+got a keyboard. Now LoadAsync checks its arguments (PARAM for a missing
+param, message or initial text, or a limit over 512; BUSY while open) and
+posts CELL_SYSUTIL_OSKDIALOG_LOADED to every registered sysutil callback.
+The host answers on a later cellSysutilCheckCallback (PS3_OSK_DELAY_MS,
+default 1000 ms): it confirms with the next entry of PS3_OSK_TEXT
+(comma-separated, one per dialog) or else the initial text, or cancels with
+PS3_OSK_CANCEL=1, and posts FINISHED. UnloadAsync returns the result and
+the text NUL-terminated within numCharsResultString and posts UNLOADED;
+GetInputText reports NO_INPUT_TEXT until then; Abort gives ABORT and posts
+FINISHED. GetSize writes u16s and takes the dialog type. The SDK's error
+codes (0x8002B501-4) replace invented ones.
+Reference: the SDK's cellOskDialog documentation, with RPCS3's
+cellOskDialog.cpp as the behaviour reference only; no emulator code.
+cellSysutilCheckCallback calls cellOskDialog_tick (the host's answer), so
+the sysutil test fixtures that stub cellMsgDialog_tick stub it too.
+Tests: libs/misc/tests/test_osk_dialog.c (tools/test_osk_dialog.py), which
+also checks the four names hash to GT6's imported NIDs.
+diff --git a/libs/misc/cellOskDialog.c b/libs/misc/cellOskDialog.c
+index 17e7c674..ac4d731f 100644
+--- a/libs/misc/cellOskDialog.c
++++ b/libs/misc/cellOskDialog.c
+@@ -1,277 +1,355 @@
+ /*
+  * ps3recomp - cellOskDialog HLE implementation
+  *
+- * Provides an on-screen keyboard stub.  When a game requests text input,
+- * the prompt is logged and an empty string (or configurable default) is
+- * returned immediately.  In a full implementation this would show an
+- * actual input dialog.
++ * The system's on-screen keyboard, as the title sees it. LoadAsync opens the
++ * dialog and the system posts CELL_SYSUTIL_OSKDIALOG_LOADED to every
++ * registered sysutil callback; when the user confirms (or cancels) it posts
++ * FINISHED; the title then calls UnloadAsync, which hands back the result and
++ * the text and posts UNLOADED. GetInputText reads the text while it is open.
++ * Abort closes it with the ABORT result and posts FINISHED.
++ *
++ * There is no keyboard on screen here. The "user" is the host: the dialog is
++ * confirmed a short time after it opens (PS3_OSK_DELAY_MS, default 1000, so
++ * the title sees LOADED and FINISHED on different polls, as it would with a
++ * person typing) with the next entry of PS3_OSK_TEXT (comma-separated ASCII,
++ * one entry per dialog, for scripted runs), or, past the list or without it,
++ * the dialog's initial text unchanged -- what pressing Start on the PS3's
++ * keyboard does. PS3_OSK_CANCEL=1 cancels instead. A Mac text field is the
++ * player's version of this (BACKLOG, Mac GUI).
++ *
++ * Errors and argument checks follow the SDK's documented codes, with RPCS3's
++ * cellOskDialog.cpp as the behaviour reference (no code taken from it).
++ * Guest structs (all pointers are 4-byte guest addresses, big-endian):
++ *   CellOskDialogInputFieldInfo      { u16* message; u16* init_text; u32 limit_length; }
++ *   CellOskDialogCallbackReturnParam { s32 result; s32 numCharsResultString; u16* pResultString; }
++ *   CellOskDialogParam               { u32 allowOskPanelFlg; u32 firstViewPanel;
++ *                                      f32 controlPoint.x, .y; s32 prohibitFlgs; }
+  */
+ 
+ #include "cellOskDialog.h"
++#include "../system/cellSysutil.h"   /* cellSysutilQueueEvent, CELL_SYSUTIL_MAX_CALLBACKS */
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+-#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
+-#include "../guest_struct.h"   /* GUEST_EA, vm_read/vm_write: guest EA -> host */
++#include "../../runtime/ppu/ppu_memory.h"   /* vm_read/vm_write: guest EA -> host, byte-swapped */
++#include "../../runtime/ppu/ppu_context.h"
++#include "../guest_struct.h"                /* GUEST_EA */
++#ifdef _WIN32
++#  include <windows.h>
++#else
++#  include <pthread.h>
++#  include <time.h>
++#endif
++
++#ifdef _WIN32
++static SRWLOCK s_lock = SRWLOCK_INIT;
++#  define OSK_LOCK()   AcquireSRWLockExclusive(&s_lock)
++#  define OSK_UNLOCK() ReleaseSRWLockExclusive(&s_lock)
++static unsigned long long osk_now_ms(void) { return GetTickCount64(); }
++#else
++static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
++#  define OSK_LOCK()   pthread_mutex_lock(&s_lock)
++#  define OSK_UNLOCK() pthread_mutex_unlock(&s_lock)
++static unsigned long long osk_now_ms(void)
++{
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (unsigned long long)ts.tv_sec * 1000ull + (unsigned long long)ts.tv_nsec / 1000000ull;
++}
++#endif
+ 
+-/* ---------------------------------------------------------------------------
+- * Internal state
+- * -----------------------------------------------------------------------*/
++extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
++
++enum { OSK_UNLOADED, OSK_OPEN, OSK_CLOSED };
+ 
+-static int  s_osk_initialized = 0;
+-static int  s_osk_loaded = 0;
+-static char s_default_response[CELL_OSK_MAX_TEXT_LENGTH + 1] = "";
++enum {
++    OSKIF_O_MESSAGE = 0, OSKIF_O_INIT_TEXT = 4, OSKIF_O_LIMIT_LENGTH = 8,
++    OSKRET_O_RESULT = 0, OSKRET_O_NUMCHARS = 4, OSKRET_O_PRESULTSTRING = 8
++};
+ 
+-/* Stored input result (UTF-16) */
+-static CellOskDialogChar s_result_text[CELL_OSK_MAX_TEXT_LENGTH + 1];
+-static u32               s_result_length = 0;
++static int  s_state = OSK_UNLOADED;
++static s32  s_result;                                   /* CELL_OSKDIALOG_INPUT_FIELD_RESULT_* */
++static u16  s_text[CELL_OSKDIALOG_STRING_SIZE];         /* the dialog's text, NUL-terminated */
++static u16  s_valid[CELL_OSKDIALOG_STRING_SIZE];        /* what GetInputText reports */
++static u32  s_limit;                                    /* characters the field takes */
++static unsigned long long s_confirm_at;                 /* osk_now_ms() of the host's answer, 0 = none */
++static unsigned s_dialogs;                              /* dialogs opened, for PS3_OSK_TEXT */
+ 
+-/* Convert narrow string to UTF-16LE (simple ASCII subset) */
+-static void osk_ascii_to_utf16(const char* src, CellOskDialogChar* dst,
+-                                u32 maxChars)
++/* Every registered sysutil callback gets the system's dialog events. */
++static void osk_broadcast(u32 status, u32 param)
+ {
+-    u32 i;
+-    for (i = 0; i < maxChars && src[i] != '\0'; i++)
+-        dst[i] = (CellOskDialogChar)src[i];
+-    dst[i] = 0;
++    for (int slot = 0; slot < CELL_SYSUTIL_MAX_CALLBACKS; ++slot)
++        cellSysutilQueueEvent(slot, status, param);
+ }
+ 
+-/* Convert UTF-16LE to narrow string for logging (ASCII subset) */
+-static void osk_utf16_to_ascii(const CellOskDialogChar* src, char* dst,
+-                                u32 maxChars)
++static void osk_ascii(const u16* src, char* dst, size_t max)
+ {
+-    u32 i;
+-    for (i = 0; i < maxChars && src[i] != 0; i++)
+-        dst[i] = (src[i] < 128) ? (char)src[i] : '?';
++    size_t i = 0;
++    for (; i + 1 < max && src[i]; i++) dst[i] = (src[i] < 0x80) ? (char)src[i] : '?';
+     dst[i] = '\0';
+ }
+ 
+-/* ---------------------------------------------------------------------------
+- * Configuration
+- * -----------------------------------------------------------------------*/
+-
+-/* ---------------------------------------------------------------------------
+- * Guest struct access
+- *
+- * CellOskDialogInputFieldInfo is { CellOskDialogChar* message;
+- * CellOskDialogChar* init_text; u32 limit_length; } and
+- * CellOskDialogCallbackReturnParam is { s32 result; u32 numCharsResultString;
+- * CellOskDialogChar* pResultString; }. Both lead with (or contain) pointers,
+- * which the guest stores in four bytes and we in eight, so a cast misplaces
+- * every field after the first. The strings are UTF-16 and big-endian, so the
+- * code units come across one at a time too.
+- * -----------------------------------------------------------------------*/
+-enum {
+-    OSKIF_O_MESSAGE = 0, OSKIF_O_INIT_TEXT = 4, OSKIF_O_LIMIT_LENGTH = 8,
+-    OSKRET_O_RESULT = 0, OSKRET_O_NUMCHARS = 4, OSKRET_O_PRESULTSTRING = 8
+-};
+-
+-/* Copy a NUL-terminated big-endian UTF-16 string out of guest memory. */
+-static u32 osk_guest_utf16(u32 ea, CellOskDialogChar* dst, u32 max)
++/* The n-th (0-based) comma-separated entry of PS3_OSK_TEXT into s_text, at
++ * most s_limit characters; 0 when there is none (the initial text stays). */
++static int osk_scripted_text(unsigned n)
+ {
+-    u32 n = 0;
+-    if (!ea)
+-        return 0;
+-    while (n < max) {
+-        u16 c = vm_read16(ea + n * 2);
+-        if (!c)
+-            break;
+-        dst[n++] = c;
++    const char* list = getenv("PS3_OSK_TEXT");
++    if (!list || !*list) return 0;
++    const char* p = list;
++    for (unsigned i = 0; i < n; i++) {
++        p = strchr(p, ',');
++        if (!p) return 0;
++        p++;
+     }
+-    dst[n] = 0;
+-    return n;
++    u32 k = 0;
++    for (; p[k] && p[k] != ',' && k < s_limit && k < CELL_OSKDIALOG_STRING_SIZE - 1; k++)
++        s_text[k] = (u16)(unsigned char)p[k];
++    s_text[k] = 0;
++    return 1;
++}
++
++static unsigned osk_delay_ms(void)
++{
++    const char* e = getenv("PS3_OSK_DELAY_MS");
++    return (e && *e) ? (unsigned)strtoul(e, NULL, 10) : 1000u;
+ }
+ 
+-void cellOskDialogSetDefaultResponse(const char* text)
++/* ---------------------------------------------------------------------------
++ * The host's answer, from cellSysutilCheckCallback.
++ * -----------------------------------------------------------------------*/
++void cellOskDialog_tick(void)
+ {
+-    if (text) {
+-        strncpy(s_default_response, GUEST_PTR(text, const char*),
+-                CELL_OSK_MAX_TEXT_LENGTH);
+-        s_default_response[CELL_OSK_MAX_TEXT_LENGTH] = '\0';
++    OSK_LOCK();
++    if (s_state != OSK_OPEN || !s_confirm_at || osk_now_ms() < s_confirm_at) {
++        OSK_UNLOCK();
++        return;
++    }
++    s_confirm_at = 0;
++    const char* cancel = getenv("PS3_OSK_CANCEL");
++    if (cancel && *cancel && *cancel != '0') {
++        s_result = CELL_OSKDIALOG_INPUT_FIELD_RESULT_CANCELED;
++    } else {
++        osk_scripted_text(s_dialogs - 1);
++        s_result = CELL_OSKDIALOG_INPUT_FIELD_RESULT_OK;
+     }
++    s_state = OSK_CLOSED;
++    char shown[128];
++    osk_ascii(s_text, shown, sizeof shown);
++    const s32 result = s_result;
++    OSK_UNLOCK();
++    printf("[cellOskDialog] the host %s the dialog with \"%s\"; FINISHED\n",
++           result == CELL_OSKDIALOG_INPUT_FIELD_RESULT_OK ? "confirmed" : "cancelled", shown);
++    osk_broadcast(CELL_SYSUTIL_OSKDIALOG_FINISHED, 0);
+ }
+ 
+ /* ---------------------------------------------------------------------------
+- * API implementations
++ * API
+  * -----------------------------------------------------------------------*/
+ 
+-s32 cellOskDialogInit(u32 container)
++s32 cellOskDialogLoadAsync(u32 container, const CellOskDialogParam* dialogParam,
++                           const CellOskDialogInputFieldInfo* inputFieldInfo)
+ {
+     (void)container;
+-    printf("[cellOskDialog] Init()\n");
+-
+-    if (s_osk_initialized)
+-        return CELL_OSK_ERROR_ALREADY_INITIALIZED;
+-
+-    s_osk_initialized = 1;
+-    s_osk_loaded = 0;
++    const u32 param_ea = GUEST_EA(dialogParam);
++    const u32 info_ea  = GUEST_EA(inputFieldInfo);
++    if (!param_ea || !info_ea) return (s32)CELL_OSKDIALOG_ERROR_PARAM;
++    const u32 message_ea = vm_read32(info_ea + OSKIF_O_MESSAGE);
++    const u32 init_ea    = vm_read32(info_ea + OSKIF_O_INIT_TEXT);
++    const u32 limit      = vm_read32(info_ea + OSKIF_O_LIMIT_LENGTH);
++    if (!message_ea || !init_ea || limit > CELL_OSKDIALOG_STRING_SIZE)
++        return (s32)CELL_OSKDIALOG_ERROR_PARAM;
++
++    OSK_LOCK();
++    if (s_state != OSK_UNLOADED) {
++        OSK_UNLOCK();
++        return (s32)CELL_SYSUTIL_ERROR_BUSY;
++    }
++    s_limit = (limit >= CELL_OSKDIALOG_STRING_SIZE) ? CELL_OSKDIALOG_STRING_SIZE - 1 : limit;
++    memset(s_text, 0, sizeof s_text);
++    memset(s_valid, 0, sizeof s_valid);
++    for (u32 i = 0; i < s_limit; i++) {
++        const u16 c = vm_read16(init_ea + i * 2u);
++        if (!c) break;
++        s_text[i] = c;
++    }
++    u16 msg[128] = {0};
++    for (u32 i = 0; i + 1 < 128; i++) {
++        const u16 c = vm_read16(message_ea + i * 2u);
++        if (!c) break;
++        msg[i] = c;
++    }
++    s_result = CELL_OSKDIALOG_INPUT_FIELD_RESULT_OK;
++    s_state = OSK_OPEN;
++    s_dialogs++;
++    s_confirm_at = osk_now_ms() + osk_delay_ms();
++    if (!s_confirm_at) s_confirm_at = 1;
++    char m[128], t[128];
++    osk_ascii(msg, m, sizeof m);
++    osk_ascii(s_text, t, sizeof t);
++    OSK_UNLOCK();
++
++    printf("[cellOskDialog] LoadAsync: \"%s\", initial text \"%s\", limit %u, panels 0x%X; LOADED\n",
++           m, t, limit, vm_read32(param_ea));
++    osk_broadcast(CELL_SYSUTIL_OSKDIALOG_LOADED, 0);
+     return CELL_OK;
+ }
+ 
+-s32 cellOskDialogEnd(void)
++s32 cellOskDialogLoadAsyncExt(void)
+ {
+-    printf("[cellOskDialog] End()\n");
+-
+-    if (!s_osk_initialized)
+-        return CELL_OSK_ERROR_NOT_INITIALIZED;
+-
+-    s_osk_initialized = 0;
+-    s_osk_loaded = 0;
+-    return CELL_OK;
++    return CELL_OK;   /* undocumented; RPCS3 has it as a no-op and GT6 does not call it */
+ }
+ 
+-s32 cellOskDialogLoadAsync(u32 container,
+-                           const CellOskDialogParam* dialogParam,
+-                           const CellOskDialogInputFieldInfo* inputFieldInfo)
++/* GetInputText (is_unload 0) and UnloadAsync (1). */
++static s32 osk_get_text(u32 out_ea, int is_unload)
+ {
+-    (void)container; (void)dialogParam;
+-
+-    if (!s_osk_initialized)
+-        return CELL_OSK_ERROR_NOT_INITIALIZED;
+-
+-    if (s_osk_loaded)
+-        return CELL_OSK_ERROR_DIALOG_ALREADY_LOADED;
+-
+-    s_osk_loaded = 1;
+-
+-    u32 info_ea    = GUEST_EA(inputFieldInfo);
+-    u32 message_ea = info_ea ? vm_read32(info_ea + OSKIF_O_MESSAGE)   : 0;
+-    u32 init_ea    = info_ea ? vm_read32(info_ea + OSKIF_O_INIT_TEXT) : 0;
+-
+-    static CellOskDialogChar host_init[CELL_OSK_MAX_TEXT_LENGTH + 1];
+-    u32 init_len = osk_guest_utf16(init_ea, host_init, CELL_OSK_MAX_TEXT_LENGTH);
+-
+-    /* Log the prompt if available */
+-    if (message_ea) {
+-        static CellOskDialogChar host_msg[CELL_OSK_MAX_TEXT_LENGTH + 1];
+-        osk_guest_utf16(message_ea, host_msg, CELL_OSK_MAX_TEXT_LENGTH);
+-        char prompt[256];
+-        osk_utf16_to_ascii(host_msg, prompt, sizeof(prompt) - 1);
+-        printf("[cellOskDialog] LoadAsync - Prompt: \"%s\"\n", prompt);
+-    } else {
+-        printf("[cellOskDialog] LoadAsync - (no prompt)\n");
++    if (!out_ea) return (s32)CELL_OSKDIALOG_ERROR_PARAM;
++    const s32 max_chars = (s32)vm_read32(out_ea + OSKRET_O_NUMCHARS);
++    if (max_chars < 0) return (s32)CELL_OSKDIALOG_ERROR_PARAM;
++
++    OSK_LOCK();
++    if (s_state == OSK_UNLOADED) {
++        OSK_UNLOCK();
++        return (s32)CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED;
+     }
+-
+-    if (init_ea) {
+-        char init[256];
+-        osk_utf16_to_ascii(host_init, init, sizeof(init) - 1);
+-        printf("[cellOskDialog] Initial text: \"%s\"\n", init);
++    if (is_unload) memcpy(s_valid, s_text, sizeof s_valid);
++    s32 result;
++    if (is_unload) result = s_result;
++    else result = s_valid[0] ? CELL_OSKDIALOG_INPUT_FIELD_RESULT_OK
++                             : CELL_OSKDIALOG_INPUT_FIELD_RESULT_NO_INPUT_TEXT;
++    vm_write32(out_ea + OSKRET_O_RESULT, (u32)result);
++    const u32 str_ea = vm_read32(out_ea + OSKRET_O_PRESULTSTRING);
++    const int copy = str_ea && (result == CELL_OSKDIALOG_INPUT_FIELD_RESULT_OK ||
++                                (is_unload && result == CELL_OSKDIALOG_INPUT_FIELD_RESULT_NO_INPUT_TEXT));
++    /* numCharsResultString is the buffer's size in characters on the way in;
++     * the string is NUL-terminated within it. */
++    for (s32 i = 0; copy && i < CELL_OSKDIALOG_STRING_SIZE - 1; i++) {
++        if (i < max_chars) {
++            vm_write16(str_ea + (u32)i * 2u, s_valid[i]);
++            if (!s_valid[i]) break;
++        } else {
++            vm_write16(str_ea + (u32)i * 2u, 0);
++            break;
++        }
+     }
+-
+-    /* Prepare the result: use default response or empty string */
+-    memset(s_result_text, 0, sizeof(s_result_text));
+-    if (s_default_response[0] != '\0') {
+-        osk_ascii_to_utf16(s_default_response, s_result_text,
+-                           CELL_OSK_MAX_TEXT_LENGTH);
+-        s_result_length = (u32)strlen(s_default_response);
+-        printf("[cellOskDialog] Returning default response: \"%s\"\n",
+-               s_default_response);
+-    } else if (init_ea) {
+-        /* Copy initial text as the response */
+-        memcpy(s_result_text, host_init,
+-               (init_len + 1) * sizeof(CellOskDialogChar));
+-        s_result_length = init_len;
+-    } else {
+-        s_result_length = 0;
++    if (is_unload) {
++        s_state = OSK_UNLOADED;
++        s_confirm_at = 0;
++    }
++    OSK_UNLOCK();
++    if (is_unload) {
++        printf("[cellOskDialog] UnloadAsync: result %d; UNLOADED\n", (int)result);
++        osk_broadcast(CELL_SYSUTIL_OSKDIALOG_UNLOADED, 0);
+     }
+-
+     return CELL_OK;
+ }
+ 
+-s32 cellOskDialogUnloadAsync(CellOskDialogCallbackReturnParam* result)
++s32 cellOskDialogUnloadAsync(CellOskDialogCallbackReturnParam* OutputInfo)
+ {
+-    if (!s_osk_initialized)
+-        return CELL_OSK_ERROR_NOT_INITIALIZED;
+-
+-    if (!s_osk_loaded)
+-        return CELL_OSK_ERROR_DIALOG_NOT_LOADED;
+-
+-    printf("[cellOskDialog] UnloadAsync()\n");
+-
+-    if (result) {
+-        u32 res_ea = GUEST_EA(result);
+-        vm_write32(res_ea + OSKRET_O_RESULT,
+-                   CELL_OSK_DIALOG_INPUT_FIELD_RESULT_OK);
+-        vm_write32(res_ea + OSKRET_O_NUMCHARS, s_result_length);
+-        u32 str_ea = vm_read32(res_ea + OSKRET_O_PRESULTSTRING);
+-        if (str_ea && s_result_length > 0) {
+-            /* UTF-16, big-endian in guest memory: one unit at a time. */
+-            for (u32 i = 0; i <= s_result_length; i++)
+-                vm_write16(str_ea + i * 2, s_result_text[i]);
+-        }
+-    }
++    return osk_get_text(GUEST_EA(OutputInfo), 1);
++}
++
++s32 cellOskDialogGetInputText(CellOskDialogCallbackReturnParam* OutputInfo)
++{
++    return osk_get_text(GUEST_EA(OutputInfo), 0);
++}
+ 
+-    s_osk_loaded = 0;
++s32 cellOskDialogGetSize(u16* width, u16* height, u32 dialogType)
++{
++    const u32 w = GUEST_EA(width), h = GUEST_EA(height);
++    if (!w || !h) return (s32)CELL_OSKDIALOG_ERROR_PARAM;
++    vm_write16(w, dialogType >= CELL_OSKDIALOG_TYPE_SEPARATE_SINGLELINE_TEXT_WINDOW ? 0 : 1);
++    vm_write16(h, 1);
+     return CELL_OK;
+ }
+ 
+-s32 cellOskDialogGetSize(u32* width, u32* height)
++s32 cellOskDialogAbort(void)
+ {
+-    if (!width || !height)
+-        return CELL_OSK_ERROR_INVALID_PARAMETER;
++    OSK_LOCK();
++    if (s_state == OSK_UNLOADED) {
++        OSK_UNLOCK();
++        return (s32)CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED;
++    }
++    s_result = CELL_OSKDIALOG_INPUT_FIELD_RESULT_ABORT;
++    s_state = OSK_CLOSED;
++    s_confirm_at = 0;
++    OSK_UNLOCK();
++    printf("[cellOskDialog] Abort; FINISHED\n");
++    osk_broadcast(CELL_SYSUTIL_OSKDIALOG_FINISHED, 0);
++    return CELL_OK;
++}
+ 
+-    /* Standard PS3 OSK dimensions */
+-    vm_write32((u32)(uintptr_t)width, (u32)640);
+-    vm_write32((u32)(uintptr_t)height, (u32)240);
++s32 cellOskDialogSetDeviceMask(u32 deviceMask)
++{
++    (void)deviceMask;
+     return CELL_OK;
+ }
+ 
+-s32 cellOskDialogAbort(void)
++s32 cellOskDialogSetSeparateWindowOption(void* windowOption)
+ {
+-    printf("[cellOskDialog] Abort()\n");
++    if (!GUEST_EA(windowOption)) return (s32)CELL_OSKDIALOG_ERROR_PARAM;
++    return CELL_OK;
++}
+ 
+-    if (!s_osk_loaded)
+-        return CELL_OSK_ERROR_DIALOG_NOT_LOADED;
++s32 cellOskDialogSetInitialInputDevice(u32 inputDevice)
++{
++    if (inputDevice > CELL_OSKDIALOG_INPUT_DEVICE_KEYBOARD) return (s32)CELL_OSKDIALOG_ERROR_PARAM;
++    return CELL_OK;
++}
+ 
+-    s_osk_loaded = 0;
++s32 cellOskDialogSetInitialKeyLayout(u32 initialKeyLayout)
++{
++    if (initialKeyLayout > CELL_OSKDIALOG_INITIAL_PANEL_LAYOUT_FULLKEY)
++        return (s32)CELL_OSKDIALOG_ERROR_PARAM;
+     return CELL_OK;
+ }
+ 
+-s32 cellOskDialogSetInitialInputDevice(u32 device)
++s32 cellOskDialogDisableDimmer(void)
+ {
+-    (void)device;
+     return CELL_OK;
+ }
+ 
+-s32 cellOskDialogSetInitialKeyLayout(u32 layout)
++s32 cellOskDialogSetKeyLayoutOption(u32 option)
+ {
+-    (void)layout;
+-    printf("[cellOskDialog] SetInitialKeyLayout(%u)\n", layout);
++    if (option == 0 || option > (CELL_OSKDIALOG_10KEY_PANEL | CELL_OSKDIALOG_FULLKEY_PANEL))
++        return (s32)CELL_OSKDIALOG_ERROR_PARAM;
+     return CELL_OK;
+ }
+ 
+-s32 cellOskDialogSetLayoutMode(u32 mode)
++s32 cellOskDialogAddSupportLanguage(u32 supportLanguage)
+ {
+-    (void)mode;
+-    printf("[cellOskDialog] SetLayoutMode(%u)\n", mode);
++    (void)supportLanguage;
+     return CELL_OK;
+ }
+ 
+-s32 cellOskDialogSetSeparateWindowOption(u32 option)
++s32 cellOskDialogSetLayoutMode(s32 layoutMode)
+ {
+-    (void)option;
++    (void)layoutMode;
+     return CELL_OK;
+ }
+ 
+-s32 cellOskDialogGetInputText(CellOskDialogCallbackReturnParam* result)
++/* f32 initialScale arrives in f1, which the generic HLE adapter does not pass. */
++s32 cellOskDialogExtSetInitialScale(void)
+ {
+-    if (!s_osk_initialized)
+-        return CELL_OSK_ERROR_NOT_INITIALIZED;
+-
+-    if (!result)
+-        return CELL_OSK_ERROR_INVALID_PARAMETER;
+-
+-    u32 res_ea = GUEST_EA(result);
+-    vm_write32(res_ea + OSKRET_O_RESULT, (s_result_length > 0)
+-               ? CELL_OSK_DIALOG_INPUT_FIELD_RESULT_OK
+-               : CELL_OSK_DIALOG_INPUT_FIELD_RESULT_NO_INPUT_TEXT);
+-    vm_write32(res_ea + OSKRET_O_NUMCHARS, s_result_length);
+-
+-    u32 str_ea = vm_read32(res_ea + OSKRET_O_PRESULTSTRING);
+-    if (str_ea && s_result_length > 0) {
+-        /* UTF-16, big-endian in guest memory: one unit at a time. */
+-        for (u32 i = 0; i <= s_result_length; i++)
+-            vm_write16(str_ea + i * 2, s_result_text[i]);
+-    }
++    const double scale = g_active_ctx ? g_active_ctx->fpr[1] : 1.0;
++    if (scale < (double)CELL_OSKDIALOG_SCALE_MIN || scale > (double)CELL_OSKDIALOG_SCALE_MAX)
++        return (s32)CELL_OSKDIALOG_ERROR_PARAM;
++    return CELL_OK;
++}
+ 
++/* Called by the system when it must close the dialog for a system dialog of
++ * its own (the PS button); there is none here, so it is only checked. */
++s32 cellOskDialogExtRegisterForceFinishCallback(u32 pCallback)
++{
++    if (!pCallback) return (s32)CELL_OSKDIALOG_ERROR_PARAM;
+     return CELL_OK;
+ }
++
++/* Tests only: the dialog back to its boot state. */
++void cellOskDialog_reset_for_test(void)
++{
++    OSK_LOCK();
++    s_state = OSK_UNLOADED;
++    s_confirm_at = 0;
++    s_dialogs = 0;
++    OSK_UNLOCK();
++}
+diff --git a/libs/misc/cellOskDialog.h b/libs/misc/cellOskDialog.h
+index 77e31bc1..e5ba07bb 100644
+--- a/libs/misc/cellOskDialog.h
++++ b/libs/misc/cellOskDialog.h
+@@ -15,30 +15,44 @@ extern "C" {
+ #endif
+ 
+ /* ---------------------------------------------------------------------------
+- * Error codes
++ * Error codes and system events (the SDK's values)
+  * -----------------------------------------------------------------------*/
+-#define CELL_OSK_ERROR_NOT_INITIALIZED          0x8002B301
+-#define CELL_OSK_ERROR_ALREADY_INITIALIZED      0x8002B302
+-#define CELL_OSK_ERROR_INVALID_PARAMETER        0x8002B303
+-#define CELL_OSK_ERROR_DIALOG_NOT_LOADED        0x8002B304
+-#define CELL_OSK_ERROR_DIALOG_ALREADY_LOADED    0x8002B305
+-#define CELL_OSK_ERROR_ABORT                    0x8002B306
+-#define CELL_OSK_ERROR_UNKNOWN                  0x8002B3FF
+ 
+-/* ---------------------------------------------------------------------------
+- * Dialog result codes
+- * -----------------------------------------------------------------------*/
+-#define CELL_OSK_DIALOG_RESULT_OK               0
+-#define CELL_OSK_DIALOG_RESULT_CANCELED         1
+-#define CELL_OSK_DIALOG_RESULT_ABORT            2
++#define CELL_OSKDIALOG_ERROR_IME_ALREADY_IN_USE 0x8002B501
++#define CELL_OSKDIALOG_ERROR_GET_SIZE_ERROR     0x8002B502
++#define CELL_OSKDIALOG_ERROR_UNKNOWN            0x8002B503
++#define CELL_OSKDIALOG_ERROR_PARAM              0x8002B504
++#ifndef CELL_SYSUTIL_ERROR_BUSY
++#define CELL_SYSUTIL_ERROR_BUSY                 0x8002B105
++#endif
++#ifndef CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED
++#define CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED  0x8002B302
++#endif
+ 
+-/* ---------------------------------------------------------------------------
+- * Input field types
+- * -----------------------------------------------------------------------*/
+-#define CELL_OSK_DIALOG_INPUT_FIELD_RESULT_OK           0
+-#define CELL_OSK_DIALOG_INPUT_FIELD_RESULT_CANCELED     1
+-#define CELL_OSK_DIALOG_INPUT_FIELD_RESULT_ABORT        2
+-#define CELL_OSK_DIALOG_INPUT_FIELD_RESULT_NO_INPUT_TEXT 3
++#define CELL_SYSUTIL_OSKDIALOG_LOADED               0x0502
++#define CELL_SYSUTIL_OSKDIALOG_FINISHED             0x0503
++#define CELL_SYSUTIL_OSKDIALOG_UNLOADED             0x0504
++#define CELL_SYSUTIL_OSKDIALOG_INPUT_ENTERED        0x0505
++#define CELL_SYSUTIL_OSKDIALOG_INPUT_CANCELED       0x0506
++#define CELL_SYSUTIL_OSKDIALOG_INPUT_DEVICE_CHANGED 0x0507
++#define CELL_SYSUTIL_OSKDIALOG_DISPLAY_CHANGED      0x0508
++
++#define CELL_OSKDIALOG_INPUT_FIELD_RESULT_OK            0
++#define CELL_OSKDIALOG_INPUT_FIELD_RESULT_CANCELED      1
++#define CELL_OSKDIALOG_INPUT_FIELD_RESULT_ABORT         2
++#define CELL_OSKDIALOG_INPUT_FIELD_RESULT_NO_INPUT_TEXT 3
++
++#define CELL_OSKDIALOG_INITIAL_PANEL_LAYOUT_SYSTEM  0
++#define CELL_OSKDIALOG_INITIAL_PANEL_LAYOUT_10KEY   1
++#define CELL_OSKDIALOG_INITIAL_PANEL_LAYOUT_FULLKEY 2
++#define CELL_OSKDIALOG_10KEY_PANEL                  0x00000001
++#define CELL_OSKDIALOG_FULLKEY_PANEL                0x00000002
++#define CELL_OSKDIALOG_INPUT_DEVICE_PAD             0
++#define CELL_OSKDIALOG_INPUT_DEVICE_KEYBOARD        1
++#define CELL_OSKDIALOG_TYPE_SEPARATE_SINGLELINE_TEXT_WINDOW 4
++#define CELL_OSKDIALOG_STRING_SIZE                  512
++#define CELL_OSKDIALOG_SCALE_MIN                    0.80f
++#define CELL_OSKDIALOG_SCALE_MAX                    1.05f
+ 
+ /* ---------------------------------------------------------------------------
+  * Layout modes
+@@ -100,26 +114,27 @@ typedef struct CellOskDialogParam {
+  * Functions
+  * -----------------------------------------------------------------------*/
+ 
+-s32 cellOskDialogInit(u32 container);
+-s32 cellOskDialogEnd(void);
+-
+-s32 cellOskDialogLoadAsync(u32 container,
+-                           const CellOskDialogParam* dialogParam,
++s32 cellOskDialogLoadAsync(u32 container, const CellOskDialogParam* dialogParam,
+                            const CellOskDialogInputFieldInfo* inputFieldInfo);
+-s32 cellOskDialogUnloadAsync(CellOskDialogCallbackReturnParam* result);
+-
+-s32 cellOskDialogGetSize(u32* width, u32* height);
++s32 cellOskDialogLoadAsyncExt(void);
++s32 cellOskDialogUnloadAsync(CellOskDialogCallbackReturnParam* OutputInfo);
++s32 cellOskDialogGetInputText(CellOskDialogCallbackReturnParam* OutputInfo);
++s32 cellOskDialogGetSize(u16* width, u16* height, u32 dialogType);
+ s32 cellOskDialogAbort(void);
+-
+-s32 cellOskDialogSetInitialInputDevice(u32 device);
+-s32 cellOskDialogSetInitialKeyLayout(u32 layout);
+-s32 cellOskDialogSetLayoutMode(u32 mode);
+-s32 cellOskDialogSetSeparateWindowOption(u32 option);
+-
+-s32 cellOskDialogGetInputText(CellOskDialogCallbackReturnParam* result);
+-
+-/* Set a default response string (call before LoadAsync if desired) */
+-void cellOskDialogSetDefaultResponse(const char* text);
++s32 cellOskDialogSetDeviceMask(u32 deviceMask);
++s32 cellOskDialogSetSeparateWindowOption(void* windowOption);
++s32 cellOskDialogSetInitialInputDevice(u32 inputDevice);
++s32 cellOskDialogSetInitialKeyLayout(u32 initialKeyLayout);
++s32 cellOskDialogDisableDimmer(void);
++s32 cellOskDialogSetKeyLayoutOption(u32 option);
++s32 cellOskDialogAddSupportLanguage(u32 supportLanguage);
++s32 cellOskDialogSetLayoutMode(s32 layoutMode);
++s32 cellOskDialogExtSetInitialScale(void);   /* f32 in f1, read from the guest context */
++s32 cellOskDialogExtRegisterForceFinishCallback(u32 pCallback);
++
++/* The host's answer to an open dialog; cellSysutilCheckCallback calls it. */
++void cellOskDialog_tick(void);
++void cellOskDialog_reset_for_test(void);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/libs/misc/tests/test_osk_dialog.c b/libs/misc/tests/test_osk_dialog.c
+new file mode 100644
+index 00000000..6aaee0a4
+--- /dev/null
++++ b/libs/misc/tests/test_osk_dialog.c
+@@ -0,0 +1,170 @@
++/*
++ * test_osk_dialog - the on-screen keyboard (libs/misc/cellOskDialog.c).
++ *
++ * LoadAsync posts LOADED to every sysutil slot; the host answers on a later
++ * poll (cellOskDialog_tick) with FINISHED; UnloadAsync returns the result and
++ * the text, NUL-terminated within numCharsResultString, and posts UNLOADED.
++ * PS3_OSK_TEXT supplies one text per dialog, in order; past it the initial
++ * text stands. Argument checks and codes as the SDK documents them (RPCS3 as
++ * the behaviour reference). Also checks the names hash to GT6's imported NIDs
++ * for the four that were unresolved. Run by tools/test_osk_dialog.py.
++ */
++#include "../cellOskDialog.c"
++#include <assert.h>
++
++uint8_t* vm_base;
++int g_resv_store_active = 0;
++uint32_t g_ww_lo = 0, g_ww_hi = 0;
++void ppu_resv_break_store(uint64_t ea) { (void)ea; }
++int  spu_coh_is_reserved(uint32_t addr) { (void)addr; return 0; }
++void spu_lockline_lock(void) {}
++void spu_lockline_unlock(void) {}
++void spu_coh_notify_write(uint32_t addr) { (void)addr; }
++void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width) { (void)addr; (void)val; (void)width; }
++PPU_THREAD_LOCAL ppu_context* g_active_ctx;
++
++static u32 ev[1024]; static int ev_slot[1024]; static int n_ev;
++void cellSysutilQueueEvent(int slot, u32 status, u32 param)
++{
++    (void)param;
++    if (n_ev < 1024) { ev_slot[n_ev] = slot; ev[n_ev] = status; }
++    n_ev++;
++}
++
++static int fails = 0;
++#define CHECK(c, ...) do { const int ok_ = (c); printf(ok_ ? "[PASS] " : "[FAIL] "); printf(__VA_ARGS__); \
++                           printf("\n"); if (!ok_) fails++; } while (0)
++
++#define PARAM 0x1000u
++#define INFO  0x1100u
++#define MSG   0x1200u
++#define INIT  0x1300u
++#define RET   0x1400u
++#define STR   0x1500u
++
++static void put_utf16(u32 ea, const char* s)
++{
++    for (; *s; s++, ea += 2) vm_write16(ea, (u16)*s);
++    vm_write16(ea, 0);
++}
++
++static int text_is(u32 ea, const char* s)
++{
++    for (; *s; s++, ea += 2) if (vm_read16(ea) != (u16)*s) return 0;
++    return vm_read16(ea) == 0;
++}
++
++/* Every slot got `status`, and only that, since n_ev was `from`. */
++static int broadcast(int from, u32 status)
++{
++    if (n_ev - from != CELL_SYSUTIL_MAX_CALLBACKS) return 0;
++    for (int i = from; i < n_ev; i++) if (ev[i] != status || ev_slot[i] != i - from) return 0;
++    return 1;
++}
++
++static s32 load(u32 limit)
++{
++    vm_write32(INFO + 0, MSG); vm_write32(INFO + 4, INIT); vm_write32(INFO + 8, limit);
++    return cellOskDialogLoadAsync(0, (void*)(uintptr_t)PARAM, (void*)(uintptr_t)INFO);
++}
++
++static s32 unload(s32 room)
++{
++    vm_write32(RET + 0, 0xDEADu); vm_write32(RET + 4, (u32)room); vm_write32(RET + 8, STR);
++    for (u32 i = 0; i < 32; i++) vm_write16(STR + i * 2, 0x7777);
++    return cellOskDialogUnloadAsync((void*)(uintptr_t)RET);
++}
++
++int main(void)
++{
++    vm_base = calloc(1, 0x10000);
++    put_utf16(MSG, "First Name");
++    put_utf16(INIT, "");
++    setenv("PS3_OSK_DELAY_MS", "0", 1);
++
++    /* Argument checks. */
++    CHECK((u32)cellOskDialogLoadAsync(0, NULL, (void*)(uintptr_t)INFO) == CELL_OSKDIALOG_ERROR_PARAM,
++          "LoadAsync with no dialog parameters is PARAM");
++    vm_write32(INFO + 0, 0); vm_write32(INFO + 4, INIT); vm_write32(INFO + 8, 12);
++    CHECK((u32)cellOskDialogLoadAsync(0, (void*)(uintptr_t)PARAM, (void*)(uintptr_t)INFO) ==
++          CELL_OSKDIALOG_ERROR_PARAM, "LoadAsync with no message is PARAM");
++    CHECK((u32)load(513) == CELL_OSKDIALOG_ERROR_PARAM, "a limit over 512 is PARAM");
++    CHECK((u32)unload(32) == CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED, "UnloadAsync with nothing open");
++    CHECK((u32)cellOskDialogAbort() == CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED, "Abort with nothing open");
++    CHECK((u32)cellOskDialogSetKeyLayoutOption(0) == CELL_OSKDIALOG_ERROR_PARAM &&
++          (u32)cellOskDialogSetKeyLayoutOption(4) == CELL_OSKDIALOG_ERROR_PARAM &&
++          cellOskDialogSetKeyLayoutOption(3) == CELL_OK, "SetKeyLayoutOption takes 1..3");
++    CHECK((u32)cellOskDialogSetInitialKeyLayout(3) == CELL_OSKDIALOG_ERROR_PARAM &&
++          cellOskDialogSetInitialKeyLayout(2) == CELL_OK, "SetInitialKeyLayout takes 0..2");
++    CHECK(cellOskDialogDisableDimmer() == CELL_OK, "DisableDimmer");
++    static ppu_context ctx;
++    g_active_ctx = &ctx;
++    ctx.fpr[1] = 1.0;
++    CHECK(cellOskDialogExtSetInitialScale() == CELL_OK, "ExtSetInitialScale(1.0)");
++    ctx.fpr[1] = 1.5;
++    CHECK((u32)cellOskDialogExtSetInitialScale() == CELL_OSKDIALOG_ERROR_PARAM, "ExtSetInitialScale(1.5) is PARAM");
++    CHECK((u32)cellOskDialogExtRegisterForceFinishCallback(0) == CELL_OSKDIALOG_ERROR_PARAM &&
++          cellOskDialogExtRegisterForceFinishCallback(0x5000) == CELL_OK, "ExtRegisterForceFinishCallback");
++    CHECK(n_ev == 0, "nothing posted so far (%d)", n_ev);
++
++    /* A dialog the host confirms with its initial text, no script. */
++    unsetenv("PS3_OSK_TEXT");
++    put_utf16(INIT, "John");
++    int from = n_ev;
++    CHECK(load(12) == CELL_OK && broadcast(from, CELL_SYSUTIL_OSKDIALOG_LOADED), "LoadAsync posts LOADED to every slot");
++    CHECK((u32)load(12) == CELL_SYSUTIL_ERROR_BUSY, "a second LoadAsync while open is BUSY");
++    vm_write32(RET + 4, 32); vm_write32(RET + 8, STR);
++    CHECK(cellOskDialogGetInputText((void*)(uintptr_t)RET) == CELL_OK &&
++          vm_read32(RET) == CELL_OSKDIALOG_INPUT_FIELD_RESULT_NO_INPUT_TEXT,
++          "GetInputText before anything is entered: NO_INPUT_TEXT");
++    from = n_ev;
++    cellOskDialog_tick();
++    CHECK(broadcast(from, CELL_SYSUTIL_OSKDIALOG_FINISHED), "the host's answer posts FINISHED");
++    from = n_ev;
++    cellOskDialog_tick();
++    CHECK(n_ev == from, "only once");
++    from = n_ev;
++    CHECK(unload(32) == CELL_OK && vm_read32(RET) == CELL_OSKDIALOG_INPUT_FIELD_RESULT_OK &&
++          text_is(STR, "John") && broadcast(from, CELL_SYSUTIL_OSKDIALOG_UNLOADED),
++          "UnloadAsync: OK, \"John\", UNLOADED");
++
++    /* Scripted texts, one per dialog; a short buffer truncates. */
++    setenv("PS3_OSK_TEXT", "Alpha,Bravo", 1);
++    cellOskDialog_reset_for_test();
++    put_utf16(INIT, "");
++    load(12); cellOskDialog_tick();
++    CHECK(unload(32) == CELL_OK && text_is(STR, "Alpha"), "the first dialog gets the first entry");
++    load(12); cellOskDialog_tick();
++    CHECK(unload(3) == CELL_OK && vm_read16(STR) == 'B' && vm_read16(STR + 2) == 'r' &&
++          vm_read16(STR + 4) == 'a' && vm_read16(STR + 6) == 0, "the second gets the second, cut to the room given");
++    put_utf16(INIT, "Smith");
++    load(12); cellOskDialog_tick();
++    CHECK(unload(32) == CELL_OK && text_is(STR, "Smith"), "past the list the initial text stands");
++    load(3); cellOskDialog_tick();
++    CHECK(unload(32) == CELL_OK && text_is(STR, "Smi"), "the initial text is cut to the field's limit");
++
++    /* Cancel and Abort. */
++    setenv("PS3_OSK_CANCEL", "1", 1);
++    load(12); cellOskDialog_tick();
++    CHECK(unload(32) == CELL_OK && vm_read32(RET) == CELL_OSKDIALOG_INPUT_FIELD_RESULT_CANCELED &&
++          vm_read16(STR) == 0x7777, "PS3_OSK_CANCEL: CANCELED, no text written");
++    unsetenv("PS3_OSK_CANCEL");
++    load(12);
++    from = n_ev;
++    CHECK(cellOskDialogAbort() == CELL_OK && broadcast(from, CELL_SYSUTIL_OSKDIALOG_FINISHED), "Abort posts FINISHED");
++    from = n_ev;
++    cellOskDialog_tick();
++    CHECK(n_ev == from, "an aborted dialog gets no host answer");
++    CHECK(unload(32) == CELL_OK && vm_read32(RET) == CELL_OSKDIALOG_INPUT_FIELD_RESULT_ABORT, "UnloadAsync after Abort: ABORT");
++
++    /* A delay keeps FINISHED off the poll that delivers LOADED. */
++    setenv("PS3_OSK_DELAY_MS", "100000", 1);
++    load(12);
++    from = n_ev;
++    cellOskDialog_tick();
++    CHECK(n_ev == from, "before the delay the dialog stays open");
++    cellOskDialogAbort(); unload(32);
++
++    printf(fails ? "%d check(s) FAILED\n" : "all checks passed\n", fails);
++    return fails ? 1 : 0;
++}
+diff --git a/libs/system/cellSysutil.c b/libs/system/cellSysutil.c
+index c4eb87db..c88d8a35 100644
+--- a/libs/system/cellSysutil.c
++++ b/libs/system/cellSysutil.c
+@@ -219,6 +219,9 @@ s32 cellSysutilCheckCallback(void)
+      * its dismissal. Done before the drain so the callback it queues is
+      * delivered on this same poll. */
+     { extern void cellMsgDialog_tick(void); cellMsgDialog_tick(); }
++    /* An open on-screen keyboard the host has answered posts FINISHED, which
++     * this same poll then delivers (cellOskDialog.c). */
++    { extern void cellOskDialog_tick(void); cellOskDialog_tick(); }
+     /* Turn psnr replies and pushes into queued NP callbacks first, so this
+      * same poll delivers them. A no-op when no psnr server is configured. */
+     { extern void np_psnr_pump(void); np_psnr_pump(); }
+diff --git a/libs/system/tests/test_dialog_abort.c b/libs/system/tests/test_dialog_abort.c
+index 75d488e4..074585ad 100644
+--- a/libs/system/tests/test_dialog_abort.c
++++ b/libs/system/tests/test_dialog_abort.c
+@@ -15,6 +15,7 @@ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ void np_psnr_pump(void) {}
+ void ps3_np_eula_tick(void) {}
++void cellOskDialog_tick(void) {}
+ 
+ static unsigned failures, calls;
+ static u32 last_opd;
+diff --git a/libs/system/tests/test_dialog_callbacks.c b/libs/system/tests/test_dialog_callbacks.c
+index 51547699..f17f4bcb 100644
+--- a/libs/system/tests/test_dialog_callbacks.c
++++ b/libs/system/tests/test_dialog_callbacks.c
+@@ -15,6 +15,7 @@ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ void np_psnr_pump(void) {}
+ void ps3_np_eula_tick(void) {}
++void cellOskDialog_tick(void) {}
+ 
+ static unsigned calls;
+ static int waiting;
+diff --git a/libs/system/tests/test_host_quit.c b/libs/system/tests/test_host_quit.c
+index 5ebaad9f..2482c7a3 100644
+--- a/libs/system/tests/test_host_quit.c
++++ b/libs/system/tests/test_host_quit.c
+@@ -18,6 +18,7 @@ uint8_t* vm_base;
+ uint32_t ppu_vm_size;
+ void np_psnr_pump(void) {}
+ void cellMsgDialog_tick(void) {}
++void cellOskDialog_tick(void) {}
+ void ps3_np_eula_tick(void) {}
+ 
+ static volatile int s_busy = 1;       /* a save is being written */
+diff --git a/libs/system/tests/test_license_area.c b/libs/system/tests/test_license_area.c
+index 84ab8c3e..80577908 100644
+--- a/libs/system/tests/test_license_area.c
++++ b/libs/system/tests/test_license_area.c
+@@ -18,6 +18,7 @@ void spu_lockline_unlock(void) {}
+ void np_psnr_pump(void) {}
+ void ps3_np_eula_tick(void) {}
+ void cellMsgDialog_tick(void) {}
++void cellOskDialog_tick(void) {}
+ /* cellSysutil.c declares vm_write32 extern (the runtime defines it); the test stores the word big-endian like the runtime. */
+ void vm_write32(uint64_t a, uint32_t v) { for (int i = 0; i < 4; i++) vm_base[a + i] = (uint8_t)(v >> (24 - 8 * i)); }
+ void vm_write8(uint64_t a, uint8_t v) { vm_base[a] = v; }
+diff --git a/libs/system/tests/test_np_eula.c b/libs/system/tests/test_np_eula.c
+index c6e7d3c5..a2e9b30f 100644
+--- a/libs/system/tests/test_np_eula.c
++++ b/libs/system/tests/test_np_eula.c
+@@ -14,6 +14,7 @@ uint8_t* vm_base;
+ uint32_t ppu_vm_size;
+ void np_psnr_pump(void) {}
+ void cellMsgDialog_tick(void) {}
++void cellOskDialog_tick(void) {}
+ static int s_online;
+ int ps3_netctl_online(void) { return s_online; }
+ int np_psnr_enabled(void) { return 0; }
+diff --git a/libs/system/tests/test_sysconf.c b/libs/system/tests/test_sysconf.c
+index 500a1355..8a817573 100644
+--- a/libs/system/tests/test_sysconf.c
++++ b/libs/system/tests/test_sysconf.c
+@@ -19,6 +19,7 @@ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ void np_psnr_pump(void) {}
+ void ps3_np_eula_tick(void) {}
++void cellOskDialog_tick(void) {}
+ 
+ static unsigned calls;
+ static u64 last_result, last_user;
+diff --git a/tools/test_osk_dialog.py b/tools/test_osk_dialog.py
+new file mode 100644
+index 00000000..c9f4dd19
+--- /dev/null
++++ b/tools/test_osk_dialog.py
+@@ -0,0 +1,58 @@
++#!/usr/bin/env python3
++"""The on-screen keyboard (libs/misc/cellOskDialog.c): the sysutil events, the
++host's answer, the text handed back and the argument checks.
++
++GT6 imports cellOskDialogDisableDimmer 0x41F20828, cellOskDialogSetKeyLayoutOption
++0xB53C54FA, cellOskDialogExtSetInitialScale 0x75370397 and
++cellOskDialogExtRegisterForceFinishCallback 0xE800F586, which had no handler, and
++LoadAsync answered NOT_INITIALIZED (a call no SDK has), so its player-name page
++never got a keyboard. Checks the names hash to those NIDs, then builds
++libs/misc/tests/test_osk_dialog.c, which includes cellOskDialog.c, and runs it.
++"""
++import hashlib
++import os
++import shutil
++import struct
++import subprocess
++import sys
++import tempfile
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++SUFFIX = b"\x67\x59\x65\x99\x04\x25\x04\x90\x56\x64\x27\x49\x94\x89\x74\x1A"
++NIDS = (('cellOskDialogDisableDimmer', 0x41F20828), ('cellOskDialogSetKeyLayoutOption', 0xB53C54FA),
++        ('cellOskDialogExtSetInitialScale', 0x75370397),
++        ('cellOskDialogExtRegisterForceFinishCallback', 0xE800F586),
++        ('cellOskDialogLoadAsync', 0x7FCFC915))
++
++
++def nid(name):
++    return struct.unpack('<I', hashlib.sha1(name.encode() + SUFFIX).digest()[:4])[0]
++
++
++def main():
++    fails = 0
++    for name, want in NIDS:
++        got = nid(name)
++        fails += got != want
++        print(f"[{'PASS' if got == want else 'FAIL'}] {name} hashes to 0x{got:08X} (imported as 0x{want:08X})")
++    cc = os.environ.get('CC') or shutil.which('cc') or shutil.which('gcc') or shutil.which('clang')
++    if not cc:
++        print('SKIP: no C compiler')
++        return 1 if fails else 0
++    with tempfile.TemporaryDirectory() as tmp:
++        exe = Path(tmp) / 'test_osk_dialog'
++        r = subprocess.run([cc, '-std=gnu17', '-O1', '-w', '-I' + str(ROOT / 'include'),
++                            str(ROOT / 'libs/misc/tests/test_osk_dialog.c'), '-o', str(exe)],
++                           capture_output=True, text=True)
++        if r.returncode:
++            print(r.stdout + r.stderr)
++            print('FAIL: fixture did not build')
++            return 1
++        r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=30)
++        sys.stdout.write(r.stdout + r.stderr)
++        return 1 if (fails or r.returncode) else 0
++
++
++if __name__ == '__main__':
++    sys.exit(main())
