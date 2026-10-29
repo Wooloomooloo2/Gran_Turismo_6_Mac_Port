@@ -2,6 +2,7 @@ From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Ma
 Subject: [PATCH] sysPrxForUser: sys_lwcond_wait blocks until signalled
 
 Upstream: not yet submitted
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
 Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0004)
 
 What: the context-style sys_lwcond in runtime/ppu/ppu_sysprx.cpp gets a real

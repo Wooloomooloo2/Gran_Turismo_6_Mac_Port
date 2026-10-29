@@ -1,6 +1,6 @@
 From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
 Subject: [PATCH] GCM: prepare-flip command in the title's context, present at
- the immediate flip; park holes wait; OSK result copy; present-rect pitch
+ the immediate flip; park holes wait; present-rect pitch
 
 Upstream: not yet submitted; written to be upstreamed (generic)
 Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
@@ -36,87 +36,23 @@ Holes get GCM_PARK_HOLE_GRACE_MS (default 5000; 0 waits for ever, with a
 line every 5 s); and a jump-park resync now sweeps the abandoned block's
 remainder when it lies past put, outside the ring range the resync
 sweeps (fences, semaphore and back-end releases, prepare commands).
-(3) cellOskDialog's result string, rewritten from the SDK contract:
-numCharsResultString counts characters without the terminator, so the text
-is cut to that many characters and one NUL follows (at index
-numCharsResultString for a text that long). 0049's text said "within".
-(4) Present: a surface of another pitch than the display buffer's is not
+(3) Present: a surface of another pitch than the display buffer's is not
 cropped (the video out would scan that memory at the buffer's pitch); the
 last presented rectangle is shown again (present_rect with surface 0). A
 target bound with pitch 0 is logged (4 times), and one of exactly the
 buffer's size is taken as laid out like it.
-(5) 0050's trace comment says 4000, as its cap is.
+(4) 0050's trace comment says 4000, as its cap is.
 Why: GT6 (BCES01977): flips presented about 1.9 times per prepare, the 26
 black dumps of the verdict run were the mid-frame presents; a long run under
 load stopped after two jump-park resyncs (20261029-034740).
 Behaviour reference: RPCS3's cellGcmSetPrepareFlip and its GCM_FLIP_COMMAND
-(0xFEAC) handling, read as a reference only, no code copied. The OSK copy was
-written from the SDK's documented contract without RPCS3's source open.
+(0xFEAC) handling, read as a reference only, no code copied.
 Tests: libs/video/tests/test_gcm_prepare_flip.c (a title-owned context with
 under 4 KB of headroom takes the stream; the callback makes room; one present
 per pair in either order), test_rsx_draw_engine.c (pitch mismatch keeps the
-last image), libs/misc/tests/test_osk_dialog.c (a text exactly the room's
-length, with a canary after the NUL), test_gcm_resync_labels.c (a hole
-outlasts the segment-end grace, and its block's tail release still lands).
+last image), test_gcm_resync_labels.c (a hole outlasts the segment-end grace,
+and its block's tail release still lands).
 
---- a/libs/misc/cellOskDialog.c
-+++ b/libs/misc/cellOskDialog.c
-@@ -220,16 +220,17 @@
-     const u32 str_ea = vm_read32(out_ea + OSKRET_O_PRESULTSTRING);
-     const int copy = str_ea && (result == CELL_OSKDIALOG_INPUT_FIELD_RESULT_OK ||
-                                 (is_unload && result == CELL_OSKDIALOG_INPUT_FIELD_RESULT_NO_INPUT_TEXT));
--    /* numCharsResultString is the buffer's size in characters on the way in;
--     * the string is NUL-terminated within it. */
--    for (s32 i = 0; copy && i < CELL_OSKDIALOG_STRING_SIZE - 1; i++) {
--        if (i < max_chars) {
--            vm_write16(str_ea + (u32)i * 2u, s_valid[i]);
--            if (!s_valid[i]) break;
--        } else {
--            vm_write16(str_ea + (u32)i * 2u, 0);
--            break;
--        }
-+    /* numCharsResultString is, on the way in, how many characters
-+     * pResultString holds, the terminator not counted (the SDK samples give
-+     * a buffer one character longer than the number they pass). The text is
-+     * cut to that many characters and one NUL follows it, so with a text that
-+     * long the NUL is at index numCharsResultString. */
-+    if (copy) {
-+        u32 len = 0;
-+        while (len + 1 < CELL_OSKDIALOG_STRING_SIZE && s_valid[len]) len++;
-+        const u32 n = len < (u32)max_chars ? len : (u32)max_chars;
-+        for (u32 k = 0; k < n; k++) vm_write16(str_ea + k * 2u, s_valid[k]);
-+        vm_write16(str_ea + n * 2u, 0);
-     }
-     if (is_unload) {
-         s_state = OSK_UNLOADED;
---- a/libs/misc/tests/test_osk_dialog.c
-+++ b/libs/misc/tests/test_osk_dialog.c
-@@ -3,7 +3,8 @@
-  *
-  * LoadAsync posts LOADED to every sysutil slot; the host answers on a later
-  * poll (cellOskDialog_tick) with FINISHED; UnloadAsync returns the result and
-- * the text, NUL-terminated within numCharsResultString, and posts UNLOADED.
-+ * the text, cut to numCharsResultString characters (the terminator not
-+ * counted, as in the SDK samples) and followed by one NUL, and posts UNLOADED.
-  * PS3_OSK_TEXT supplies one text per dialog, in order; past it the initial
-  * text stands. Argument checks and codes as the SDK documents them (RPCS3 as
-  * the behaviour reference). Also checks the names hash to GT6's imported NIDs
-@@ -137,6 +138,15 @@
-     load(12); cellOskDialog_tick();
-     CHECK(unload(3) == CELL_OK && vm_read16(STR) == 'B' && vm_read16(STR + 2) == 'r' &&
-           vm_read16(STR + 4) == 'a' && vm_read16(STR + 6) == 0, "the second gets the second, cut to the room given");
-+    /* A text exactly as long as the room: the NUL goes at index room, and
-+     * nothing past it is touched. */
-+    setenv("PS3_OSK_TEXT", "Smithers", 1);
-+    cellOskDialog_reset_for_test();
-+    load(12); cellOskDialog_tick();
-+    CHECK(unload(8) == CELL_OK && text_is(STR, "Smithers") && vm_read16(STR + 18) == 0x7777,
-+          "an 8-character text in room 8: 8 characters, the NUL at index 8, the canary after it intact");
-+    unsetenv("PS3_OSK_TEXT");
-+    cellOskDialog_reset_for_test();
-     put_utf16(INIT, "Smith");
-     load(12); cellOskDialog_tick();
-     CHECK(unload(32) == CELL_OK && text_is(STR, "Smith"), "past the list the initial text stands");
 --- a/libs/spurs/cellFiber.c
 +++ b/libs/spurs/cellFiber.c
 @@ -776,7 +776,7 @@

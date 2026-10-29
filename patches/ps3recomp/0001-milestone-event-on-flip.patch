@@ -2,6 +2,7 @@ From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Ma
 Subject: [PATCH] cellGcmSys: record a gcm:flip milestone for each guest flip request
 
 Upstream: not yet submitted
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
 Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514
 
 Every guest flip request that the present loop shows (the three places that

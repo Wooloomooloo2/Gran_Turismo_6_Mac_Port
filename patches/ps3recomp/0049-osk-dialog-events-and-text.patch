@@ -16,21 +16,25 @@ The host answers on a later cellSysutilCheckCallback (PS3_OSK_DELAY_MS,
 default 1000 ms): it confirms with the next entry of PS3_OSK_TEXT
 (comma-separated, one per dialog) or else the initial text, or cancels with
 PS3_OSK_CANCEL=1, and posts FINISHED. UnloadAsync returns the result and
-the text NUL-terminated (corrected by 0051: cut to numCharsResultString characters, the NUL after them) and posts UNLOADED;
+the text, cut to numCharsResultString characters (the terminator not
+counted) with one NUL after them, and posts UNLOADED;
 GetInputText reports NO_INPUT_TEXT until then; Abort gives ABORT and posts
 FINISHED. GetSize writes u16s and takes the dialog type. The SDK's error
 codes (0x8002B501-4) replace invented ones.
 Reference: the SDK's cellOskDialog documentation, with RPCS3's
-cellOskDialog.cpp as the behaviour reference only; no emulator code.
+cellOskDialog.cpp as the behaviour reference only; no emulator code. The
+result-string copy was written from the SDK's documented contract without
+RPCS3's source open.
 cellSysutilCheckCallback calls cellOskDialog_tick (the host's answer), so
 the sysutil test fixtures that stub cellMsgDialog_tick stub it too.
 Tests: libs/misc/tests/test_osk_dialog.c (tools/test_osk_dialog.py), which
-also checks the four names hash to GT6's imported NIDs.
+also checks the four names hash to GT6's imported NIDs and that a text
+exactly the room's length gets its NUL at index room, a canary after it intact.
 diff --git a/libs/misc/cellOskDialog.c b/libs/misc/cellOskDialog.c
-index 17e7c674..ac4d731f 100644
+index 17e7c674..254a4bcf 100644
 --- a/libs/misc/cellOskDialog.c
 +++ b/libs/misc/cellOskDialog.c
-@@ -1,277 +1,355 @@
+@@ -1,277 +1,356 @@
  /*
   * ps3recomp - cellOskDialog HLE implementation
   *
@@ -101,20 +105,23 @@ index 17e7c674..ac4d731f 100644
 - * Internal state
 - * -----------------------------------------------------------------------*/
 +extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
-+
-+enum { OSK_UNLOADED, OSK_OPEN, OSK_CLOSED };
  
 -static int  s_osk_initialized = 0;
 -static int  s_osk_loaded = 0;
 -static char s_default_response[CELL_OSK_MAX_TEXT_LENGTH + 1] = "";
++enum { OSK_UNLOADED, OSK_OPEN, OSK_CLOSED };
+ 
+-/* Stored input result (UTF-16) */
+-static CellOskDialogChar s_result_text[CELL_OSK_MAX_TEXT_LENGTH + 1];
+-static u32               s_result_length = 0;
 +enum {
 +    OSKIF_O_MESSAGE = 0, OSKIF_O_INIT_TEXT = 4, OSKIF_O_LIMIT_LENGTH = 8,
 +    OSKRET_O_RESULT = 0, OSKRET_O_NUMCHARS = 4, OSKRET_O_PRESULTSTRING = 8
 +};
  
--/* Stored input result (UTF-16) */
--static CellOskDialogChar s_result_text[CELL_OSK_MAX_TEXT_LENGTH + 1];
--static u32               s_result_length = 0;
+-/* Convert narrow string to UTF-16LE (simple ASCII subset) */
+-static void osk_ascii_to_utf16(const char* src, CellOskDialogChar* dst,
+-                                u32 maxChars)
 +static int  s_state = OSK_UNLOADED;
 +static s32  s_result;                                   /* CELL_OSKDIALOG_INPUT_FIELD_RESULT_* */
 +static u16  s_text[CELL_OSKDIALOG_STRING_SIZE];         /* the dialog's text, NUL-terminated */
@@ -122,10 +129,7 @@ index 17e7c674..ac4d731f 100644
 +static u32  s_limit;                                    /* characters the field takes */
 +static unsigned long long s_confirm_at;                 /* osk_now_ms() of the host's answer, 0 = none */
 +static unsigned s_dialogs;                              /* dialogs opened, for PS3_OSK_TEXT */
- 
--/* Convert narrow string to UTF-16LE (simple ASCII subset) */
--static void osk_ascii_to_utf16(const char* src, CellOskDialogChar* dst,
--                                u32 maxChars)
++
 +/* Every registered sysutil callback gets the system's dialog events. */
 +static void osk_broadcast(u32 status, u32 param)
  {
@@ -370,16 +374,17 @@ index 17e7c674..ac4d731f 100644
 +    const u32 str_ea = vm_read32(out_ea + OSKRET_O_PRESULTSTRING);
 +    const int copy = str_ea && (result == CELL_OSKDIALOG_INPUT_FIELD_RESULT_OK ||
 +                                (is_unload && result == CELL_OSKDIALOG_INPUT_FIELD_RESULT_NO_INPUT_TEXT));
-+    /* numCharsResultString is the buffer's size in characters on the way in;
-+     * the string is NUL-terminated within it. */
-+    for (s32 i = 0; copy && i < CELL_OSKDIALOG_STRING_SIZE - 1; i++) {
-+        if (i < max_chars) {
-+            vm_write16(str_ea + (u32)i * 2u, s_valid[i]);
-+            if (!s_valid[i]) break;
-+        } else {
-+            vm_write16(str_ea + (u32)i * 2u, 0);
-+            break;
-+        }
++    /* numCharsResultString is, on the way in, how many characters
++     * pResultString holds, the terminator not counted (the SDK samples give
++     * a buffer one character longer than the number they pass). The text is
++     * cut to that many characters and one NUL follows it, so with a text that
++     * long the NUL is at index numCharsResultString. */
++    if (copy) {
++        u32 len = 0;
++        while (len + 1 < CELL_OSKDIALOG_STRING_SIZE && s_valid[len]) len++;
++        const u32 n = len < (u32)max_chars ? len : (u32)max_chars;
++        for (u32 k = 0; k < n; k++) vm_write16(str_ea + k * 2u, s_valid[k]);
++        vm_write16(str_ea + n * 2u, 0);
      }
 -
 -    /* Prepare the result: use default response or empty string */
@@ -435,13 +440,13 @@ index 17e7c674..ac4d731f 100644
 -    }
 +    return osk_get_text(GUEST_EA(OutputInfo), 1);
 +}
-+
+ 
+-    s_osk_loaded = 0;
 +s32 cellOskDialogGetInputText(CellOskDialogCallbackReturnParam* OutputInfo)
 +{
 +    return osk_get_text(GUEST_EA(OutputInfo), 0);
 +}
- 
--    s_osk_loaded = 0;
++
 +s32 cellOskDialogGetSize(u16* width, u16* height, u32 dialogType)
 +{
 +    const u32 w = GUEST_EA(width), h = GUEST_EA(height);
@@ -700,16 +705,17 @@ index 77e31bc1..e5ba07bb 100644
  }
 diff --git a/libs/misc/tests/test_osk_dialog.c b/libs/misc/tests/test_osk_dialog.c
 new file mode 100644
-index 00000000..6aaee0a4
+index 00000000..91931623
 --- /dev/null
 +++ b/libs/misc/tests/test_osk_dialog.c
-@@ -0,0 +1,170 @@
+@@ -0,0 +1,180 @@
 +/*
 + * test_osk_dialog - the on-screen keyboard (libs/misc/cellOskDialog.c).
 + *
 + * LoadAsync posts LOADED to every sysutil slot; the host answers on a later
 + * poll (cellOskDialog_tick) with FINISHED; UnloadAsync returns the result and
-+ * the text, NUL-terminated within numCharsResultString, and posts UNLOADED.
++ * the text, cut to numCharsResultString characters (the terminator not
++ * counted, as in the SDK samples) and followed by one NUL, and posts UNLOADED.
 + * PS3_OSK_TEXT supplies one text per dialog, in order; past it the initial
 + * text stands. Argument checks and codes as the SDK documents them (RPCS3 as
 + * the behaviour reference). Also checks the names hash to GT6's imported NIDs
@@ -843,6 +849,15 @@ index 00000000..6aaee0a4
 +    load(12); cellOskDialog_tick();
 +    CHECK(unload(3) == CELL_OK && vm_read16(STR) == 'B' && vm_read16(STR + 2) == 'r' &&
 +          vm_read16(STR + 4) == 'a' && vm_read16(STR + 6) == 0, "the second gets the second, cut to the room given");
++    /* A text exactly as long as the room: the NUL goes at index room, and
++     * nothing past it is touched. */
++    setenv("PS3_OSK_TEXT", "Smithers", 1);
++    cellOskDialog_reset_for_test();
++    load(12); cellOskDialog_tick();
++    CHECK(unload(8) == CELL_OK && text_is(STR, "Smithers") && vm_read16(STR + 18) == 0x7777,
++          "an 8-character text in room 8: 8 characters, the NUL at index 8, the canary after it intact");
++    unsetenv("PS3_OSK_TEXT");
++    cellOskDialog_reset_for_test();
 +    put_utf16(INIT, "Smith");
 +    load(12); cellOskDialog_tick();
 +    CHECK(unload(32) == CELL_OK && text_is(STR, "Smith"), "past the list the initial text stands");
