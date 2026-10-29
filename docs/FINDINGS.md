@@ -2,16 +2,16 @@
 
 ## Owner summary: milestone 3 (2026-10-29)
 
-**The game reaches its first menu on the Mac: on a new save that is the first-run player page, and it is drawn complete, with all its text, about two minutes after starting.** With scripted presses and two placeholder names the game also accepts the names and starts its first drive at Brands Hatch. This is an agent's judgement from the captured picture; please confirm it by eye (`runs/20261029-052136/frames_png/frame_005280.png` in the game folder).
+**The game reaches its first menu on the Mac: on a new save that is the first-run player page, drawn with all its text, about two minutes after starting.** With scripted presses and two placeholder names the game also accepts the names and starts its first drive at Brands Hatch. This is an agent's judgement from the captured picture; please confirm it by eye (`runs/20261029-052136/frames_png/frame_005280.png` in the game folder). Please judge it with one known flaw in view: two black rectangles above the top-left of the name panel (about a third of the way across and a quarter of the way down) look like something the game meant to draw there that the port does not yet draw. It is a milestone 4 lead.
 
 | Question | Answer |
 |---|---|
-| Did it reach the first menu? | Yes, pending your check. The player-name page with every label, the OK button and the "Welcome to Gran Turismo 6!" box, in the right size and place, on every fresh run since batch 13. There was no RPCS3 picture of this screen to compare with: RPCS3 stopped earlier on this game. |
+| Did it reach the first menu? | Yes, pending your check. The player-name page with every label, the OK button and the "Welcome to Gran Turismo 6!" box, in the right size and place, in the verdict run; two of the batch 14 runs drew it without its panel for some seconds (BACKLOG). Two black rectangles above the panel's top-left corner are not yet explained (BACKLOG). There was no RPCS3 picture of this screen to compare with: RPCS3 stopped earlier on this game. |
 | How far beyond it? | To the first drive: the names go in, GT6 confirms them, welcomes the player at Brands Hatch and shows its tutorial boxes and driving display. The main menu comes after that drive and was not reached. |
 | Biggest risk | In that drive the 3D world is not drawn (black behind the driving display) and the frame rate falls to a few frames a second. Both are milestone 4's first work. A second start of the game still stays on a black screen. |
 | What milestone 4 needs | Your eye check of the page, then your go-ahead. It starts with the missing 3D world in the drive, then the frame rate, then the second start. |
 
-Smaller points: the on-screen keyboard is answered by the program itself (a text field for the player comes with the Mac app), and 51 changes to the borrowed runtime are now carried as patches, all offered back to it under its own licence.
+Smaller points: the on-screen keyboard is answered by the program itself (a text field for the player comes with the Mac app), and 51 changes to the borrowed runtime are now carried as patches, all written to be offered back to it under its own licence (none submitted yet).
 
 ## Owner summary: milestone 2 (2026-10-27)
 
@@ -44,6 +44,13 @@ folder, and the game's code is fully mapped. Nothing failed outright.
 One smaller risk: the disc has not yet been checked against an independent source (backlog).
 
 Measurements and facts, newest first within each section.
+
+### Test run, milestone 3 final-review fixes (2026-10-29)
+
+- `ctest --test-dir build`: 2/2 passed.
+- `.venv/bin/python -m pytest tests -q`: `285 passed, 6 skipped` (the skips need the game folder); with `GT6_TREE` set: `291 passed`, 0 skipped. New: `test_shell_pad_input_and_roots_do_not_reach_the_game` (D77), the play-name and disc-layer write-access tests.
+- `scripts/apply_ps3recomp_patches.sh --check` and `--verify`: 0001-0051, with 0051's cellOskDialog hunk folded into 0049 (the patched tree byte-identical to before); the OSK runner passes on 0001-0049 alone and on the full series. Both images re-translated and rebuilt on this patch set; `boot_game.check_images`: no problems, before and after the suites.
+- `scripts/check_no_game_files.py $(git ls-files)`: clean. `gt6unpack verify`: 16568 files checked, 0 mismatched, 0 missing, 0 extra. No RPCS3 log; no new macOS crash report.
 
 ### Test run, milestone 3 handover (2026-10-29, batch 14)
 

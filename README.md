@@ -18,7 +18,9 @@ The PS3's system software is replaced by a Mac runtime, and its graphics command
 Milestone 3 ("reach the first menu") is reached, pending the owner's check by eye. On a new
 save GT6's first menu is its first-run player page, and the Mac build shows it with all its
 text (the name fields, the OK button and the "Welcome to Gran Turismo 6!" box) about two
-minutes after starting. With scripted button presses and placeholder names the game goes
+minutes after starting. That needs a play folder whose first-run install is already done and
+five scripted button presses ("To get to GT6's first menu" below). Two black rectangles above
+the name panel are not explained yet. With scripted button presses and placeholder names the game goes
 further: it accepts the names, shows its confirmation screen and starts its first drive at
 Brands Hatch, with the tutorial boxes and the driving display. Nothing is playable yet.
 
@@ -29,6 +31,8 @@ Known gaps, carried into milestone 4:
 - A second start of the game, after the first, stays on a black screen.
 - The on-screen keyboard is answered by the program itself; there is no text field for the
   player yet.
+- On the player page, two black rectangles above the name panel look like something not yet
+  drawn, and some runs show the page's text without its panel for a few seconds.
 
 | Milestone | Outcome | State |
 |---|---|---|
@@ -97,7 +101,8 @@ python3 -m venv .venv && .venv/bin/pip install -r scripts/requirements-dev.txt
 .venv/bin/python scripts/translate_game.py "$GT6_TREE"
 
 # 3. Make the play folder the game runs on (a clone of the tree's dev_hdd0 with the
-#    launcher's on-disk changes applied). --force replaces one an earlier run used.
+#    launcher's on-disk changes applied). --force replaces one an earlier run used, and
+#    with it any first-run install that run did (see "To get to GT6's first menu").
 .venv/bin/python scripts/prepare_play.py "$GT6_TREE" --force
 
 # 4. Build the Mac program (78 s on an M4 Max, FINDINGS; the lifted code is built at -O1,
@@ -160,8 +165,29 @@ Options for long runs (D35):
 `scripts/prepare_play.py --name play-SUFFIX` makes a second play folder beside `play` (D49),
 so a run can keep one folder (a finished first-run install, say) while another is used.
 
-To get to GT6's first menu on a new save (milestone 3; the first-run install already done in
-the play folder), the scripted presses are `--press 45:cross --press 75:cross --press
+To get to GT6's first menu on a new save (milestone 3) the play folder must already hold a
+finished first-run install, which takes about 8 minutes. Make one once and keep it, then run
+each boot on an APFS clone of it (`cp -c -R` copies in a moment and takes no extra disk until
+the game writes):
+
+```sh
+# Once: a play folder with the first-run install done. Cross at 480 s answers
+# "Installation complete."; GT6 then restarts itself into its new program (a spawn in
+# report.json) and the run ends by itself or at --seconds.
+.venv/bin/python scripts/prepare_play.py "$GT6_TREE" --name play-installed
+.venv/bin/python scripts/boot_game.py "$GT6_TREE" --play play-installed --until time \
+      --seconds 540 --press 480:cross
+
+# Each time: a fresh clone (any new name), then the presses below.
+cp -c -R "$GT6_TREE/play-installed" "$GT6_TREE/play-run1"
+.venv/bin/python scripts/boot_game.py "$GT6_TREE" --play play-run1 --until time --seconds 300 \
+      --png --press 45:cross --press 75:cross --press 125:cross --press 145:cross --press 165:cross
+```
+
+A clone carries the install run's "used" mark, so `boot_game.py` warns that the folder was
+already used and `report.json` names the install run in `play_reused`. That is expected for
+a clone: do not run `prepare_play.py --force` on it or on `play-installed`, because that
+wipes the install. Delete a clone (`rm -rf`) when its run is done. The scripted presses are `--press 45:cross --press 75:cross --press
 125:cross --press 145:cross --press 165:cross` (past the screen-adjust page, the opening movie,
 the welcome boxes); the player page is up at about 110 s. `--press 185:cross --press 200:down
 --press 210:cross --press 225:down --press 235:cross --osk-text John --osk-text Smith` then
@@ -175,8 +201,9 @@ imports), `summary.md`, the logs, the dumped frames (`frames/frame_<present>.ppm
 (`frames_list`), and counts the frames that were really drawn: at least one draw call and more
 than 1% non-black pixels (`drawn_frames`, `first_drawn`). The outcome is `first_frame` only
 when the game flipped a frame and at least one frame was dumped (`flip_no_frame` otherwise). A
-play folder that a run has used is not clean: run step 3 with `--force` before the next boot
-(`boot_game.py` warns when you have not). Re-run step 2 after changing anything under
+play folder that a run has used is not clean: for a clean boot from scratch, run step 3 with
+`--force` before the next boot (`boot_game.py` warns when you have not). For runs that start
+from a finished install, use a fresh clone instead, as above; there the warning is expected. Re-run step 2 after changing anything under
 `patches/`. To take the patches back out of the submodule:
 `git -C third_party/ps3recomp checkout . && git -C third_party/ps3recomp clean -fd`.
 
