@@ -217,7 +217,8 @@ def test_cli_name_makes_a_sibling_play_folder(tmp_path):
 
 
 @pytest.mark.parametrize("name", ["../play-x", "/tmp/play-x", "play/x", "other", "playx",
-                                  "play-", "", "dev_hdd0", "play-a/../../x"])
+                                  "play-", "", "dev_hdd0", "play-a/../../x",
+                                  "play-.", "play-..", "play--x", "play-.x"])
 def test_name_must_be_a_play_folder_name(tmp_path, name):
     tree = tmp_path / "tree"
     make_tree(tree)
@@ -319,3 +320,28 @@ def test_force_discards_saves_and_trophies(tmp_path):
     prepare_play.prepare(tree, force=True)
     assert not (tree / "play" / "dev_hdd0" / "home").exists()
     assert not (tree / "play" / "trophies").exists()
+
+
+def test_play_names_with_a_dotted_suffix_are_accepted(tmp_path):
+    """Final review m-6: a suffix may hold dots, but not start with one."""
+    tree = tmp_path / "tree"
+    make_tree(tree)
+    assert prepare_play.play_folder(tree, "play-fresh-20261028.1") == tree / "play-fresh-20261028.1"
+    assert prepare_play.play_folder(tree, "play-x") == tree / "play-x"
+
+
+def test_disc_layer_write_access_by_acl_counts(tmp_path, monkeypatch):
+    """Final review m-7: a disc layer whose mode bits are read-only but which the host still
+    lets this user write (an ACL) counts as writable."""
+    root = tmp_path / "dev_bdvd"
+    root.mkdir()
+    (root / "f").write_text("x")
+    try:
+        for p in (root / "f", root):
+            p.chmod(0o555 if p.is_dir() else 0o444)
+        assert prepare_play.disc_layer_writable(tmp_path) is None
+        monkeypatch.setattr(prepare_play.os, "access", lambda path, mode: True)
+        assert "is writable" in prepare_play.disc_layer_writable(tmp_path)
+    finally:
+        for p in (root, root / "f"):
+            p.chmod(0o755 if p.is_dir() else 0o644)

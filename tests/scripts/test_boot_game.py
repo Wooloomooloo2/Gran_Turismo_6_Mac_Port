@@ -188,6 +188,32 @@ def test_host_pads_are_ignored_unless_asked(tree, tmp_path, monkeypatch):
     assert boot_game.build_env(tree, tmp_path, True, None)["PAD_NO_HOST"] == "1"
 
 
+def test_shell_pad_input_and_roots_do_not_reach_the_game(tree, tmp_path, monkeypatch):
+    """D77 (final review I-1): pad input and file roots left in the shell are not passed on;
+    only --press drives the pad and the roots are always the checked play folder's."""
+    for k, v in (("PAD_SCRIPT", "1000:cross"), ("PAD_FILE", "/x"), ("PAD_AUTOPRESS", "1"),
+                 ("PAD_STICK", "1"), ("PAD_SWEEP", "1"), ("GT6_PAD_SCRIPT_IMAGE2", "1:cross"),
+                 ("PS3_HDD0_ROOT", "/elsewhere/dev_hdd0"), ("PS3_HDD1_ROOT", "/elsewhere/h1"),
+                 ("PS3_VFS_ROOT", "/elsewhere/dev_bdvd"), ("PAD_NO_HOST", "0")):
+        monkeypatch.setenv(k, v)
+    env = boot_game.build_env(tree, tmp_path, True, None)
+    assert not [k for k in env if k.startswith(("PAD_", "GT6_PAD_SCRIPT_IMAGE"))
+                and k != "PAD_NO_HOST"]
+    assert env["PAD_NO_HOST"] == "1"
+    assert env["PS3_HDD0_ROOT"] == str(tree / "play" / "dev_hdd0")
+    assert env["PS3_HDD1_ROOT"] == str(tree / "play" / "dev_hdd1")
+    assert env["PS3_VFS_ROOT"] == str(tree / "dev_bdvd")
+    assert env["PS3_GAMEDATA_ROOT"] == str(tree / "play")
+    env = boot_game.build_env(tree, tmp_path, True, None, play=tree / "play-x")
+    assert env["PS3_HDD0_ROOT"] == str(tree / "play-x" / "dev_hdd0")
+    assert env["PS3_VFS_ROOT"] == str(tree / "dev_bdvd")
+    env = boot_game.build_env(tree, tmp_path, True,
+                              boot_game.press_env([(30, "cross", 1), (5, "cross", 2)]))
+    assert env["PAD_SCRIPT"] != "1000:cross" and "GT6_PAD_SCRIPT_IMAGE2" in env
+    assert env["GT6_PAD_SCRIPT_IMAGE2"] != "1:cross"
+    assert "PAD_FILE" not in env
+
+
 def test_host_pad_run_records_it(tree, tmp_path):
     """Batch 11 review M-6: a --host-pad run says so in report.json and summary.md."""
     rep = boot_game.boot(fake("crash", tmp_path), tree, seconds=30, idle=20, host_pad=True)

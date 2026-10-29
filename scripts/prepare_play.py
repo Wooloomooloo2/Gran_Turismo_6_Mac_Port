@@ -201,7 +201,9 @@ def _ours(folder):
     return (Path(folder) / STAGING_MARK).is_file() or _made_by_us(folder)
 
 
-PLAY_NAME = re.compile(r"play(-[A-Za-z0-9_.-]+)?")
+# The suffix starts with a letter, digit or underscore, so "play-." and "play-.." never
+# need reasoning about (final review m-6).
+PLAY_NAME = re.compile(r"play(-[A-Za-z0-9_][A-Za-z0-9_.-]*)?")
 
 
 def play_folder(tree, name=None):
@@ -298,7 +300,9 @@ def disc_layer_writable(tree):
         return None
     for d, dirs, files in os.walk(root):
         for name in [d] + [os.path.join(d, f) for f in dirs + files]:
-            if not os.path.islink(name) and os.stat(name).st_mode & 0o222:
+            # Mode bits, and os.access for an ACL that grants write (final review m-7).
+            if not os.path.islink(name) and (os.stat(name).st_mode & 0o222
+                                             or os.access(name, os.W_OK)):
                 return f"{name} is writable; the verified disc layer must be read-only"
     return None
 

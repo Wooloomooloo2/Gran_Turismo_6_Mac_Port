@@ -322,6 +322,12 @@ def images_env(tree, commit=None, patches=None):
 
 def build_env(tree, run, headless, env, frame_every=60, frame_max=300, play=None, host_pad=False):
     e = dict(os.environ)
+    # D77: a run's input and file roots are what the report says and nothing else. Pad input
+    # left in the shell (PAD_SCRIPT, PAD_FILE, PAD_AUTOPRESS, ..., GT6_PAD_SCRIPT_IMAGE<n>) is
+    # dropped, so only --press drives the pad; PAD_NO_HOST is set below (D65, D68).
+    for k in list(e):
+        if (k.startswith("PAD_") and k != "PAD_NO_HOST") or k.startswith("GT6_PAD_SCRIPT_IMAGE"):
+            del e[k]
     # D65: an unattended run reads no host controller. A pad paired with this Mac (the
     # owner's DualSense) reaches the game even with its window in the background, so a
     # run's outcome could depend on what someone did with it; only --press drives the pad.
@@ -335,12 +341,15 @@ def build_env(tree, run, headless, env, frame_every=60, frame_max=300, play=None
         e["GT6_IMAGES"] = images
     # D50: saves (<root>/dev_hdd0/home/00000001/savedata) and trophies (<root>/trophies) go
     # into the play folder, never the folder the harness was started from.
-    e["PS3_GAMEDATA_ROOT"] = str(Path(play) if play is not None else Path(tree) / "play")
-    if play is not None:
-        # D49: run on <tree>/play-<suffix>; both file layers take their roots from here, so
-        # the folder whose prepare.json was checked is the one the game writes to.
-        e["PS3_HDD0_ROOT"] = str(Path(play) / "dev_hdd0")
-        e["PS3_HDD1_ROOT"] = str(Path(play) / "dev_hdd1")
+    play_dir = Path(play) if play is not None else Path(tree) / "play"
+    e["PS3_GAMEDATA_ROOT"] = str(play_dir)
+    # D49, D77: both file layers always take their roots from the checked play folder (the
+    # default one too), so the folder whose prepare.json was checked is the one the game
+    # writes to, and the disc layer is <tree>/dev_bdvd, the one D46's read-only check covers;
+    # roots left in the shell are overridden.
+    e["PS3_HDD0_ROOT"] = str(play_dir / "dev_hdd0")
+    e["PS3_HDD1_ROOT"] = str(play_dir / "dev_hdd1")
+    e["PS3_VFS_ROOT"] = str(Path(tree) / "dev_bdvd")
     e["PS3_MILESTONE_OUT"] = str(run / "milestones.log")
     # The numbered series (patch 0010) replaces milestone 2's single overwritten dump.
     e.pop("PS3RECOMP_METAL_FRAME_DUMP", None)
