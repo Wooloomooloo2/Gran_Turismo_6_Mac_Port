@@ -7,7 +7,7 @@ Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0049)
 
 What: a diagnostic, off unless PS3_FIBER_TRACE is set: one stderr line per
 cellFiberPpuContextRun (and its return, with the cause and the context that
-returned), Switch and ReturnToThread, the first 400, with the guest thread
+returned), Switch and ReturnToThread, the first 4000, with the guest thread
 id and LR. For a title whose context is parked and never run again (GT6's
 second boot).
 Reference: none needed (logging only).

@@ -281,6 +281,12 @@ static DWORD WINAPI frame_clock(LPVOID)
              * present freely, so the window is not blank during boot. */
             unsigned fc = cellGcm_flip_request_count();
             if (fc != last_flip) {
+                /* This present is the flip's: take its pending mark too, or
+                 * the next tick presents the same flip a second time, after
+                 * the drain has gone on into the next frame (Task 5 batch 13
+                 * review I-1: about two presents per flip, every other one a
+                 * partial or empty frame). */
+                (void)cellGcm_take_flip_pending();
                 present_guest_frame();
                 last_flip = fc;
             } else if (fc == 0) {

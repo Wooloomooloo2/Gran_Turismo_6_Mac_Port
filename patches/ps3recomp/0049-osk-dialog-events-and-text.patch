@@ -16,7 +16,7 @@ The host answers on a later cellSysutilCheckCallback (PS3_OSK_DELAY_MS,
 default 1000 ms): it confirms with the next entry of PS3_OSK_TEXT
 (comma-separated, one per dialog) or else the initial text, or cancels with
 PS3_OSK_CANCEL=1, and posts FINISHED. UnloadAsync returns the result and
-the text NUL-terminated within numCharsResultString and posts UNLOADED;
+the text NUL-terminated (corrected by 0051: cut to numCharsResultString characters, the NUL after them) and posts UNLOADED;
 GetInputText reports NO_INPUT_TEXT until then; Abort gives ABORT and posts
 FINISHED. GetSize writes u16s and takes the dialog type. The SDK's error
 codes (0x8002B501-4) replace invented ones.

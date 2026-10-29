@@ -1,0 +1,807 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] GCM: prepare-flip command in the title's context, present at
+ the immediate flip; park holes wait; OSK result copy; present-rect pitch
+
+Upstream: not yet submitted; written to be upstreamed (generic)
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0050)
+
+What:
+(1) cellGcmSetPrepareFlip / cellGcmSetFlipImmediate as libgcm and the RSX
+do them. 0048 wrote a private 1-word marker only when the context had 4 KB
+to spare past `current` (the runtime ring's reserve), so a context the title
+owns and steps in small segments almost never had room: the prepare then
+presented at call time and the immediate flip presented again, about two
+presents per flip, every other one mid-frame (GT6: the 180-draw scene stage,
+black). Now the prepare writes the driver's 2-word flip command (method
+0xFEAC, data: the buffer id) at `current`; a title-owned context needs only
+those 8 bytes, and with less the title's own callback is called first
+(ctx->callback(ctx, 2)), as libgcm does. The runtime's own ring keeps its
+reserve. The drain marks the buffer ready where it meets the command (and
+resets the 3D state, as at a flip); cellGcmSetFlipImmediate presents a ready
+buffer at once, or the drain presents it when it reaches the command: one
+present per prepare + immediate pair, never an unfinished frame. A context
+that is not a mapped command buffer marks the buffer ready at once; nothing
+presents at the prepare any more. Per-buffer state is atomic (the prepare
+runs on the title's render thread, the immediate flip from its vblank
+handler). A resync that skips a prepare command marks its buffer ready.
+Counters on stderr ("[gcm-prepare]", at prepares 1, 10, 100, 1000 and every
+2000th; every one with GCM_PREPARE_STATS) give the path each prepare took and
+how many the old 4 KB check would have refused.
+(2) A self-JUMP park with commands already written after it is a hole an SPU
+job fills, not a segment end; the RSX waits on it however long that takes.
+The 50 ms grace expired on such holes under host load and the resync dropped
+the block's tail, with the sync write the title then waited on for good.
+Holes get GCM_PARK_HOLE_GRACE_MS (default 5000; 0 waits for ever, with a
+line every 5 s); and a jump-park resync now sweeps the abandoned block's
+remainder when it lies past put, outside the ring range the resync
+sweeps (fences, semaphore and back-end releases, prepare commands).
+(3) cellOskDialog's result string, rewritten from the SDK contract:
+numCharsResultString counts characters without the terminator, so the text
+is cut to that many characters and one NUL follows (at index
+numCharsResultString for a text that long). 0049's text said "within".
+(4) Present: a surface of another pitch than the display buffer's is not
+cropped (the video out would scan that memory at the buffer's pitch); the
+last presented rectangle is shown again (present_rect with surface 0). A
+target bound with pitch 0 is logged (4 times), and one of exactly the
+buffer's size is taken as laid out like it.
+(5) 0050's trace comment says 4000, as its cap is.
+Why: GT6 (BCES01977): flips presented about 1.9 times per prepare, the 26
+black dumps of the verdict run were the mid-frame presents; a long run under
+load stopped after two jump-park resyncs (20261029-034740).
+Behaviour reference: RPCS3's cellGcmSetPrepareFlip and its GCM_FLIP_COMMAND
+(0xFEAC) handling, read as a reference only, no code copied. The OSK copy was
+written from the SDK's documented contract without RPCS3's source open.
+Tests: libs/video/tests/test_gcm_prepare_flip.c (a title-owned context with
+under 4 KB of headroom takes the stream; the callback makes room; one present
+per pair in either order), test_rsx_draw_engine.c (pitch mismatch keeps the
+last image), libs/misc/tests/test_osk_dialog.c (a text exactly the room's
+length, with a canary after the NUL), test_gcm_resync_labels.c (a hole
+outlasts the segment-end grace, and its block's tail release still lands).
+
+--- a/libs/misc/cellOskDialog.c
++++ b/libs/misc/cellOskDialog.c
+@@ -220,16 +220,17 @@
+     const u32 str_ea = vm_read32(out_ea + OSKRET_O_PRESULTSTRING);
+     const int copy = str_ea && (result == CELL_OSKDIALOG_INPUT_FIELD_RESULT_OK ||
+                                 (is_unload && result == CELL_OSKDIALOG_INPUT_FIELD_RESULT_NO_INPUT_TEXT));
+-    /* numCharsResultString is the buffer's size in characters on the way in;
+-     * the string is NUL-terminated within it. */
+-    for (s32 i = 0; copy && i < CELL_OSKDIALOG_STRING_SIZE - 1; i++) {
+-        if (i < max_chars) {
+-            vm_write16(str_ea + (u32)i * 2u, s_valid[i]);
+-            if (!s_valid[i]) break;
+-        } else {
+-            vm_write16(str_ea + (u32)i * 2u, 0);
+-            break;
+-        }
++    /* numCharsResultString is, on the way in, how many characters
++     * pResultString holds, the terminator not counted (the SDK samples give
++     * a buffer one character longer than the number they pass). The text is
++     * cut to that many characters and one NUL follows it, so with a text that
++     * long the NUL is at index numCharsResultString. */
++    if (copy) {
++        u32 len = 0;
++        while (len + 1 < CELL_OSKDIALOG_STRING_SIZE && s_valid[len]) len++;
++        const u32 n = len < (u32)max_chars ? len : (u32)max_chars;
++        for (u32 k = 0; k < n; k++) vm_write16(str_ea + k * 2u, s_valid[k]);
++        vm_write16(str_ea + n * 2u, 0);
+     }
+     if (is_unload) {
+         s_state = OSK_UNLOADED;
+--- a/libs/misc/tests/test_osk_dialog.c
++++ b/libs/misc/tests/test_osk_dialog.c
+@@ -3,7 +3,8 @@
+  *
+  * LoadAsync posts LOADED to every sysutil slot; the host answers on a later
+  * poll (cellOskDialog_tick) with FINISHED; UnloadAsync returns the result and
+- * the text, NUL-terminated within numCharsResultString, and posts UNLOADED.
++ * the text, cut to numCharsResultString characters (the terminator not
++ * counted, as in the SDK samples) and followed by one NUL, and posts UNLOADED.
+  * PS3_OSK_TEXT supplies one text per dialog, in order; past it the initial
+  * text stands. Argument checks and codes as the SDK documents them (RPCS3 as
+  * the behaviour reference). Also checks the names hash to GT6's imported NIDs
+@@ -137,6 +138,15 @@
+     load(12); cellOskDialog_tick();
+     CHECK(unload(3) == CELL_OK && vm_read16(STR) == 'B' && vm_read16(STR + 2) == 'r' &&
+           vm_read16(STR + 4) == 'a' && vm_read16(STR + 6) == 0, "the second gets the second, cut to the room given");
++    /* A text exactly as long as the room: the NUL goes at index room, and
++     * nothing past it is touched. */
++    setenv("PS3_OSK_TEXT", "Smithers", 1);
++    cellOskDialog_reset_for_test();
++    load(12); cellOskDialog_tick();
++    CHECK(unload(8) == CELL_OK && text_is(STR, "Smithers") && vm_read16(STR + 18) == 0x7777,
++          "an 8-character text in room 8: 8 characters, the NUL at index 8, the canary after it intact");
++    unsetenv("PS3_OSK_TEXT");
++    cellOskDialog_reset_for_test();
+     put_utf16(INIT, "Smith");
+     load(12); cellOskDialog_tick();
+     CHECK(unload(32) == CELL_OK && text_is(STR, "Smith"), "past the list the initial text stands");
+--- a/libs/spurs/cellFiber.c
++++ b/libs/spurs/cellFiber.c
+@@ -776,7 +776,7 @@
+ }
+ 
+ /* PS3_FIBER_TRACE=1: one stderr line per context Run, Switch, ReturnToThread
+- * and return of a Run (the first 400), with the guest thread and LR, for a
++ * and return of a Run (the first 4000), with the guest thread and LR, for a
+  * title whose context is never resumed. */
+ static int xtrace_on(void)
+ {
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -127,6 +127,10 @@
+ static volatile int s_flip_pending = 0;
+ /* A flip _cellGcmSetFlipCommand queued in the FIFO: | bufferId, bit 8 = ours. */
+ #define GCM_FLIP_MARKER 0xFEAD0100u
++/* cellGcmSetPrepareFlip's command (method 0xFEAC, subchannel 7, count 1, then
++ * the buffer id), and the drain reaching it (defined with the prepare). */
++#define GCM_PREPARE_FLIP_HDR 0x0004FEACu   /* method 0xFEAC (subchannel 7), count 1 */
++static int gcm_prepared_reached(u32 id);
+ /* Flips queued into the command stream by gcm_flip_into_fifo, and how many of
+  * those markers the drain has reached. The RSX completes a flip when it
+  * executes it; until the drain reaches the marker, the flip has not happened,
+@@ -978,6 +982,32 @@
+     static long long ms = -1;
+     if (ms < 0) { const char* e = getenv("GCM_PARK_GRACE_MS"); ms = e ? atoll(e) : (long long)GCM_PARK_GRACE_MS; }
+     return (unsigned long long)ms;
++}
++/* A park with commands already written after it is a hole, not the end of a
++ * segment: an SPU job (Edge geometry, GT6's) fills it with a JUMP to its own
++ * commands, and the RSX just waits for it however long that takes. GT6 under
++ * host load took longer than the 50 ms above (run 20261029-034740), and the
++ * resync then dropped the block's tail with a sync write in it, so the game
++ * stopped. A hole gets its own, far longer, limit (GCM_PARK_HOLE_GRACE_MS,
++ * default 5 s; 0 = wait for ever, as the RSX does), with a line every 5 s
++ * while it waits. Kept finite because a title that reuses a command block
++ * leaves the previous use's commands after a stale park. */
++#define GCM_PARK_HOLE_GRACE_MS 5000ull
++static unsigned long long gcm_park_grace_for(u32 park_io, unsigned long long waited)
++{
++    const u32 nea = gcm_io2ea(park_io + 4);
++    const u32 nw = nea ? vm_read32(nea) : 0;
++    const int hole = nw && ((nw >> 29) == 0 || (nw >> 29) == 2) && ((nw >> 18) & 0x7FFu);
++    if (!hole) return gcm_park_grace_ms();
++    static long long ms = -1;
++    if (ms < 0) { const char* e = getenv("GCM_PARK_HOLE_GRACE_MS");
++                  ms = e ? atoll(e) : (long long)GCM_PARK_HOLE_GRACE_MS; }
++    { static unsigned long long last; static u32 last_io;
++      if (waited >= 5000ull && (last_io != park_io || waited - last >= 5000ull)) {
++          last_io = park_io; last = waited;
++          fprintf(stderr, "[cellGcmSys] waiting at a command-buffer hole 0x%08X for %llu ms%c",
++                  park_io, waited, 10); } }
++    return ms == 0 ? ~0ull : (unsigned long long)ms;
+ }
+ /* How close `current` must get to `end` before the runtime will recycle a ring
+  * on the title's behalf. One gcmReserve is 8 bytes; a page of slack keeps a
+@@ -1634,6 +1664,14 @@
+              * every flip after it waits for the drain forever. */
+             if ((w & 0xFFFFFF00u) == GCM_FLIP_MARKER &&
+                 s_fifo_flips_reached != s_fifo_flips_queued) { s_fifo_flips_reached++; continue; }
++            /* ...and a skipped prepare command would leave its buffer never
++             * ready, its immediate flip never presented. */
++            if ((w & ~0x40000000u) == GCM_PREPARE_FLIP_HDR) {
++                const u32 dea = gcm_io2ea(io + 4);
++                if (dea) gcm_prepared_reached(vm_read32(dea));
++                io += 4;
++                continue;
++            }
+             if ((w >> 29) != 0 || (w & 0x1FFCu) != 0x0050u) continue;
+             u32 dea = gcm_io2ea(io + 4); if (!dea) continue;
+             gcm_ref_push_at(vm_read32(dea), io);
+@@ -1689,6 +1727,60 @@
+     *getoff = land;
+ }
+ 
++/* A resync out of a main-memory command block (the jump-park one) leaves the
++ * rest of that block unread, and the ring sweep above never looks there.
++ * Walk the block's remainder after the park as a command stream and replay
++ * what a title waits on: fences (0x0050), NV406E semaphore releases, the
++ * NV4097 back-end and texture-read releases, and prepare-flip commands. It
++ * stops at anything that is not a method header, a CALL or RETURN, or a JUMP
++ * out of the block, and after 64 KB. GT6 run 20261029-034740 stopped for good
++ * after two such resyncs: its frame loop waited on a sync write in the tail. */
++static void gcm_fifo_sweep_block_tail(u32 from)
++{
++    static rsx_state s_tail_state;   /* the sync methods do not touch it */
++    const u32 lim = from + 0x10000u;
++    unsigned fences = 0, labels = 0, flips = 0;
++    for (u32 io = from; io + 4 <= lim; ) {
++        const u32 ea = gcm_io2ea(io); if (!ea) break;
++        const u32 w = vm_read32(ea), type = w >> 29;
++        if (w == 0) { io += 4; continue; }                              /* NOP */
++        if ((w & 0xE0000003u) == 0x20000000u || (w & 3u) == 1u) {       /* JUMP */
++            const u32 tgt = ((w & 3u) == 1u) ? (w & ~3u) : (w & 0x1FFFFFFCu);
++            if (tgt == io) { io += 4; continue; }                       /* another hole */
++            if (tgt > io && tgt < lim) { io = tgt; continue; }
++            break;
++        }
++        if (type != 0 && type != 2) break;
++        const u32 count = (w >> 18) & 0x7FFu, method = w & 0x1FFCu, subch = (w >> 13) & 7u;
++        if (!count) break;
++        if ((w & ~0x40000000u) == GCM_PREPARE_FLIP_HDR) {
++            const u32 dea = gcm_io2ea(io + 4);
++            if (dea) { gcm_prepared_reached(vm_read32(dea)); flips++; }
++            io += 8;
++            continue;
++        }
++        for (u32 i = 0; i < count; i++) {
++            const u32 dea = gcm_io2ea(io + 4 + i * 4); if (!dea) break;
++            const u32 m = (type == 0) ? method + i * 4 : method, v = vm_read32(dea);
++            if (subch != 0) continue;
++            if (m == 0x50u) { gcm_ref_push_at(v, io); fences++; }
++            else if (m == 0x64u) s_sema_offset = v;
++            else if (m == 0x6Cu) {
++                atomic_thread_fence(memory_order_release);
++                vm_write32(GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu), v);
++                labels++;
++            } else if (m == 0x01A4u || m == 0x1D6Cu || m == 0x1D70u || m == 0x1D74u) {
++                rsx_process_method(&s_tail_state, m, v);
++                labels += (m == 0x1D70u || m == 0x1D74u);
++            }
++        }
++        io += 4 + count * 4;
++    }
++    { static int n = 0; if (PS3_LOG_FIRST(n, 8))
++        fprintf(stderr, "[cellGcmSys] resync swept the abandoned block from 0x%08X: %u"
++                " fence(s), %u label write(s), %u prepared flip(s)%c", from, fences, labels, flips, 10); }
++}
++
+ static void gcm_fifo_dump_around(u32 getoff)
+ {
+     /* Only ever called on a recovery (bad branch, stuck get), and capped, so
+@@ -2344,6 +2436,24 @@
+             continue;
+         }
+ 
++        if ((w & ~0x40000000u) == GCM_PREPARE_FLIP_HDR) {
++            /* cellGcmSetPrepareFlip's command: the buffer is finished. The
++             * RSX resets its 3D state at a flip command, as at 0xFEAD. When an
++             * immediate flip is already waiting on this buffer it is
++             * presented now, and the pass stops here, as at a flip word, so
++             * the present shows exactly this frame. */
++            const u32 dea = gcm_io2ea(s_fifo_getoff + 4);
++            if (!dea) { gcm_fifo_resync_why("unmapped-flip", &s_fifo_getoff, put); break; }
++            const u32 id = vm_read32(dea);
++            s_fifo_getoff += 8;
++            gcm_fifo_flip_resets_state(&s_state);
++            if (PS3_FT_ON()) { const uint64_t t = ps3_ft_now();
++                               ps3_ft_span(PS3_FT_FLIP_FIFO, 0, id & 7u, 0, t, t); }
++            if (gcm_prepared_reached(id) &&
++                gcm_fifo_backlog(put, s_fifo_getoff) < GCM_FIFO_CATCHUP_BYTES)
++                { why = "flip"; break; }
++            continue;
++        }
+         if (type == 1) {                       /* JUMP: 0x20000000 | offset */
+             { static int _rd = -1; if (_rd < 0) _rd = getenv("GCM_RECDBG") ? 1 : 0;
+               if (_rd) fprintf(stderr, "[JMP] %08X -> %08X (put=%08X)\n",
+@@ -2380,7 +2490,7 @@
+                       const unsigned long long now = ps3_ms_now();
+                       if (park_off != s_fifo_getoff || park_put != put) {
+                           park_off = s_fifo_getoff; park_put = put; park_since = now;
+-                      } else if (now - park_since >= gcm_park_grace_ms() &&
++                      } else if (now - park_since >= gcm_park_grace_for(s_fifo_getoff, now - park_since) &&
+                                  /* Read the park again before giving up on it.
+                                   * An SPU job that fills a command-buffer hole
+                                   * (Edge geometry reserves them as self-JUMPs)
+@@ -2390,7 +2500,13 @@
+                                  vm_read32(gcm_io2ea(s_fifo_getoff)) == w) {
+                           park_off = 0;
+                           gcm_fifo_dump_around(s_fifo_getoff);
+-                          gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put);
++                          { /* A park ahead of put lies in a block the ring
++                             * sweep does not reach (GT6's main-memory blocks);
++                             * one behind it is inside the swept range. */
++                            const u32 tail = s_fifo_getoff + 4;
++                            const int beyond = s_fifo_getoff > put;
++                            gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put);
++                            if (beyond) gcm_fifo_sweep_block_tail(tail); }
+                       }
+                   }
+                   why = "parked";
+@@ -3219,10 +3335,120 @@
+ }
+ 
+ /* NID: 0xA2478CA3 */
+-/* Buffers a cellGcmSetPrepareFlip put into the command stream, for the
+- * cellGcmSetFlipImmediate that shows them. */
+-static volatile u32 s_prepared_in_fifo;
++/* cellGcmSetPrepareFlip / cellGcmSetFlipImmediate, as libgcm and the RSX do
++ * them. The prepare puts the driver's flip command (method 0xFEAC, one data
++ * word: the buffer id) into the title's context at `current`; the buffer is
++ * ready once the RSX has executed everything before that command. The
++ * immediate flip then switches the display to a ready buffer, at the moment
++ * the title picks (GT6: its vblank handler, one frame behind the prepare).
++ * So the present happens at cellGcmSetFlipImmediate when the drain has
++ * already reached the buffer's command, or when the drain reaches it if the
++ * immediate flip came first; never at the prepare, and never twice.
++ *
++ * Per buffer: prepared (the command is in a stream, the immediate flip has
++ * not taken it yet) and ready (the drain has reached it). s_pf_wanted is the
++ * buffer an immediate flip is waiting on, plus one (0: none). The drain thread
++ * and the title's threads race on all three, so they are atomic, and the
++ * present is claimed by whoever clears s_pf_wanted. */
++static _Atomic u32 s_pf_prepared, s_pf_ready, s_pf_wanted;
+ 
++/* Counters (GCM_PREPARE_STATS on stderr; always in the summary line printed
++ * at prepares 1, 10, 100, 1000 and every 2000th): which way each prepare went
++ * and how the presents came about. `old_refused` counts prepares the room check
++ * before this change (current + 8 + 4 KB > end) would have refused: the
++ * hypothesis that GT6's flips mostly bypassed the stream. */
++static _Atomic u32 s_pf_n, s_pf_stream, s_pf_unmapped, s_pf_callback, s_pf_full,
++                   s_pf_old_refused, s_pf_reached, s_pf_present_now, s_pf_present_later;
++
++static void gcm_prepared_present(u32 bufferId)
++{
++    gcm_set_current_display_buffer(bufferId);
++    s_flip_pending = 1;
++    gcm_note_flip_request();
++}
++
++/* The drain has executed buffer `id`'s prepare command (or a resync skipped
++ * it, which the RSX would have executed by now). Returns 1 when it presented
++ * the buffer for an immediate flip that was waiting on it. */
++static int gcm_prepared_reached(u32 id)
++{
++    id &= 7u;
++    if (id >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM) return 0;
++    atomic_fetch_add(&s_pf_reached, 1);
++    atomic_fetch_or(&s_pf_ready, 1u << id);
++    u32 want = id + 1;
++    if (atomic_compare_exchange_strong(&s_pf_wanted, &want, 0u)) {
++        atomic_fetch_and(&s_pf_ready, ~(1u << id));
++        atomic_fetch_add(&s_pf_present_later, 1);
++        gcm_prepared_present(id);
++        return 1;
++    }
++    return 0;
++}
++
++static void gcm_prepare_stats(const char* ctx_note)
++{
++    const u32 n = atomic_load(&s_pf_n);
++    static int dbg = -1;
++    if (dbg < 0) dbg = getenv("GCM_PREPARE_STATS") ? 1 : 0;
++    if (!(dbg || n == 1 || n == 10 || n == 100 || n == 1000 || n % 2000u == 0)) return;
++    fprintf(stderr, "[gcm-prepare] %u prepares: %u in the stream (%u after the title's"
++            " callback), %u full after it, %u unmapped; %u the old 4 KB check would have"
++            " refused; %u commands reached; presents at the immediate flip %u, at the"
++            " command %u; %u guest flip requests%s%s%c",
++            n, atomic_load(&s_pf_stream), atomic_load(&s_pf_callback), atomic_load(&s_pf_full),
++            atomic_load(&s_pf_unmapped), atomic_load(&s_pf_old_refused),
++            atomic_load(&s_pf_reached), atomic_load(&s_pf_present_now),
++            atomic_load(&s_pf_present_later), s_flip_request_count,
++            ctx_note ? "; " : "", ctx_note ? ctx_note : "", 10);
++}
++
++/* Write the prepare command into a context. A context the title owns needs
++ * only room for the command's 2 words; when it has less, libgcm calls the
++ * context's callback (ctx->callback(ctx, 2)), which makes room, and writes
++ * then. The runtime's own ring (its callback is the runtime's sentinel) keeps
++ * the runtime's 4 KB reserve and its wrap, as gcm_flip_into_fifo does.
++ * Returns 1 when the command is in the stream, 0 when ctx is not a mapped
++ * command buffer, -1 when there was still no room. */
++static int gcm_prepare_flip_into_fifo(u32 ctx, u32 bufferId)
++{
++    if (!ctx) return 0;
++    u32 end = vm_read32(ctx + 4), cur = vm_read32(ctx + 8);
++    if (gcm_ea2io(cur) == 0xFFFFFFFFu) return 0;
++    const u32 cb_opd = vm_read32(ctx + 0xC);
++    const int runtime_ring = cb_opd && vm_read32(cb_opd) == GCM_FIFO_CALLBACK_SENTINEL_EA;
++    char note[160];
++    note[0] = 0;
++    { static int shown = 0;
++      if (shown < 3) { shown++;
++          snprintf(note, sizeof note, "context 0x%08X begin 0x%08X end 0x%08X current 0x%08X"
++                   " callback 0x%08X (%s)", ctx, vm_read32(ctx), end, cur, cb_opd,
++                   runtime_ring ? "the runtime's ring" : "the title's"); } }
++    atomic_fetch_add(&s_pf_n, 1);
++    if (cur + 8 + GCM_RECYCLE_SLACK > end) atomic_fetch_add(&s_pf_old_refused, 1);
++    if (runtime_ring) {
++        if (cur + 8 + GCM_RECYCLE_SLACK > end) { gcm_prepare_stats(note); return -1; }
++    } else if (cur + 8 > end) {
++        if (cb_opd && g_ps3_guest_caller) {
++            atomic_fetch_add(&s_pf_callback, 1);
++            g_ps3_guest_caller(cb_opd, ctx, 2, 0, 0, 0, 0, 0, 0);
++            end = vm_read32(ctx + 4);
++            cur = vm_read32(ctx + 8);
++        }
++        if (cur + 8 > end || gcm_ea2io(cur) == 0xFFFFFFFFu) {
++            atomic_fetch_add(&s_pf_full, 1);
++            gcm_prepare_stats(note);
++            return -1;
++        }
++    }
++    vm_write32(cur, GCM_PREPARE_FLIP_HDR);
++    vm_write32(cur + 4, bufferId);
++    vm_write32(ctx + 8, cur + 8);
++    atomic_fetch_add(&s_pf_stream, 1);
++    gcm_prepare_stats(note[0] ? note : NULL);
++    return 1;
++}
++
+ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
+ {
+     if (bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM)
+@@ -3233,17 +3459,17 @@
+ 
+     printf("[cellGcmSys] SetPrepareFlip(bufferId=%u)\n", bufferId);
+ 
+-    /* libgcm writes the flip into the context: the buffer is ready once the
+-     * RSX has executed every command before it. The drain presents it there
+-     * (the marker case), so a flip never shows a frame the RSX has not
+-     * finished; cellGcmSetFlipImmediate then only switches to it. A context
+-     * that is not a mapped command buffer, or is full, flips here instead. */
+-    if (gcm_flip_into_fifo((u32)(uintptr_t)ctx, bufferId)) {
+-        s_prepared_in_fifo |= 1u << bufferId;
+-    } else {
+-        s_prepared_in_fifo &= ~(1u << bufferId);
+-        gcm_set_current_display_buffer(bufferId);
+-        gcm_note_flip_request();
++    /* New contents for this buffer: it is not ready until the drain reaches
++     * this prepare's command. A context that is not a mapped command buffer
++     * (or one still full after its callback) has no place in the stream, so
++     * the buffer counts as ready at once; the immediate flip still presents
++     * it, once. */
++    atomic_fetch_and(&s_pf_ready, ~(1u << bufferId));
++    atomic_fetch_or(&s_pf_prepared, 1u << bufferId);
++    const int r = gcm_prepare_flip_into_fifo((u32)(uintptr_t)ctx, bufferId);
++    if (r <= 0) {
++        if (r == 0) atomic_fetch_add(&s_pf_unmapped, 1);
++        atomic_fetch_or(&s_pf_ready, 1u << bufferId);
+     }
+     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+     s_last_flip_time = get_timestamp_ns();
+@@ -4263,11 +4489,22 @@
+ s32 cellGcmSetFlipImmediate(u32 bufferId)
+ {
+     printf("[cellGcmSys] SetFlipImmediate(bufferId=%u)\n", bufferId);
+-    /* A buffer cellGcmSetPrepareFlip queued in the stream is presented where
+-     * the drain reaches it; here the flip is only reported (status, handler,
+-     * vblank completion), not presented a second time and early. */
+-    if (bufferId < CELL_GCM_MAX_DISPLAY_BUFFER_NUM && (s_prepared_in_fifo & (1u << bufferId))) {
+-        s_prepared_in_fifo &= ~(1u << bufferId);
++    /* A buffer cellGcmSetPrepareFlip prepared: present it now if the drain
++     * has reached its prepare command, else when it does (the RSX finishes
++     * the buffer first). Either way once; the flip is reported here (status,
++     * handler, vblank completion). A buffer never prepared flips at once, as
++     * before. */
++    if (bufferId < CELL_GCM_MAX_DISPLAY_BUFFER_NUM &&
++        (atomic_fetch_and(&s_pf_prepared, ~(1u << bufferId)) & (1u << bufferId))) {
++        atomic_store(&s_pf_wanted, bufferId + 1);
++        if (atomic_load(&s_pf_ready) & (1u << bufferId)) {
++            u32 want = bufferId + 1;
++            if (atomic_compare_exchange_strong(&s_pf_wanted, &want, 0u)) {
++                atomic_fetch_and(&s_pf_ready, ~(1u << bufferId));
++                atomic_fetch_add(&s_pf_present_now, 1);
++                gcm_prepared_present(bufferId);
++            }
++        }
+         return gcm_flip_request(bufferId, 2);
+     }
+     return cellGcmSetFlipCommand(bufferId);
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -202,6 +202,7 @@
+     u32 frame_draws, frame_clears;            /* issued since the last present */
+     u32 last_frame_draws, last_frame_clears;  /* ... in the frame presented last */
+     u32 last_present_surface;
++    u32 last_rect_w, last_rect_h;   /* the last present_rect's size (0: none) */
+     u32 last_flip_buffer;
+     u64 write_serial;       /* orders colour and depth writes to one address */
+ 
+@@ -738,6 +739,14 @@
+                                       sf.clip_w, sf.clip_h, fmt, sf.color_pitch[sel], aa_grid);
+     if (first == ENG_INVALID) return 0;
+     g.surfaces[first].pitch = sf.color_pitch[sel];
++    /* A target bound with pitch 0 (the register's reset value: nothing has
++     * set it yet) cannot be told apart from another layout at the same
++     * address; say when, so it can be traced (batch 13 review M-3). */
++    if (!sf.color_pitch[sel]) { static u32 logs = 0; if (PS3_LOG_FIRST(logs, 4))
++        fprintf(stderr, "[rsx engine] target %u:0x%08X %ux%u bound with pitch 0"
++                        " (format 0x%X, target %u, draw %u)\n",
++                sf.color_location[sel], sf.color_offset[sel], sf.clip_w, sf.clip_h,
++                sf.color_format, sf.color_target, g.guest_draws); }
+     slots[0] = first;
+     u32 n = 1;
+ 
+@@ -3415,8 +3424,9 @@
+  * currently bound: the live target at that instant is often an offscreen
+  * shadow or post-process surface, and copying it presents black despite the
+  * scene's draws having executed (rsx_live_draw.c:7557-7570). */
+-static u32 eng_present_surface(u32 buffer_id)
++static u32 eng_present_surface(u32 buffer_id, int* pitch_mismatch)
+ {
++    *pitch_mismatch = 0;
+     if (buffer_id < 8 && g.display_buffers[buffer_id].valid) {
+         const eng_display_buffer* d = &g.display_buffers[buffer_id];
+         /* The video out reads the buffer's memory with the buffer's pitch, so
+@@ -3427,7 +3437,11 @@
+             const eng_surface* s = &g.surfaces[i];
+             if (!s->handle || s->location != d->location || s->offset != d->offset) continue;
+             if (any == ENG_INVALID || s->color_serial > g.surfaces[any].color_serial) any = i;
+-            if (s->pitch == d->pitch &&
++            /* Pitch 0: never set (above); a surface of exactly the buffer's
++             * size is taken as laid out like it. */
++            const int same_layout = s->pitch == d->pitch ||
++                (!s->pitch && s->w == d->width && s->h == d->height);
++            if (same_layout &&
+                 (best == ENG_INVALID || s->color_serial > g.surfaces[best].color_serial))
+                 best = i;
+         }
+@@ -3436,9 +3450,11 @@
+             static u32 logs = 0;
+             if (PS3_LOG_FIRST(logs, 8))
+                 fprintf(stderr, "[rsx engine] flip of buffer %u (0x%08X, pitch %u): the surface"
+-                                " there has pitch %u (%ux%u); presenting it\n",
++                                " there has pitch %u (%ux%u); not the picture the video"
++                                " out would scan, so the last image stays\n",
+                         buffer_id, d->offset, d->pitch, g.surfaces[any].pitch,
+                         g.surfaces[any].w, g.surfaces[any].h);
++            *pitch_mismatch = 1;
+             return any;
+         }
+     }
+@@ -3448,7 +3464,8 @@
+ static void eng_present(u32 buffer_id)
+ {
+     if (!g.ready) return;
+-    const u32 target = eng_present_surface(buffer_id);
++    int pitch_mismatch = 0;
++    const u32 target = eng_present_surface(buffer_id, &pitch_mismatch);
+     if (target == ENG_INVALID) return;
+     g.surfaces[target].last_use = g.frames;
+     if (getenv("PS3RECOMP_METAL_FRAME_DUMP") && g.frames % 120 == 0) {
+@@ -3475,12 +3492,21 @@
+     const u32 ax = (ps->aa_grid & 0xFFu) ? (ps->aa_grid & 0xFFu) : 1u;
+     const u32 ay = (ps->aa_grid >> 8) ? (ps->aa_grid >> 8) : 1u;
+     const u32 dw = d ? d->width * ax : 0, dh = d ? d->height * ay : 0;
+-    if (d && g.be->present_rect && ps->location == d->location && ps->offset == d->offset &&
+-        (dw < ps->w || dh < ps->h))
+-        g.be->present_rect(g.be->user, ps->handle, dw < ps->w ? dw : ps->w,
+-                           dh < ps->h ? dh : ps->h);
+-    else
++    if (pitch_mismatch && d && g.be->present_rect && g.last_rect_w == dw && g.last_rect_h == dh) {
++        /* Only a surface of another pitch is at the buffer's address (GT6's
++         * 1024x1024 scene target over buffer 0): the video out would scan that
++         * memory at the buffer's pitch, which is not this surface's top-left.
++         * Present the last good image of this size again instead (surface 0:
++         * the backend's last rectangle), so no crop of it is shown. */
++        g.be->present_rect(g.be->user, 0, dw, dh);
++    } else if (d && g.be->present_rect && ps->location == d->location && ps->offset == d->offset &&
++        (dw < ps->w || dh < ps->h)) {
++        g.last_rect_w = dw < ps->w ? dw : ps->w;
++        g.last_rect_h = dh < ps->h ? dh : ps->h;
++        g.be->present_rect(g.be->user, ps->handle, g.last_rect_w, g.last_rect_h);
++    } else {
+         g.be->present(g.be->user, ps->handle);
++    }
+     g.frames++;
+     g.last_guest_draws = g.guest_draws;
+     g.guest_draws = 0;
+--- a/libs/video/rsx_draw_engine.h
++++ b/libs/video/rsx_draw_engine.h
+@@ -307,7 +307,10 @@
+      * (cellGcmSetDisplayBuffer's width and height) when the engine surface at
+      * its address is larger, as a 1280x720 buffer inside a 1440x1080 render
+      * target of the same pitch. The video out scans that rectangle and
+-     * nothing else. NULL presents the whole surface, as before. */
++     * nothing else. NULL presents the whole surface, as before. Surface 0
++     * presents the last rectangle again (same w x h), with the frame's draws
++     * committed: the engine's "keep the last image" when the surface at the
++     * buffer's address has another layout. */
+     void (*present_rect)(void* user, u32 surface, u32 w, u32 h);
+ 
+ } rsx_draw_backend;
+--- a/libs/video/rsx_metal_backend.m
++++ b/libs/video/rsx_metal_backend.m
+@@ -4497,6 +4497,21 @@
+  * keeps an in-flight frame's read of it before the next frame's copy. */
+ static void eng_present_rect(void* user, u32 surface, u32 w, u32 h)
+ {
++    if (!surface) {
++        /* The last rectangle again: commit the frame's draws and present the
++         * texture the previous copy filled. With none of that size, commit
++         * only (nothing new to show). */
++        if (!s_eng_crop_tex || [s_eng_crop_tex width] != w || [s_eng_crop_tex height] != h) {
++            eng_present(user, 0);
++            return;
++        }
++        rsx_metal_backend_note_guest_frame();
++        s_eng_crop_from = nil;
++        eng_encode_and_commit(s_eng_crop_tex);
++        eng_dump_frame(s_eng_crop_tex);
++        eng_series_present(s_eng_crop_tex);
++        return;
++    }
+     id<MTLTexture> src = eng_obj(surface);
+     if (!src || !w || !h || w > [src width] || h > [src height] || [src sampleCount] != 1 ||
+         [src textureType] != MTLTextureType2D) {
+--- a/libs/video/tests/test_gcm_prepare_flip.c
++++ b/libs/video/tests/test_gcm_prepare_flip.c
+@@ -2,7 +2,11 @@
+  * the SDK returns the prepared buffer's id (0 or more) or an error, and a
+  * title may keep it. GT6 stores it as the
+  * id its vblank handler later passes to cellGcmSetFlipImmediate; returning
+- * CELL_OK (0) made every flip show buffer 0. Built and run by
++ * CELL_OK (0) made every flip show buffer 0. The prepare's command goes into
++ * a context the title owns with only 2 words of room needed (the title's own
++ * callback makes room when there is less), and exactly one present follows a
++ * prepare + immediate flip pair, whichever reaches its point first. Built and
++ * run by
+  * tools/test_gcm_prepare_flip.py, which compiles cellGcmSys.c in. */
+ #include "../cellGcmSys.c"
+ void ps3_ms(const char* key) { (void)key; }   /* the milestone log is not under test */
+@@ -24,27 +28,94 @@
+ static uint32_t noted = 0xFFu;
+ int  rsx_draw_engine_enabled(void) { return 1; }
+ void rsx_draw_engine_note_flip(uint32_t buffer_id) { noted = buffer_id; }
++
++/* Guest memory: a context at 0x100000, its command buffer in the 1 MB page at
++ * 0x200000, mapped at IO 0. */
++#define CTX   0x00100000u
++#define BUF   0x00200000u
++#define CB    0x00300000u   /* the title's callback OPD */
++static unsigned cb_calls; static uint64_t cb_ctx, cb_count;
++static void guest_caller(uint32_t opd, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
++                         uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
++{
++    (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; (void)a7;
++    if (opd != CB) return;                    /* the flip handler: none here */
++    cb_calls++; cb_ctx = a0; cb_count = a1;
++    vm_write32(CTX + 8, BUF + 0x2000);        /* the title's next segment */
++    vm_write32(CTX + 4, BUF + 0x2000 + 0x800);
++}
++static void set_ctx(uint32_t begin, uint32_t end, uint32_t cur)
++{
++    vm_write32(CTX + 0, begin); vm_write32(CTX + 4, end);
++    vm_write32(CTX + 8, cur);   vm_write32(CTX + 0xC, CB);
++}
++
+ int main(void)
+ {
++    vm_base = calloc(1, 0x400000); ppu_vm_size = 0x400000;
++    memset(s_io_address_table, 0xFF, sizeof s_io_address_table);
++    memset(s_ea_address_table, 0xFF, sizeof s_ea_address_table);
++    s_io_address_table[BUF >> 20] = 0; s_ea_address_table[0] = BUF >> 20;
++    g_ps3_guest_caller = guest_caller;
++    s_display_buffer_set[0] = 1;
+     s_display_buffer_set[1] = 1;
+     s_display_buffer_set[2] = 1;
+     assert(cellGcmSetPrepareFlip(NULL, 2) == 2);
+-    assert(cellGcmGetCurrentDisplayBufferId() == 2 && noted == 2);
+-    assert(cellGcmSetPrepareFlip(NULL, 1) == 1 && noted == 1);
++    assert(cellGcmSetPrepareFlip(NULL, 1) == 1);
+     assert(cellGcmSetPrepareFlip(NULL, 3) == (s32)CELL_GCM_ERROR_INVALID_VALUE);   /* not set */
+     assert(cellGcmSetPrepareFlip(NULL, 9) == (s32)CELL_GCM_ERROR_INVALID_VALUE);
+-    /* No mapped command buffer: the prepare names the buffer at once and the
+-     * immediate flip presents it. */
++
++    /* No mapped command buffer: nothing is presented at the prepare; the
++     * immediate flip presents the buffer, once. */
++    u32 fc = s_flip_request_count;
+     s_flip_pending = 0;
+-    assert(cellGcmSetPrepareFlip(NULL, 2) == 2 && !(s_prepared_in_fifo & 4u));
++    assert(cellGcmSetPrepareFlip(NULL, 2) == 2 && s_flip_request_count == fc && !s_flip_pending);
+     assert(cellGcmSetFlipImmediate(2) == CELL_OK && s_flip_pending == 1 && noted == 2);
+-    /* Prepared in the stream: the drain presents it where it meets the
+-     * marker, so the immediate flip only reports it (no second, early present). */
+-    s_flip_pending = 0; s_flip_direct_pending = 0; noted = 0xFF;
+-    s_prepared_in_fifo = 1u << 1;
++    assert(s_flip_request_count == fc + 1);
++
++    /* A title-owned context with 0x100 bytes left (far under the runtime ring's
++     * 4 KB reserve) takes the stream: the 2-word command at current. */
++    set_ctx(BUF, BUF + 0x1000, BUF + 0xF00);
++    s_flip_pending = 0; noted = 0xFF; fc = s_flip_request_count;
++    assert(cellGcmSetPrepareFlip((void*)(uintptr_t)CTX, 1) == 1);
++    assert(vm_read32(BUF + 0xF00) == 0x0004FEACu && vm_read32(BUF + 0xF04) == 1);
++    assert(vm_read32(CTX + 8) == BUF + 0xF08 && cb_calls == 0);
++    assert(s_flip_request_count == fc && !s_flip_pending && noted == 0xFF);   /* no present yet */
++
++    /* Immediate flip first, drain second: the present waits for the command,
++     * then happens exactly once. */
++    s_flip_direct_pending = 0;
+     assert(cellGcmSetFlipImmediate(1) == CELL_OK);
+-    assert(s_flip_pending == 0 && noted == 0xFF && s_flip_direct_pending == 1 && !s_prepared_in_fifo);
++    assert(s_flip_request_count == fc && !s_flip_pending && s_flip_direct_pending == 1);
+     assert(cellGcmGetFlipStatus() == CELL_GCM_FLIP_STATUS_WAITING);
+-    puts("cellGcmSetPrepareFlip returns the buffer id; a prepared flip is presented once: passed");
++    assert(gcm_prepared_reached(1) == 1);
++    assert(s_flip_request_count == fc + 1 && s_flip_pending == 1 && noted == 1);
++    assert(gcm_prepared_reached(1) == 0 && s_flip_request_count == fc + 1);
++
++    /* Drain first, immediate flip second: presented at the immediate flip. */
++    s_flip_pending = 0; fc = s_flip_request_count;
++    assert(cellGcmSetPrepareFlip((void*)(uintptr_t)CTX, 2) == 2);
++    assert(gcm_prepared_reached(2) == 0 && s_flip_request_count == fc);
++    assert(cellGcmSetFlipImmediate(2) == CELL_OK);
++    assert(s_flip_request_count == fc + 1 && s_flip_pending == 1 && noted == 2);
++    /* A second immediate flip of the same buffer, not prepared again, is the
++     * old direct flip, not a replay of the prepared one. */
++
++    /* Less than 2 words left: the title's own callback is called with
++     * (context, 2), and the command goes where it moved current. */
++    set_ctx(BUF, BUF + 0x1000, BUF + 0xFFC);
++    assert(cellGcmSetPrepareFlip((void*)(uintptr_t)CTX, 0) == 0);
++    assert(cb_calls == 1 && cb_ctx == CTX && cb_count == 2);
++    assert(vm_read32(BUF + 0x2000) == 0x0004FEACu && vm_read32(BUF + 0x2004) == 0);
++    assert(vm_read32(CTX + 8) == BUF + 0x2008);
++
++    /* The race the atomics settle: both sides at once still give one present. */
++    s_flip_pending = 0; fc = s_flip_request_count;
++    assert(gcm_prepared_reached(0) == 0);
++    assert(cellGcmSetFlipImmediate(0) == CELL_OK && s_flip_request_count == fc + 1);
++    assert(!s_pf_prepared && !s_pf_wanted);
++    puts("cellGcmSetPrepareFlip returns the buffer id, writes the 2-word command into the"
++         " title's context (its callback makes room), and one present follows each"
++         " prepare + immediate flip: passed");
+     return 0;
+ }
+--- a/libs/video/tests/test_gcm_resync_labels.c
++++ b/libs/video/tests/test_gcm_resync_labels.c
+@@ -122,6 +122,7 @@
+ int main(void)
+ {
+     setvbuf(stdout, NULL, _IONBF, 0);
++    setenv("GCM_PARK_HOLE_GRACE_MS", "200", 1);
+     const uint32_t vm_size = ppu_hle_inject_base + 0x10000u;
+     vm_base = (uint8_t*)calloc(1, vm_size);
+     if (!vm_base) { puts("FAIL: guest VM alloc"); return 1; }
+@@ -162,6 +163,37 @@
+           seen_m[1] == 0x1D74u && seen_v[1] == 0x133u,
+           "the skipped NV4097 offset and release reached rsx_process_method, in order");
+ 
++    /* A hole: a park in a command block past put, with commands already
++     * written after it (an SPU job fills it later). It waits longer than a
++     * segment-end park (GCM_PARK_HOLE_GRACE_MS, 200 ms here), and when it
++     * does resync, the rest of the block's sync writes still land. */
++    const u32 blk = 0x8000u;
++    u32 b = blk;
++    gw32(IO_ADDR + b, 0x20000000u | b); b += 4;         /* the hole */
++    b = put_method(b, 0x0064u, 0x0050u);
++    b = put_method(b, 0x006Cu, 0xBEEF0001u);
++    gw32(IO_ADDR + b, 0xFFFFFFFFu);                     /* not a command: the tail ends */
++    const u32 put2 = put + 0x40u;
++    s_fifo_getoff = blk;
++    vm_write32(ctrl + 0, put2);
++    cellGcm_rsx_process_fifo();
++    wait_past_grace();
++    cellGcm_rsx_process_fifo();
++    check(s_fifo_getoff == blk, "a hole outlasts the 50 ms grace of a segment end");
++    const unsigned long long t0 = ps3_ms_now();
++    while (ps3_ms_now() - t0 <= 220u) {
++#ifdef _WIN32
++        Sleep(5);
++#else
++        struct timespec ts = {0, 5000000};
++        nanosleep(&ts, NULL);
++#endif
++    }
++    cellGcm_rsx_process_fifo();
++    check(s_fifo_getoff == put2, "past its own limit the hole resyncs to put");
++    check(vm_read32(GCM_LABEL_GUEST_BASE + 0x50u) == 0xBEEF0001u,
++          "the release in the abandoned block's tail was written to its label");
++
+     printf("[gcm_resync_labels] %s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
+     free(vm_base);
+     return fails ? 1 : 0;
+--- a/libs/video/tests/test_rsx_draw_engine.c
++++ b/libs/video/tests/test_rsx_draw_engine.c
+@@ -1205,6 +1205,16 @@
+     rsx_draw_engine_present_buffer(1);
+     CHECK(g_present_rect.n == 1 && stub.n_present == presents + 1 && presented_surface == big,
+           "a display buffer the target's size presents it whole");
++
++    /* Only a surface of another pitch at the buffer's address: the video out
++     * would scan it at the buffer's pitch, so no crop of it is shown; the last
++     * rectangle of that size is presented again (surface 0). */
++    rsx_draw_engine_set_display_buffer(2, RSX_LOCATION_LOCAL, 0x40000, 2048, 200, 150);
++    rsx_draw_engine_present_buffer(2);
++    CHECK(g_present_rect.n == 2 && g_present_rect.surface == 0 &&
++          g_present_rect.w == 200 && g_present_rect.h == 150 && stub.n_present == presents + 2,
++          "a pitch mismatch presents the last 200x150 image again (%d, surface %u, %ux%u, %d)",
++          g_present_rect.n, g_present_rect.surface, g_present_rect.w, g_present_rect.h, stub.n_present - presents);
+     engine_down();
+ }
+ 
