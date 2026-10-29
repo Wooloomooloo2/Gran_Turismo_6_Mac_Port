@@ -365,10 +365,17 @@ target_include_directories(gt6 PRIVATE
     "${CMAKE_CURRENT_BINARY_DIR}"
 )
 target_link_libraries(gt6 PRIVATE ps3recomp_runtime)
-# The POST_BUILD step also records the hash of the submodule's working tree at link time, so
-# an edit outside the patch series (a debug line) makes the other builds stale (D47).
+# The tree stamp (D72): every object of gt6 and of the runtime depends on a file that changes
+# when the submodule's working-tree hash does, so a changed tree recompiles them all even when
+# a source's modification time is older than its object (a `cp -p` restore).
+include("${CMAKE_CURRENT_SOURCE_DIR}/tree_stamp.cmake")
+set(GT6_TREE_STAMP "${CMAKE_CURRENT_BINARY_DIR}/ps3recomp_tree.stamp")
+gt6_tree_stamp(gt6_tree_stamp SUB "${PS3RECOMP_DIR}" STAMP "${GT6_TREE_STAMP}"
+               TARGETS gt6 ps3recomp_runtime)
+# The POST_BUILD step records the tree hash from the stamp, the tree every object was compiled
+# from, so an edit outside the patch series (a debug line) makes the other builds stale (D47).
 add_custom_command(TARGET gt6 POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -DSUB=${PS3RECOMP_DIR}
+    COMMAND ${CMAKE_COMMAND} -DSTAMP=${GT6_TREE_STAMP}
                              -DIN=${CMAKE_CURRENT_BINARY_DIR}/gt6.image.pending
                              -DOUT=$<TARGET_FILE_DIR:gt6>/gt6.image
                              -P ${CMAKE_CURRENT_SOURCE_DIR}/write_image.cmake

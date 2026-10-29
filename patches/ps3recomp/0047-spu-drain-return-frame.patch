@@ -1,0 +1,163 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] SPU drain: a call's return counts only in the call's frame
+
+Upstream: not yet submitted; written to be upstreamed (generic)
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0046)
+
+What: 0043 made the interpreter stop at a call's return point only when $sp
+is back at or above the call's (spu_ret_frame_reached). The drain's two
+exits still matched by address alone, so a return to the same point from a
+deeper frame -- a recursive call through one call site, reaching the drain
+as a queued transfer when the return point is a lifted entry -- left the
+outer host frame with the inner frame's state. Both exits now require the
+frame too (SPU_RET_SP_ANY, the direct-call drains, still matches any). A
+return turned down by the frame check is noted, at most 8 times each, by
+the interpreter ("[spu_interp] return to ... from a deeper frame runs on")
+and by the drain ("[spu] drain: return to ..."): code that breaks the ABI
+(a lower $sp at its return) would run on through its caller from there.
+Batch 11 review M-2 and M-3.
+Reference: the SPU ABI (the stack grows down; a callee returns with its
+caller's $sp); no emulator code.
+Tests: runtime/spu/tests/test_spu_interpreter_handoff.c, new mode
+nested-return-recursive-lifted (0x204 lifted; fails on the address-only
+drain), and the runner requires both notes.
+diff --git a/runtime/spu/spu_drain.c b/runtime/spu/spu_drain.c
+--- a/runtime/spu/spu_drain.c
++++ b/runtime/spu/spu_drain.c
+@@ -568,11 +568,22 @@ static void spu_drain_call_sp(spu_context* ctx, uint32_t return_pc, uint32_t ret
+ #define SPU_DRAIN_POP_IRQ() do { if (ctx->irq_frame == &f) ctx->irq_frame = f.prev; ctx->drain_ret_pc = outer_ret_pc; ctx->drain_ret_sp = outer_ret_sp; } while (0)
+     for (;;) {
+         while (*tramp) {
++            /* The call's return point, in the call's frame (or an outer
++             * one): a return to it from a deeper frame (a recursive call
++             * through the same site) runs on (batch 11 review M-2). */
+             if (*tramp == spu_indirect_branch &&
+                 (ctx->pc & SPU_LS_MASK) == (return_pc & SPU_LS_MASK)) {
+-                *tramp = 0;
+-                SPU_DRAIN_POP_IRQ();
+-                return;
++                if (spu_ret_frame_reached(ctx, ret_sp)) {
++                    *tramp = 0;
++                    SPU_DRAIN_POP_IRQ();
++                    return;
++                }
++                { static int _n = 0; if (PS3_LOG_FIRST(_n, 8))
++                    fprintf(stderr, "[spu] drain: return to 0x%05X from a deeper frame runs on:"
++                            " $sp=0x%05X, the call's 0x%05X, img=%d\n",
++                            (unsigned)(return_pc & SPU_LS_MASK),
++                            (unsigned)(ctx->gpr[1]._u32[0] & SPU_LS_MASK), (unsigned)ret_sp,
++                            ctx->image_id); }
+             }
+             void (*fn)(spu_context*) = *tramp;
+             *tramp = 0;
+@@ -606,7 +617,8 @@ static void spu_drain_call_sp(spu_context* ctx, uint32_t return_pc, uint32_t ret
+             }
+             fn(ctx);
+         }
+-        if ((ctx->pc & SPU_LS_MASK) == (return_pc & SPU_LS_MASK)) {
++        if ((ctx->pc & SPU_LS_MASK) == (return_pc & SPU_LS_MASK) &&
++            spu_ret_frame_reached(ctx, ret_sp)) {
+             SPU_DRAIN_POP_IRQ();
+             return;
+         }
+diff --git a/runtime/spu/spu_interp.c b/runtime/spu/spu_interp.c
+--- a/runtime/spu/spu_interp.c
++++ b/runtime/spu/spu_interp.c
+@@ -504,6 +504,19 @@ uint32_t spu_interp_run_until_frame(spu_context* ctx, uint32_t start_lsa, uint32
+         /* stop_lsa counts only in stop_sp's frame or an outer one: a recursive
+          * call through the same site returns there from a deeper frame and
+          * must run on (spu_ret_frame_reached; batch 10 review M-1). */
++        /* A return the frame check turns down is noted, a few times: code
++         * that does not follow the ABI (a lower $sp at its return, a switched
++         * stack) would run on through its caller from here, and this line is
++         * what points at it (batch 11 review M-3). Recursion prints it too. */
++        if (ctx->image_id >= 0 && stop_lsa && ctx->pc == stop_lsa &&
++            !spu_ret_frame_reached(ctx, stop_sp)) {
++            static int s_rejected;
++            if (s_rejected < 8 && ++s_rejected)
++                fprintf(stderr, "[spu_interp] return to 0x%05X from a deeper frame runs on:"
++                        " $sp=0x%05X, the call's 0x%05X, img=%d\n", (unsigned)stop_lsa,
++                        (unsigned)(ctx->gpr[1]._u32[0] & SPU_LS_MASK), (unsigned)stop_sp,
++                        ctx->image_id);
++        }
+         if (ctx->image_id >= 0 && ((stop_lsa && ctx->pc == stop_lsa && spu_ret_frame_reached(ctx, stop_sp)) ||
+                                    spu_lifted_lookup(ctx, ctx->pc))) { g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }  /* rejoin fast path */
+         g_spu_interp_last_pc = ctx->pc;
+diff --git a/runtime/spu/tests/test_spu_interpreter_handoff.c b/runtime/spu/tests/test_spu_interpreter_handoff.c
+--- a/runtime/spu/tests/test_spu_interpreter_handoff.c
++++ b/runtime/spu/tests/test_spu_interpreter_handoff.c
+@@ -38,6 +38,15 @@ static void wrong_continuation(spu_context* c) {
+ static void tail_entry(spu_context* c) {
+     c->pc = 0x4000; g_spu_trampoline_fn = spu_indirect_branch;
+ }
++/* Lifted code at 0x204 (nested-return-recursive-lifted, batch 11 review
++ * M-2): what the interpreted words there do -- pop the inner frame, count,
++ * and return through $0 to 0x204 again, now in F's frame. */
++static void recursive_lifted_204(spu_context* c) {
++    c->gpr[1]._u32[0] += 32;
++    c->gpr[21]._u32[0]++;
++    c->pc = c->gpr[0]._u32[0] & SPU_LS_MASK;
++    g_spu_trampoline_fn = spu_indirect_branch;
++}
+ static int queued_call, indirect_call, nested_indirect;
+ /* Lifted G (nested-indirect-restores-outer): calls unlifted K through bisl
+  * (return 0x304), then, as if restoring its link from its frame, branches
+@@ -84,8 +93,10 @@ int main(int argc, char** argv) {
+     spu_begin_image(77);
+     spu_register_function(0x200, helper);
+     if (strcmp(mode, "nested-return-unlifted") && strcmp(mode, "nested-return-indirect-call") &&
+-        strcmp(mode, "nested-return-recursive") && strcmp(mode, "nested-indirect-restores-outer"))
++        strncmp(mode, "nested-return-recursive", 23) && strcmp(mode, "nested-indirect-restores-outer"))
+         spu_register_function(0x204, wrong_continuation);
++    if (!strcmp(mode, "nested-return-recursive-lifted"))
++        spu_register_function(0x204, recursive_lifted_204);
+     if (!strcmp(mode, "nested-indirect-restores-outer")) spu_register_function(0x6000, g_lifted);
+     spu_register_function(0x240, finish);
+     if (!strcmp(mode, "top-zero")) spu_register_function(0, finish);
+@@ -106,7 +117,7 @@ int main(int argc, char** argv) {
+         word(0x204, 0x1C004A95); /* ai $21,$21,1: must NOT be interpreted */
+         word(0x208, 0x30004800); /* bra 0x240 */
+         word(0x4004, 0x35000000); /* bi $0 -> 0x204 */
+-        if (!strcmp(mode, "nested-return-recursive")) {
++        if (!strncmp(mode, "nested-return-recursive", 23)) {
+             /* Batch 10 review M-1: the callee returns to 0x204 first from a
+              * deeper frame (a recursive call through the same site), which
+              * must run on; 0x204 then pops that frame and returns to 0x204
+@@ -183,7 +194,10 @@ int main(int argc, char** argv) {
+         assert(g_spu_trampoline_fn == NULL);
+         puts("PASS"); return 0;
+     }
+-    if (!strcmp(mode, "nested-return-recursive")) {
++    if (!strncmp(mode, "nested-return-recursive", 23)) {
++        /* -lifted: 0x204 is a lifted entry, so the inner return reaches the
++         * drain as a queued transfer to 0x204 from the deeper frame; the
++         * drain must run it, not return to F (batch 11 review M-2). */
+         assert(ctx.gpr[21]._u32[0] == 1);              /* the inner return ran on */
+         assert(ctx.gpr[1]._u32[0] == 0x3F000);         /* stopped in F's frame */
+         ctx.gpr[21]._u32[0] = 0;
+diff --git a/tools/test_spu_interpreter_handoff.py b/tools/test_spu_interpreter_handoff.py
+--- a/tools/test_spu_interpreter_handoff.py
++++ b/tools/test_spu_interpreter_handoff.py
+@@ -23,7 +23,7 @@ with tempfile.TemporaryDirectory(prefix='spu-interp-handoff-') as tmp:
+                     str(root/'runtime/platform/win32_compat.c'), '-pthread', '-lm',
+                     '-o', str(binary)], check=True)
+     failed = []
+-    for mode in ['top', 'top-zero', 'nested-return', 'nested-return-unlifted', 'nested-return-indirect-call', 'nested-return-recursive', 'nested-indirect-restores-outer', 'nested-calls', 'stop-zero',
++    for mode in ['top', 'top-zero', 'nested-return', 'nested-return-unlifted', 'nested-return-indirect-call', 'nested-return-recursive', 'nested-return-recursive-lifted', 'nested-indirect-restores-outer', 'nested-calls', 'stop-zero',
+                  'nested-stop', 'stop-code', 'halt', 'smc', 'smc-ldst', 'smc-ldst-diag', 'pure-interpreter', 'stepcap', 'negative-stepcap']:
+         env = {k: v for k, v in os.environ.items()
+                if not k.startswith(('SPU_', 'SPURS_', 'YDKJ_', 'LBP_', 'GH3_'))}
+@@ -35,5 +35,12 @@ with tempfile.TemporaryDirectory(prefix='spu-interp-handoff-') as tmp:
+         if result.returncode:
+             print(result.stderr[-2500:])
+             failed.append(mode)
++        # Batch 11 review M-3: the return turned down by the frame check is
++        # noted (the interpreter's in -recursive, the drain's in -lifted).
++        note = {'nested-return-recursive': '[spu_interp] return to 0x00204 from a deeper frame runs on',
++                'nested-return-recursive-lifted': '[spu] drain: return to 0x00204 from a deeper frame runs on'}
++        if mode in note and note[mode] not in result.stderr:
++            print(f'{mode}: no note of the deeper return:\n{result.stderr[-1500:]}')
++            failed.append(mode)
+     if failed:
+         raise SystemExit('FAILED: ' + ', '.join(failed))

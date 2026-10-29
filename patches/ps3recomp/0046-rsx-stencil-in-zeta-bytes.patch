@@ -1,0 +1,310 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] RSX engine: the stencil is part of the zeta's bytes
+
+Upstream: not yet submitted; written to be upstreamed (generic)
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0045)
+
+What: on the RSX a Z24S8 zeta is one big-endian word per pixel, depth in the
+top 24 bits and the stencil in the low byte, and a texture over the zeta's
+address reads those bytes. Two gaps made the stencil byte read as 0:
+(1) a draw that writes only the stencil (stencil test on, a writable plane,
+an operation that is not KEEP; colour and depth writes off) and a clear of
+the stencil alone did not count as writes to the zeta, so a later read of it
+as A8R8G8B8 reused the bytes converted before them; (2) the Metal backend's
+depth_as_color pass, which makes those bytes on the GPU, wrote 0 for the
+stencil. It now reads the stencil through an X32_Stencil8 view of the depth
+texture (engine depth targets get MTLTextureUsagePixelFormatView for it).
+GT6's vector font draws glyph coverage into the stencil that way and then
+samples its zeta as A8R8G8B8 to cover it, so no text was drawn. The store
+through guest memory (eng_zdepth_to_guest) still writes a 0 stencil byte.
+Also: the pass dump's per-draw lines give the stencil state, and each
+texture's pitch and crossbar.
+Reference: the RSX Z24S8 surface layout (depth << 8 | stencil) the engine's
+guest store already uses; no emulator code.
+Tests: libs/video/tests/test_rsx_draw_engine.c, a stencil-only draw and a
+stencil-only clear convert the zeta again, a draw that cannot write the
+stencil does not; libs/video/tests/test_metal_depth_as_color.m (now run by
+tools/test_metal_depth_as_color.py), every converted texel holds the
+stencil written as its fourth Z24S8 byte.
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -1564,6 +1564,22 @@ static int eng_zdepth_to_guest(u32 slot)
+     return 1;
+ }
+ 
++/* Whether a draw can change the zeta's stencil byte: the test is on, some
++ * plane is writable and an operation of a face it can rasterise is not KEEP
++ * (GL's 0x1E00, as SET_STENCIL_OP_* take it). On the RSX the stencil is the
++ * low byte of each Z24S8 word, so such a draw writes the zeta's memory as a
++ * depth write does, and a later read of that memory as a texture sees it
++ * (D71: GT6's vector font writes glyph coverage to the stencil with colour
++ * and depth writes off, then reads the zeta as A8R8G8B8). */
++static int eng_stencil_writes(const rsx_be_render_state* rs)
++{
++    if (!rs->stencil_enable || !(rs->s_write_mask & 0xFFu)) return 0;
++    const u32 keep = 0x1E00u;
++    if (rs->s_fail != keep || rs->s_zfail != keep || rs->s_zpass != keep) return 1;
++    return rs->stencil_two_sided &&
++           (rs->bs_fail != keep || rs->bs_zfail != keep || rs->bs_zpass != keep);
++}
++
+ /* A depth write or clear through the current zeta, recorded with what the
+  * guest-memory copy needs to lay it out. */
+ static void eng_zdepth_wrote(u32 slot, const rsx_dsp_surface* sf)
+@@ -2909,9 +2925,10 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
+     }
+     if (s_pd.draws_log) {
+         fprintf(s_pd.draws_log, "pass %03u draw %u: pipe %u cmask %08X blend %u %X/%X"
+-                " dt %u dw %u at %u |", s_pd.pass, s_pd.draws, pipeline, rs->color_mask,
+-                rs->blend_enable, rs->sf_rgb, rs->df_rgb, rs->depth_test, rs->depth_write,
+-                rs->alpha_test_enable);
++                " dt %u dw %u at %u st %u %X/%X/%X wm %02X |", s_pd.pass, s_pd.draws,
++                pipeline, rs->color_mask, rs->blend_enable, rs->sf_rgb, rs->df_rgb,
++                rs->depth_test, rs->depth_write, rs->alpha_test_enable, rs->stencil_enable,
++                rs->s_fail, rs->s_zfail, rs->s_zpass, rs->s_write_mask);
+         if (rsx_dsp_reg(&g.rsx, M_POLY_OFFSET_FILL) & 1u) {
+             const u32 f = rsx_dsp_reg(&g.rsx, M_POLY_OFFSET_FACTOR);
+             const u32 b = rsx_dsp_reg(&g.rsx, M_POLY_OFFSET_BIAS);
+@@ -2924,8 +2941,8 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
+             if (!(tex_mask & (1u << u))) continue;
+             rsx_dsp_texture t;
+             rsx_dsp_get_texture(&g.rsx, u, &t);
+-            fprintf(s_pd.draws_log, " t%u %u:0x%08X f%02X %ux%u", u, t.location, t.offset,
+-                    t.format & 0xFFu, t.width, t.height);
++            fprintf(s_pd.draws_log, " t%u %u:0x%08X f%02X %ux%u p%u r%04X", u, t.location,
++                    t.offset, t.format & 0xFFu, t.width, t.height, t.pitch, t.remap & 0xFFFFu);
+         }
+         fprintf(s_pd.draws_log, "\n");
+     }
+@@ -3273,6 +3290,10 @@ static void sink_end(void* user, const rsx_dispatch* r)
+     if (zslot != ENG_INVALID && rs.depth_test && rs.depth_write) {
+         g.zdepths[zslot].had_write = 1;
+         eng_zdepth_wrote(zslot, &sf);
++    } else if (zslot != ENG_INVALID && sf.depth_format != 1u && eng_stencil_writes(&rs)) {
++        /* Stencil only: the depth values are unchanged (had_write, the
++         * depth snapshot's input, stays), the zeta's memory is not. */
++        eng_zdepth_wrote(zslot, &sf);
+     }
+ }
+ 
+@@ -3378,6 +3399,10 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
+             if (!partial) g.zdepths[zslot].had_write = 0;
+             g.zdepths[zslot].snapshot_valid = 0;
+             eng_zdepth_wrote(zslot, &sf);
++        } else if (!z16) {
++            /* A stencil-only clear rewrites the low byte of every Z24S8 word
++             * it covers (D71). */
++            eng_zdepth_wrote(zslot, &sf);
+         }
+     }
+ }
+diff --git a/libs/video/rsx_metal_backend.m b/libs/video/rsx_metal_backend.m
+--- a/libs/video/rsx_metal_backend.m
++++ b/libs/video/rsx_metal_backend.m
+@@ -2809,9 +2809,11 @@ static const char* kEngDepthColorMSL =
+ "    return s < 64u ? (uint)(((m << bits) - m + (1ul << (s - 1u))) >> s) : 0u;\n"
+ "}\n"
+ "fragment float4 eng_depth_argb_fs(AOut i [[stage_in]],\n"
+-"                                  depth2d<float> src [[texture(0)]]) {\n"
++"                                  depth2d<float> src [[texture(0)]],\n"
++"                                  texture2d<uint> stencil [[texture(1)]]) {\n"
+ "    const uint v = eng_depth_round(src.read(uint2(i.pos.xy)), 24u);\n"
+-"    return float4(float((v >> 8) & 0xFFu), float(v & 0xFFu), 0.0, float(v >> 16)) / 255.0;\n"
++"    const uint s = stencil.read(uint2(i.pos.xy)).r & 0xFFu;\n"
++"    return float4(float((v >> 8) & 0xFFu), float(v & 0xFFu), float(s), float(v >> 16)) / 255.0;\n"
+ "}\n"
+ "fragment float4 eng_depth_d16_fs(AOut i [[stage_in]],\n"
+ "                                 depth2d<float> src [[texture(0)]]) {\n"
+@@ -3232,8 +3234,11 @@ static u32 eng_depth_target_create(void* user, u32 w, u32 h)
+                                                            width:w height:h
+                                                        mipmapped:NO];
+     /* ShaderRead as well as RenderTarget: depth-as-texture resolves through a
+-     * pass that samples this as a depth2d, so it cannot be write-only. */
+-    td.usage       = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
++     * pass that samples this as a depth2d, so it cannot be write-only.
++     * PixelFormatView: that pass reads the stencil through an X32_Stencil8
++     * view of it (D71). */
++    td.usage       = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead |
++                     MTLTextureUsagePixelFormatView;
+     td.storageMode = MTLStorageModePrivate;
+     return eng_obj_add([s_dev newTextureWithDescriptor:td]);
+ }
+@@ -3989,6 +3994,13 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+             s_ft_resolves++;
+             [e setRenderPipelineState:pso];
+             [e setFragmentTexture:src atIndex:0];
++            /* Z24S8's low byte is the stencil (D71): the A8R8G8B8 pass reads
++             * it through a stencil view of the same texture. */
++            if ([dst pixelFormat] != MTLPixelFormatR16Unorm) {
++                id<MTLTexture> sv = [src newTextureViewWithPixelFormat:MTLPixelFormatX32_Stencil8];
++                if (!sv) { [e endEncoding]; s_eng_encoding_failed = 1; continue; }
++                [e setFragmentTexture:sv atIndex:1];
++            }
+             [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+             [e endEncoding];
+             continue;
+diff --git a/libs/video/tests/test_metal_depth_as_color.m b/libs/video/tests/test_metal_depth_as_color.m
+--- a/libs/video/tests/test_metal_depth_as_color.m
++++ b/libs/video/tests/test_metal_depth_as_color.m
+@@ -8,12 +8,14 @@
+  * clang -fobjc-arc -I include -I libs/video
+  * libs/video/tests/test_metal_depth_as_color.m libs/video/rsx_texture_layout.c libs/video/rsx_shader_msl.cpp -lc++
+  * -Wl,-dead_strip -framework Metal -framework Cocoa -framework QuartzCore
+- * -o /tmp/test_metal_depth_as_color */
++ * -o /tmp/test_metal_depth_as_color
++ * (tools/test_metal_depth_as_color.py builds and runs it.) */
+ #include "../rsx_metal_backend.m"
+ #include <math.h>
+ #include <stdio.h>
+ 
+ float cellAvconfExt_display_gamma(void) { return 1.0f; }
++void rsx_draw_engine_frame_counts(u32* draws, u32* clears) { *draws = 0; *clears = 0; }
+ 
+ static int failures, checks;
+ #define CHECK(v, name) do { checks++; if (!(v)) { failures++; fprintf(stderr, "FAIL %s\n", name); } } while (0)
+@@ -23,8 +25,9 @@ static const char* fixture =
+ "#include <metal_stdlib>\nusing namespace metal;\n"
+ "struct V { float4 p [[position]]; };\n"
+ "vertex V vs(uint i [[vertex_id]]) { float2 p[3] = {float2(-1,-1), float2(3,-1), float2(-1,3)}; return {float4(p[i], 0, 1)}; }\n"
+-"struct D { float d [[depth(any)]]; };\n"
+-"fragment D depth_fs(V v [[stage_in]], texture2d<float> t [[texture(0)]]) { return {t.read(uint2(v.p.xy)).r}; }\n"
++"struct D { float d [[depth(any)]]; uint s [[stencil]]; };\n"
++"fragment D depth_fs(V v [[stage_in]], texture2d<float> t [[texture(0)]]) {\n"
++"    uint2 q = uint2(v.p.xy); return {t.read(q).r, (q.x * 7u + q.y * 13u + 1u) & 0xFFu}; }\n"
+ "fragment float4 copy_fs(V v [[stage_in]], texture2d<float> t [[texture(0)]]) { return t.read(uint2(v.p.xy)); }\n";
+ 
+ static int complete(id<MTLCommandBuffer> cb) { [cb commit]; [cb waitUntilCompleted]; return cb.status == MTLCommandBufferStatusCompleted && !cb.error; }
+@@ -64,6 +67,11 @@ static int pass(id<MTLRenderPipelineState> pso, id<MTLTexture> src, id<MTLTextur
+     if (depth) {
+         MTLDepthStencilDescriptor* ds = [MTLDepthStencilDescriptor new];
+         ds.depthCompareFunction = MTLCompareFunctionAlways; ds.depthWriteEnabled = YES;
++        /* The fixture's stencil values, exported by depth_fs, are written by REPLACE. */
++        MTLStencilDescriptor* sd = [MTLStencilDescriptor new];
++        sd.stencilCompareFunction = MTLCompareFunctionAlways;
++        sd.depthStencilPassOperation = MTLStencilOperationReplace;
++        ds.frontFaceStencil = sd; ds.backFaceStencil = sd;
+         [e setDepthStencilState:[s_dev newDepthStencilStateWithDescriptor:ds]];
+     }
+     [e setRenderPipelineState:pso];
+@@ -130,7 +138,9 @@ int main(void)
+             if (!(d > 0.0f)) d = 0.0f;
+             if (d > 1.0f) d = 1.0f;
+             const u32 v = (u32)((double)d * 16777215.0 + 0.5);
+-            packed[4 * i] = (u8)(v >> 16); packed[4 * i + 1] = (u8)(v >> 8); packed[4 * i + 2] = (u8)v; packed[4 * i + 3] = 0;
++            /* Z24S8: the stencil is the word's low byte (D71); depth_fs wrote this one. */
++            const u32 st = ((i % W) * 7u + (i / W) * 13u + 1u) & 0xFFu;
++            packed[4 * i] = (u8)(v >> 16); packed[4 * i + 1] = (u8)(v >> 8); packed[4 * i + 2] = (u8)v; packed[4 * i + 3] = (u8)st;
+         }
+         rsx_tex_layout tl; rsx_texture_layout(0xA5, W, H, &tl);
+         rsx_texture_decode(want, W * 4, packed, W, H, &tl, 0);
+@@ -159,7 +169,7 @@ int main(void)
+                             back[i], got[4 * i], got[4 * i + 1], got[4 * i + 2], got[4 * i + 3],
+                             want[4 * i], want[4 * i + 1], want[4 * i + 2], want[4 * i + 3]);
+             }
+-        CHECK(bad == 0, "every texel is the decode of the Z24S8 bytes");
++        CHECK(bad == 0, "every texel is the decode of the Z24S8 bytes, stencil byte included");
+ 
+         /* Through the crossbar a title reads depth bytes with: the view samples as the upload does. */
+         const u32 view = eng_surface_view(NULL, argb, 0xAA93, 0xE5);
+diff --git a/libs/video/tests/test_rsx_draw_engine.c b/libs/video/tests/test_rsx_draw_engine.c
+--- a/libs/video/tests/test_rsx_draw_engine.c
++++ b/libs/video/tests/test_rsx_draw_engine.c
+@@ -1954,6 +1954,62 @@ static void test_z16_read_as_depth16_on_gpu(void)
+     engine_down();
+ }
+ 
++/* D71: on the RSX the stencil is the low byte of each Z24S8 word, so a draw
++ * that writes only the stencil (colour and depth writes off), or a clear of
++ * the stencil alone, changes what reading the zeta as A8R8G8B8 gives, and
++ * the converted texture must be made again. GT6's vector font draws its
++ * glyphs that way and then samples the zeta it drew them into. */
++static void stencil_only_draw(u32 write_mask, u32 zpass_op)
++{
++    m(0x0328 /* STENCIL_TEST_ENABLE */, 1u);
++    m(0x032C /* STENCIL_MASK (write) */, write_mask);
++    m(0x0330 /* STENCIL_FUNC */, 0x0207u);          /* ALWAYS */
++    m(0x033C /* OP_FAIL */, 0x1E00u);
++    m(0x0340 /* OP_ZFAIL */, 0x1E00u);
++    m(0x0344 /* OP_ZPASS */, zpass_op);
++    m(M_COLOR_MASK, 0u);
++    m(M_DEPTH_TEST, 0u);
++    m(M_DEPTH_WRITE, 0u);
++    m(M_TEX_UNIT + 0x0C, 0u);
++    draw_triangle();
++    m(0x0328, 0u);
++    m(M_COLOR_MASK, 0x01010101u);
++    m(M_TEX_UNIT + 0x0C, 0x80000000u);              /* the unit back on */
++}
++
++static void test_stencil_write_changes_zeta_bytes(void)
++{
++    printf("-- a stencil-only draw or clear makes the zeta's A8R8G8B8 bytes again\n");
++    engine_up();
++    rsx_draw_backend be = g_stub_backend;
++    be.depth_as_color = stub_depth_as_color;
++    rsx_draw_engine_set_backend(&be);
++    g_argb_calls = 0; g_argb_fail = 0;
++
++    depth_pass_then_read_ex(256u * 4u, 1);       /* the zeta stays bound */
++    draw_triangle();
++    CHECK(g_argb_calls == 1, "converted once (%d calls)", g_argb_calls);
++    draw_triangle();
++    CHECK(g_argb_calls == 1, "nothing written since: reused (%d calls)", g_argb_calls);
++
++    stencil_only_draw(0xFFu, 0x150Au);            /* INVERT */
++    draw_triangle();
++    CHECK(g_argb_calls == 2, "a stencil-only draw: converted again (%d calls)", g_argb_calls);
++
++    stencil_only_draw(0x00u, 0x150Au);            /* no plane writable */
++    draw_triangle();
++    stencil_only_draw(0xFFu, 0x1E00u);            /* every op KEEP */
++    draw_triangle();
++    CHECK(g_argb_calls == 2, "a draw that cannot write the stencil: reused (%d calls)",
++          g_argb_calls);
++
++    m(M_ZSTENCIL_CLEAR, 0xFFFFFF00u);
++    m(M_CLEAR_BUFFERS, 0x02u);                    /* the stencil alone */
++    draw_triangle();
++    CHECK(g_argb_calls == 3, "a stencil-only clear: converted again (%d calls)", g_argb_calls);
++    engine_down();
++}
++
+ /* A depth-writing draw through a 256x256 Z24S8 zeta at `offset`; returns the
+  * depth target it was given, or 0. */
+ static u32 depth_draw_at(u32 offset)
+@@ -2515,6 +2571,7 @@ int main(void)
+     test_depth_snapshot_release();
+     test_depth_read_as_argb_on_gpu();
+     test_z16_read_as_depth16_on_gpu();
++    test_stencil_write_changes_zeta_bytes();
+     test_full_tables_evict_the_oldest();
+     test_color_read_as_float();
+     test_engine_rewrite_reuploads();
+diff --git a/tools/test_metal_depth_as_color.py b/tools/test_metal_depth_as_color.py
+new file mode 100644
+--- /dev/null
++++ b/tools/test_metal_depth_as_color.py
+@@ -0,0 +1,21 @@
++#!/usr/bin/env python3
++"""Check the Metal backend's depth_as_color against the store through guest memory:
++Z24S8 read as A8R8G8B8 (depth bytes and the stencil byte) and Z16 read as DEPTH16."""
++import pathlib
++import platform
++import subprocess
++import tempfile
++ROOT = pathlib.Path(__file__).resolve().parents[1]
++if platform.system() != "Darwin":
++    print("SKIP: Metal requires macOS")
++    raise SystemExit(0)
++with tempfile.TemporaryDirectory(prefix="metal-depth-as-color-") as tmp:
++    binary = pathlib.Path(tmp) / "test"
++    subprocess.run(["clang", "-fobjc-arc", "-Iinclude", "-Ilibs/video",
++                    "libs/video/tests/test_metal_depth_as_color.m",
++                    "libs/video/rsx_texture_layout.c", "libs/video/rsx_shader_msl.cpp",
++                    "-lc++", "-Wl,-dead_strip",
++                    "-framework", "Metal", "-framework", "Cocoa",
++                    "-framework", "QuartzCore", "-o", str(binary)],
++                   cwd=ROOT, check=True, timeout=120)
++    subprocess.run([str(binary)], check=True, timeout=30)

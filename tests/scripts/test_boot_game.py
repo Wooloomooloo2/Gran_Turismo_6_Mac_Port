@@ -173,6 +173,15 @@ def test_host_pads_are_ignored_unless_asked(tree, tmp_path, monkeypatch):
     assert boot_game.build_env(tree, tmp_path, True, None)["PAD_NO_HOST"] == "1"
 
 
+def test_host_pad_run_records_it(tree, tmp_path):
+    """Batch 11 review M-6: a --host-pad run says so in report.json and summary.md."""
+    rep = boot_game.boot(fake("crash", tmp_path), tree, seconds=30, idle=20, host_pad=True)
+    assert rep["host_pad"] is True
+    summary = (Path(rep["run"]) / "summary.md").read_text()
+    assert "Host controllers: read (--host-pad)" in summary
+    assert "ignored (D65)" not in summary
+
+
 def test_play_option_runs_on_a_sibling_folder(tree, tmp_path):
     """D49: play="play-x" checks and marks <tree>/play-x and points both file layers there."""
     (tree / "play-x").mkdir()
@@ -596,9 +605,73 @@ def test_tree_hash_python_and_cmake_agree_with_crlf(tmp_path):
     pending = tmp_path / "in.json"
     pending.write_text('{"self_sha256": "x"}\n')
     out = tmp_path / "out.json"
-    subprocess.run([cmake, f"-DSUB={sub}", f"-DIN={pending}", f"-DOUT={out}", "-P",
+    stamp = tmp_path / "tree.stamp"
+    subprocess.run([cmake, f"-DSUB={sub}", f"-DSTAMP={stamp}", "-P",
+                    str(boot_game.REPO / "port" / "write_tree_stamp.cmake")], check=True)
+    subprocess.run([cmake, f"-DSTAMP={stamp}", f"-DIN={pending}", f"-DOUT={out}", "-P",
                     str(boot_game.REPO / "port" / "write_image.cmake")], check=True)
     assert json.loads(out.read_text())["ps3recomp_tree"] == boot_game.ps3recomp_tree_hash(sub)
+
+
+def test_tree_stamp_rebuilds_a_source_restored_with_its_old_time(tmp_path):
+    """D72 (batch 11's stale binary): a submodule source changed, built, then copied back
+    with its old modification time (`cp -p`) is older than its object, so the build tool
+    alone keeps the changed object. The tree stamp (port/tree_stamp.cmake, as the port uses
+    it) makes every object depend on the tree hash: the rebuilt program runs the restored
+    code, and the image records the tree it was built from."""
+    cmake, ninja = shutil.which("cmake"), shutil.which("ninja")
+    if not (cmake and ninja):
+        pytest.skip("cmake and ninja not installed")
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    subprocess.run(["git", "init", "-q", str(sub)], check=True)
+    (sub / "lib.c").write_text("int value(void) { return 1; }\n")
+    (sub / "CMakeLists.txt").write_text("add_library(sublib STATIC lib.c)\n")
+    subprocess.run(["git", "-C", str(sub), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(sub), "-c", "user.name=t", "-c", "user.email=t@t",
+                    "commit", "-q", "-m", "a"], check=True)
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / "main.c").write_text('#include <stdio.h>\nint value(void);\n'
+                                 'int main(void) { printf("%d\\n", value()); return 0; }\n')
+    (proj / "pending.json").write_text('{"self_sha256": "x"}\n')
+    port = (boot_game.REPO / "port").as_posix()
+    (proj / "CMakeLists.txt").write_text(f"""cmake_minimum_required(VERSION 3.24)
+project(t C)
+add_subdirectory("{sub.as_posix()}" sub)
+add_executable(app main.c)
+target_link_libraries(app PRIVATE sublib)
+include("{port}/tree_stamp.cmake")
+set(STAMP "${{CMAKE_BINARY_DIR}}/tree.stamp")
+gt6_tree_stamp(app_tree_stamp SUB "{sub.as_posix()}" STAMP "${{STAMP}}" TARGETS app sublib)
+add_custom_command(TARGET app POST_BUILD COMMAND ${{CMAKE_COMMAND}} -DSTAMP=${{STAMP}}
+    -DIN=${{CMAKE_SOURCE_DIR}}/pending.json -DOUT=$<TARGET_FILE_DIR:app>/app.image
+    -P "{port}/write_image.cmake")
+""")
+    build = tmp_path / "build"
+    subprocess.run([cmake, "-S", str(proj), "-B", str(build), "-G", "Ninja"], check=True,
+                   capture_output=True)
+
+    def build_and_run():
+        subprocess.run([cmake, "--build", str(build)], check=True, capture_output=True)
+        image = json.loads((build / "app.image").read_text())
+        return subprocess.run([str(build / "app")], capture_output=True, text=True,
+                              check=True).stdout.strip(), image["ps3recomp_tree"]
+
+    assert build_and_run() == ("1", boot_game.ps3recomp_tree_hash(sub))
+    saved = tmp_path / "lib.c.saved"
+    shutil.copy2(sub / "lib.c", saved)                       # the original, with its time
+    old = (sub / "lib.c").stat().st_mtime - 3600
+    os.utime(saved, (old, old))
+    time.sleep(1.1)
+    (sub / "lib.c").write_text("int value(void) { return 2; }\n")
+    assert build_and_run() == ("2", boot_game.ps3recomp_tree_hash(sub))
+    shutil.copy2(saved, sub / "lib.c")                       # `cp -p`: older than lib.c.o
+    assert build_and_run() == ("1", boot_game.ps3recomp_tree_hash(sub))
+    # Nothing changed: no rebuild, and the record stays.
+    p = subprocess.run([cmake, "--build", str(build)], check=True, capture_output=True,
+                       text=True)
+    assert "lib.c.o" not in p.stdout
 
 
 def test_tree_hash_ignores_external_diff_and_textconv(tmp_path):

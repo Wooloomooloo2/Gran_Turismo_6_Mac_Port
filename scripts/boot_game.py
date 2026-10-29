@@ -222,7 +222,7 @@ def current_patch_set():
 
 
 def ps3recomp_tree_hash(sub=None):
-    """SHA-256 of the ps3recomp submodule's working tree as port/write_image.cmake records it
+    """SHA-256 of the ps3recomp submodule's working tree as port/tree_hash.cmake computes it (the tree stamp, D72)
     in gt6.image ("ps3recomp_tree"): `git diff --no-ext-diff --no-textconv HEAD --binary` (no
     user diff driver can change it, review M-2), then "<path>\n<sha256>\n" for
     each untracked file git lists (--exclude-standard; __pycache__ and .pyc left out). It
@@ -238,7 +238,7 @@ def ps3recomp_tree_hash(sub=None):
     except (OSError, subprocess.CalledProcessError):
         return None
     # CMake's execute_process drops carriage returns from what it captures, so
-    # write_image.cmake hashes the diff without them; so does this (CRLF files exist).
+    # tree_hash.cmake hashes the diff without them; so does this (CRLF files exist).
     state = bytearray(diff.replace(b"\r", b""))
     for f in others:
         if not f or "/__pycache__/" in "/" + f or f.endswith(".pyc"):
