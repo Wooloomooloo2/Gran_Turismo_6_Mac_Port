@@ -315,6 +315,9 @@ def build_env(tree, run, headless, env, frame_every=60, frame_max=300, play=None
     # run's outcome could depend on what someone did with it; only --press drives the pad.
     if not host_pad:
         e["PAD_NO_HOST"] = "1"
+    else:
+        # A PAD_NO_HOST exported in the shell would otherwise still hide the pad.
+        e.pop("PAD_NO_HOST", None)
     images = images_env(tree)
     if images:
         e["GT6_IMAGES"] = images
@@ -556,7 +559,9 @@ def _summary(rep, tree):
              f"unimplemented system calls: {len(rep['unimplemented_syscalls'])}",
              f"- SPU images run in the interpreter (lift them: translate_game.py): "
              f"{len(rep['spu_interpreted'])}",
-             f"- Run folder: {rep['run']}"]
+             f"- Run folder: {rep['run']}",
+             "- Host controllers: " + ("read (--host-pad)" if rep.get("host_pad")
+                                       else "ignored (D65)")]
     for sha in rep.get("no_matching_build", []):
         lines.append(f"- **No build for the play folder's EMAIN.SELF** (sha256 {sha[:16]}...): "
                      f"the image ran another executable's translation (D44)")
@@ -709,6 +714,7 @@ def boot(gt6, tree, seconds=300, idle=60, headless=True, env=None, until="flip",
         "play": str(play_dir),
         "play_reused": reused,
         "unchecked_build": unchecked,
+        "host_pad": bool(host_pad),
         "backtraces": backtraces,
         "pid": proc.pid,
         "run": str(run),

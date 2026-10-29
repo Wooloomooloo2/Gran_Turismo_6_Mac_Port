@@ -1,0 +1,99 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] ppu lifter: a constant jump-table base built from another register's lis
+
+Upstream: not yet submitted; written to be upstreamed (generic)
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0041)
+
+What: discover_jump_tables accepted a constant table base only as
+`lis rB,hi; addi rB,rB,lo`. Compilers also emit `lis r9,hi; addi r19,r9,lo`
+(the base kept in a callee-saved register across a loop around the
+dispatch, as in a byte-code interpreter). The addi's source register is now
+followed to its own nearest definition, which must be the lis. Before, such
+a dispatcher was dropped and its bctr lifted to an unresolved indirect call:
+the case never ran and the caller went on with state the case should have
+built.
+Tests: tools/test_ppu_jumptables.py, two new vectors (lis into another
+register: found; the source last set by mr: not a constant base). The first
+fails on the old code.
+diff --git a/tools/ppu_lifter.py b/tools/ppu_lifter.py
+--- a/tools/ppu_lifter.py
++++ b/tools/ppu_lifter.py
+@@ -4781,15 +4781,23 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
+                                 disp = mem_disp(b[1]); r_base = cand
+                                 base_is_ld = (w2.mnemonic == 'ld')
+                             break               # nearest definition wins, TOC load or not
+-                elif w.mnemonic == 'addi' and len(a) == 3 and a[1] == cand:
++                elif w.mnemonic == 'addi' and len(a) == 3 and a[1] not in ('0', 'r0'):
+                     # CONSTANT base: `lis cand,hi; addi cand,cand,lo` puts the
+                     # table's own address in the register, no TOC involved
+                     # (Gran Turismo 6 func_00A3FEE0: a 7-entry offset table
+                     # inline after its bctr). Rejected as a non-TOC definition,
+                     # every case lifted to an unresolved indirect call.
++                    # The lis may target ANOTHER register: `lis r9,hi; addi
++                    # r19,r9,lo` in a prologue keeps the base in a callee-saved
++                    # register for a loop around the dispatch (Gran Turismo 6
++                    # func_01000B30, a 56-case byte-code interpreter: its cases
++                    # lifted to unresolved indirect calls that did nothing, and
++                    # the caller drew with half-built state). The source is
++                    # followed to ITS nearest definition, which must be the lis.
++                    _src_reg = a[1]
+                     for w2 in reversed([x for x in win_cand if x.addr < w.addr]):
+                         b = [x.strip() for x in w2.operands.split(',')]
+-                        if not b or b[0] != cand or w2.mnemonic.startswith(('st', 'lf')):
++                        if not b or b[0] != _src_reg or w2.mnemonic.startswith(('st', 'lf')):
+                             continue
+                         if w2.mnemonic == 'lis' and len(b) == 2:
+                             try:
+diff --git a/tools/test_ppu_jumptables.py b/tools/test_ppu_jumptables.py
+--- a/tools/test_ppu_jumptables.py
++++ b/tools/test_ppu_jumptables.py
+@@ -375,6 +375,8 @@ def main() -> int:
+     test_spilled_base_reused_as_target()
+     test_constant_table_base()
+     test_constant_table_base_needs_lis()
++    test_constant_table_base_from_other_register()
++    test_constant_table_base_other_register_needs_lis()
+     if FAILS:
+         print(f"FAILED: {', '.join(FAILS)}")
+         return 1
+@@ -517,5 +519,39 @@ def test_constant_table_base_needs_lis():
+     check("addi onto a register last set by mr is not a constant base", discover(words, mem), None)
+ 
+ 
++def test_constant_table_base_from_other_register():
++    """The lis targets one register and the addi puts the base in another,
++    a callee-saved one the dispatch reads in a loop:
++
++        lis r9,1 ; addi r19,r9,0x1C ; lwzx r9,r19,r0 ; extsw r9,r9
++        add r9,r9,r19 ; mtctr r9 ; bctr
++
++    Gran Turismo 6 func_01000B30 (a 56-case byte-code interpreter). Before,
++    only `addi r19,r19,lo` was followed, so the cases lifted to unresolved
++    indirect calls.
++    """
++    table = TEXT_LO + 0x1C
++    words = [w_lis(9, 1), w_addi(19, 9, 0x1C), w_lwzx(9, 19, 0), w_extsw(9, 9),
++             w_add(9, 9, 19), w_mtctr(9), w_bctr()]
++    mem = {table: 0x0C, table + 4: 0x10, table + 8: 0xFFFFFFFF}
++    check("constant base, lis into another register", discover(words, mem),
++          [table + 0x0C, table + 0x10])
++
++
++def test_constant_table_base_other_register_needs_lis():
++    """`addi r19,r9,lo` is a constant base only when r9's nearest earlier
++    definition is `lis`; here `mr r9,r3` comes between:
++
++        lis r9,1 ; mr r9,r3 ; addi r19,r9,0x20 ; lwzx r9,r19,r0 ; extsw r9,r9
++        add r9,r9,r19 ; mtctr r9 ; bctr
++    """
++    table = TEXT_LO + 0x20
++    words = [w_lis(9, 1), w_mr(9, 3), w_addi(19, 9, 0x20), w_lwzx(9, 19, 0), w_extsw(9, 9),
++             w_add(9, 9, 19), w_mtctr(9), w_bctr()]
++    mem = {table: 0x0C, table + 4: 0x10, table + 8: 0xFFFFFFFF}
++    check("addi from a register last set by mr is not a constant base",
++          discover(words, mem), None)
++
++
+ if __name__ == "__main__":
+     sys.exit(main())

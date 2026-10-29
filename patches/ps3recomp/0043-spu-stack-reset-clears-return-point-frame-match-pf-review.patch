@@ -1,0 +1,589 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] SPU: a one-way stack reset clears the return point; interpreted returns match the call's frame; page-fault review fixes
+
+Upstream: not yet submitted; written to be upstreamed (generic, no title names)
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0042)
+
+What:
+- spu_run_with_halt's one-way stack reset (halt env case 2, reached through
+  spu_restart_dispatch when a return lands where no drain waits) now clears
+  drain_ret_pc, drain_ret_sp and irq_frame: no host frame survives the reset,
+  so no return point does. Before, the innermost drain's return point stayed
+  set; when the guest later returned to exactly that address at depth 0, the
+  interpreter stopped on its first instruction, no trampoline was queued, and
+  the run ended there (a SPURS policy module's run ended mid-job, stranding
+  the jobs it had claimed).
+- spu_indirect_call records the call's $sp (drain_ret_sp); the interpreter
+  stops at the return point only when $sp is at or above it (the call's own
+  frame or an outer one), so a recursive call through the same site, which
+  returns to the same address from a deeper frame, runs on.
+  spu_interp_run_until_frame is the new entry; spu_interp_run_until keeps
+  its behaviour (any frame). Direct calls' drains do not know the frame and
+  match any (SPU_RET_SP_ANY).
+- sys_mmapper_pf: the slot state word (claim count above the state byte) is
+  unsigned, so the count wraps without signed overflow. The test-only 57 hook
+  gets the slot index, with an accessor for its owner (PS3_PF_TEST only).
+Tests: runtime/spu/tests/test_spu_interpreter_handoff.c, new modes
+nested-return-recursive (fails on the pc-only match) and
+nested-indirect-restores-outer (fails if spu_indirect_call does not restore
+the outer return point); tests/test_mmapper_page_fault.c checks that the
+ABA test's second claimant holds the scanned slot, and that each forked
+child stopped on the expected diagnostic, not on any abort.
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -413,6 +413,13 @@ typedef struct spu_context {
+      * manager then ran its buffer loop a second time on the job's registers
+      * and died in its own assert (the song-freeze). */
+     uint32_t drain_ret_pc;
++    /* $sp (preferred word) of the call drain_ret_pc returns to, or
++     * SPU_RET_SP_ANY when the call's frame is not known (a direct call's
++     * drain). The interpreter stops at drain_ret_pc only in that frame or an
++     * outer one: a recursive call through the same site returns to the same
++     * address from a deeper frame (lower $sp), and must run on (batch 10
++     * review M-1). */
++    uint32_t drain_ret_sp;
+ 
+     /* Set by another host thread to stop this SPU from outside: a raw SPU's
+      * PPU writing SPU_RunCntl = 0 (spu_raw.c). Lifted code never looks at it;
+@@ -480,6 +487,17 @@ static inline void spu_context_init(spu_context* ctx, uint32_t spu_id)
+     ctx->status = SPU_STATUS_STOPPED;
+ }
+ 
++/* drain_ret_sp when the call's frame is unknown: every $sp is at or above it. */
++#define SPU_RET_SP_ANY 0u
++
++/* Whether the interpreter, at drain_ret_pc, is back in the frame of the call
++ * that set it (or an outer one). The stack grows down, and a callee returns
++ * with the $sp it was called with. */
++static inline int spu_ret_frame_reached(const spu_context* ctx, uint32_t ret_sp)
++{
++    return (ctx->gpr[1]._u32[0] & SPU_LS_MASK) >= ret_sp;
++}
++
+ /* ---------------------------------------------------------------------------
+  * Local store access helpers
+  * -----------------------------------------------------------------------*/
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -315,6 +315,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
+     ctx->host_depth = 0;
+     ctx->irq_frame = 0;
+     ctx->drain_ret_pc = 0;
++    ctx->drain_ret_sp = SPU_RET_SP_ANY;
+     /* Nest-safe: a job run synchronously from inside another SPU's execution
+      * re-enters here on the same host thread. The halt target is per-thread,
+      * so save the outer one and put it back on the way out -- otherwise the
+@@ -340,6 +341,12 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
+          * Re-enter its target with the same guest state on the driver stack. */
+         ctx->host_depth = 0;
+         g_spu_trampoline_fn = 0;
++        /* No host frame survives the reset, so no return point or interrupt
++         * frame does either: a stale one would stop an interpreted target at
++         * a return no drain waits for (batch 10 review M-2). */
++        ctx->drain_ret_pc = 0;
++        ctx->drain_ret_sp = SPU_RET_SP_ANY;
++        ctx->irq_frame = 0;
+         spu_indirect_branch(ctx);
+         SPU_DRAIN(ctx);
+         break;
+@@ -2580,14 +2587,15 @@ static int spu_smc_microstep(spu_context* ctx)
+          * no lifted entry, and a job's return would otherwise run on through
+          * the caller's code (GH3's song-freeze; see drain_ret_pc). */
+         const uint32_t return_pc = ctx->drain_ret_pc;
+-        uint32_t result = spu_interp_run_until(ctx, pc, return_pc);
++        uint32_t result = spu_interp_run_until_frame(ctx, pc, return_pc, ctx->drain_ret_sp);
+         /* A live interpreter rejoin is a transfer, not a host return. Nested
+          * drains can repair an empty trampoline, but the top-level driver
+          * otherwise ends the run before executing the lifted target.
+          * An already-owning drain must retain its own host continuation;
+          * stopped states and diagnostic exits keep their existing behavior. */
+         if (ctx->image_id >= 0 && (ctx->status & SPU_STATUS_RUNNING) &&
+-            (!return_pc || (ctx->pc & SPU_LS_MASK) != return_pc) &&
++            (!return_pc || (ctx->pc & SPU_LS_MASK) != return_pc ||
++             !spu_ret_frame_reached(ctx, ctx->drain_ret_sp)) &&
+             spu_lifted_lookup(ctx, ctx->pc)) {
+             g_spu_trampoline_fn = spu_indirect_branch;
+             return 1;
+diff --git a/runtime/spu/spu_drain.c b/runtime/spu/spu_drain.c
+--- a/runtime/spu/spu_drain.c
++++ b/runtime/spu/spu_drain.c
+@@ -538,7 +538,9 @@ typedef void (*spu_drain_fn)(spu_context*);
+ extern spu_drain_fn spu_lookup(uint32_t addr, int image_id);
+ 
+ 
+-void spu_drain_call(spu_context* ctx, uint32_t return_pc)
++/* ret_sp: the call's $sp (preferred word), or SPU_RET_SP_ANY when the caller
++ * does not know it (see drain_ret_sp). */
++static void spu_drain_call_sp(spu_context* ctx, uint32_t return_pc, uint32_t ret_sp)
+ {
+     if (__builtin_expect(g_spu_direct < 0, 0)) spu_direct_init();
+     spu_depth_guard_check(ctx);
+@@ -547,6 +549,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
+      * SPU_DIRECT the code after a call can tail-call on for a long while
+      * before it takes a step. */
+     const uint32_t outer_ret_pc = ctx->drain_ret_pc;
++    const uint32_t outer_ret_sp = ctx->drain_ret_sp;
+     /* The frame an interrupt taken in THIS loop returns to. It stays armed
+      * after the handler's first host function returns -- the handler keeps
+      * running as trampolines of this loop -- until its iret fires or the
+@@ -562,7 +565,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
+      * thread, so resolve it once per drain instead of once per access. */
+     void (**const tramp)(spu_context*) = &g_spu_trampoline_fn;
+ 
+-#define SPU_DRAIN_POP_IRQ() do { if (ctx->irq_frame == &f) ctx->irq_frame = f.prev; ctx->drain_ret_pc = outer_ret_pc; } while (0)
++#define SPU_DRAIN_POP_IRQ() do { if (ctx->irq_frame == &f) ctx->irq_frame = f.prev; ctx->drain_ret_pc = outer_ret_pc; ctx->drain_ret_sp = outer_ret_sp; } while (0)
+     for (;;) {
+         while (*tramp) {
+             if (*tramp == spu_indirect_branch &&
+@@ -574,6 +577,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
+             void (*fn)(spu_context*) = *tramp;
+             *tramp = 0;
+             ctx->drain_ret_pc = return_pc & SPU_LS_MASK;   /* re-set: a nested drain changed it */
++            ctx->drain_ret_sp = ret_sp;
+             spu_drain_hop_inline(ctx, fn, recent);
+             if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) {
+                 void (*vf)(spu_context*) = spu_take_interrupt(ctx, fn);
+@@ -629,6 +633,11 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
+ #undef SPU_DRAIN_POP_IRQ
+ }
+ 
++void spu_drain_call(spu_context* ctx, uint32_t return_pc)
++{
++    spu_drain_call_sp(ctx, return_pc, SPU_RET_SP_ANY);
++}
++
+ /* A lifted indirect call (bisl): dispatch the callee, then drain until it
+  * returns to return_pc. While the callee is dispatched, return_pc is already
+  * the innermost return point: a callee with no lifted code runs in the
+@@ -639,9 +648,16 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
+  * loops waiting for other return points. */
+ void spu_indirect_call(spu_context* ctx, uint32_t return_pc)
+ {
+-    const uint32_t outer_ret_pc = ctx->drain_ret_pc;
++    /* The call's frame: a callee returns with the $sp it was called with, and
++     * a recursive call through the same site returns to the same address from
++     * a deeper frame. The interpreter stops only in this frame or an outer one
++     * (batch 10 review M-1). */
++    const uint32_t ret_sp = ctx->gpr[1]._u32[0] & SPU_LS_MASK;
++    const uint32_t outer_ret_pc = ctx->drain_ret_pc, outer_ret_sp = ctx->drain_ret_sp;
+     ctx->drain_ret_pc = return_pc & SPU_LS_MASK;
++    ctx->drain_ret_sp = ret_sp;
+     spu_indirect_branch(ctx);
+-    ctx->drain_ret_pc = outer_ret_pc;   /* spu_drain_call keeps the outer one for its exit */
+-    spu_drain_call(ctx, return_pc);
++    ctx->drain_ret_pc = outer_ret_pc;   /* the drain keeps the outer one for its exit */
++    ctx->drain_ret_sp = outer_ret_sp;
++    spu_drain_call_sp(ctx, return_pc, ret_sp);
+ }
+diff --git a/runtime/spu/spu_interp.c b/runtime/spu/spu_interp.c
+--- a/runtime/spu/spu_interp.c
++++ b/runtime/spu/spu_interp.c
+@@ -451,6 +451,11 @@ static void interp_stats_step(const spu_context* ctx)
+ }
+ 
+ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa) {
++    return spu_interp_run_until_frame(ctx, start_lsa, stop_lsa, SPU_RET_SP_ANY);
++}
++
++uint32_t spu_interp_run_until_frame(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa,
++                                    uint32_t stop_sp) {
+     if (interp_stats_on()) {
+         /* Credit an entry inside a resident code region to the image that
+          * owns it, so the list names the lift that's missing the entry. */
+@@ -496,8 +501,11 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
+          * functions (image_id >= 0). image_id < 0 = pure interpretation: an
+          * un-lifted image (e.g. a title's raw SPU jobs) must never rejoin
+          * another image's functions that happen to share an LS address. */
+-        /* ponytail: pc-only match; a recursive call through the same site would stop early -- compare r1 too if one shows up. */
+-        if (ctx->image_id >= 0 && ((stop_lsa && ctx->pc == stop_lsa) || spu_lifted_lookup(ctx, ctx->pc))) { g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }  /* rejoin fast path */
++        /* stop_lsa counts only in stop_sp's frame or an outer one: a recursive
++         * call through the same site returns there from a deeper frame and
++         * must run on (spu_ret_frame_reached; batch 10 review M-1). */
++        if (ctx->image_id >= 0 && ((stop_lsa && ctx->pc == stop_lsa && spu_ret_frame_reached(ctx, stop_sp)) ||
++                                   spu_lifted_lookup(ctx, ctx->pc))) { g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }  /* rejoin fast path */
+         g_spu_interp_last_pc = ctx->pc;
+         if (_g1>0) {
+             int inr = (ctx->pc >= 0x26E80u && ctx->pc < 0x26F14u);
+diff --git a/runtime/spu/spu_interp.h b/runtime/spu/spu_interp.h
+--- a/runtime/spu/spu_interp.h
++++ b/runtime/spu/spu_interp.h
+@@ -34,6 +34,11 @@ uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa);
+ /* As spu_interp_run, but also hands back at stop_lsa (0 = no such point): the
+  * return point of the drain the caller goes back to (spu_smc_microstep). */
+ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa);
++/* As spu_interp_run_until, but stop_lsa stops the run only when $sp is at or
++ * above stop_sp (the frame of the call that returns there, or an outer one;
++ * SPU_RET_SP_ANY = any frame). */
++uint32_t spu_interp_run_until_frame(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa,
++                                    uint32_t stop_sp);
+ 
+ /* The single dispatch point every computed branch routes through. If `target`
+  * is a registered lifted entry, runs it; otherwise interprets from `target`.
+diff --git a/runtime/spu/tests/test_spu_interpreter_handoff.c b/runtime/spu/tests/test_spu_interpreter_handoff.c
+--- a/runtime/spu/tests/test_spu_interpreter_handoff.c
++++ b/runtime/spu/tests/test_spu_interpreter_handoff.c
+@@ -38,11 +38,28 @@ static void wrong_continuation(spu_context* c) {
+ static void tail_entry(spu_context* c) {
+     c->pc = 0x4000; g_spu_trampoline_fn = spu_indirect_branch;
+ }
+-static int queued_call, indirect_call;
++static int queued_call, indirect_call, nested_indirect;
++/* Lifted G (nested-indirect-restores-outer): calls unlifted K through bisl
++ * (return 0x304), then, as if restoring its link from its frame, branches
++ * straight into unlifted code (an inline dispatch, no trampoline) that
++ * returns to F's return point 0x204. That code must stop at 0x204, which it
++ * does only if the outer return point was restored after the inner call. */
++static void g_lifted(spu_context* c) {
++    c->gpr[0] = spu_link(0x304);
++    c->host_depth++;
++    c->pc = 0x5000;
++    spu_indirect_call(c, 0x304);
++    c->host_depth--;
++    c->gpr[23]._u32[0] = c->pc;            /* where K's call came back */
++    c->gpr[0] = spu_link(0x204);
++    c->pc = 0x4100;
++    spu_indirect_branch(c);
++}
+ static void nested_entry(spu_context* c) {
+     c->gpr[0] = spu_link(0x204);
++    c->gpr[1]._u32[0] = 0x3F000;           /* F's frame */
+     c->host_depth++;
+-    c->pc = 0x4000;
++    c->pc = nested_indirect ? 0x6000 : 0x4000;
+     if (indirect_call) {
+         /* The lifted bisl bracket: the callee is dispatched at once, and an
+          * unlifted one is interpreted inside that dispatch, before any drain
+@@ -66,8 +83,10 @@ int main(int argc, char** argv) {
+     ctx.status = SPU_STATUS_RUNNING;
+     spu_begin_image(77);
+     spu_register_function(0x200, helper);
+-    if (strcmp(mode, "nested-return-unlifted") && strcmp(mode, "nested-return-indirect-call"))
++    if (strcmp(mode, "nested-return-unlifted") && strcmp(mode, "nested-return-indirect-call") &&
++        strcmp(mode, "nested-return-recursive") && strcmp(mode, "nested-indirect-restores-outer"))
+         spu_register_function(0x204, wrong_continuation);
++    if (!strcmp(mode, "nested-indirect-restores-outer")) spu_register_function(0x6000, g_lifted);
+     spu_register_function(0x240, finish);
+     if (!strcmp(mode, "top-zero")) spu_register_function(0, finish);
+     if (!strcmp(mode, "negative-stepcap")) {
+@@ -87,6 +106,28 @@ int main(int argc, char** argv) {
+         word(0x204, 0x1C004A95); /* ai $21,$21,1: must NOT be interpreted */
+         word(0x208, 0x30004800); /* bra 0x240 */
+         word(0x4004, 0x35000000); /* bi $0 -> 0x204 */
++        if (!strcmp(mode, "nested-return-recursive")) {
++            /* Batch 10 review M-1: the callee returns to 0x204 first from a
++             * deeper frame (a recursive call through the same site), which
++             * must run on; 0x204 then pops that frame and returns to 0x204
++             * again in F's frame, where the interpreter stops. */
++            queued_call = 0; indirect_call = 1;
++            word(0x4004, 0x1CF80081); /* ai $1,$1,-32: a deeper frame */
++            word(0x4008, 0x35000000); /* bi $0 -> 0x204 (inner return) */
++            word(0x204, 0x1C080081);  /* ai $1,$1,32: back to F's frame */
++            word(0x208, 0x1C004A95);  /* ai $21,$21,1: runs once, inner frame */
++            word(0x20C, 0x35000000);  /* bi $0 -> 0x204 (F's return) */
++        }
++    } else if (!strcmp(mode, "nested-indirect-restores-outer")) {
++        /* Batch 10 review M-3: F -bisl-> lifted G -bisl-> unlifted K; then G
++         * goes into unlifted code that returns to F's 0x204. */
++        entry = nested_entry; indirect_call = 1; nested_indirect = 1;
++        word(0x204, 0x1C004A95);  /* ai $21,$21,1: must NOT be interpreted */
++        word(0x304, 0x1C005B16);  /* ai $22,$22,1: K's return, must NOT be interpreted */
++        word(0x5000, 0x04000082); /* K: ori $2,$1,0 */
++        word(0x5004, 0x35000000); /* bi $0 -> 0x304 */
++        word(0x4100, 0x04000082); /* ori $2,$1,0 */
++        word(0x4104, 0x35000000); /* bi $0 -> 0x204 */
+     } else if (!strcmp(mode, "nested-calls")) {
+         entry = nested_entry;
+         word(0x4004, 0x31004000); /* brasl $0,0x200 */
+@@ -142,6 +183,15 @@ int main(int argc, char** argv) {
+         assert(g_spu_trampoline_fn == NULL);
+         puts("PASS"); return 0;
+     }
++    if (!strcmp(mode, "nested-return-recursive")) {
++        assert(ctx.gpr[21]._u32[0] == 1);              /* the inner return ran on */
++        assert(ctx.gpr[1]._u32[0] == 0x3F000);         /* stopped in F's frame */
++        ctx.gpr[21]._u32[0] = 0;
++    }
++    if (!strcmp(mode, "nested-indirect-restores-outer")) {
++        assert(ctx.gpr[23]._u32[0] == 0x304);          /* K's call came back to G */
++        assert(ctx.gpr[22]._u32[0] == 0);              /* and 0x304 was not interpreted */
++    }
+     assert(ctx.gpr[21]._u32[0] == 0);
+     if (!strncmp(mode, "smc-ldst", 8)) {
+         for (int k = 0; k < 4; k++) {
+@@ -168,7 +218,8 @@ int main(int argc, char** argv) {
+     }
+     assert(halted == 1 && ctx.status == SPU_STATUS_STOPPED_BY_STOP);
+     assert(ctx.gpr[11]._u32[0] == 1);
+-    assert(ctx.gpr[20]._u32[0] == (!strncmp(mode, "nested-return", 13) ? 1u : 0u));
++    assert(ctx.gpr[20]._u32[0] == (!strncmp(mode, "nested-return", 13) ||
++                                   !strcmp(mode, "nested-indirect-restores-outer") ? 1u : 0u));
+     assert(ctx.gpr[10]._u32[0] == (!strcmp(mode, "nested-calls") ? 2u : 0u));
+     puts("PASS"); return 0;
+ }
+diff --git a/tools/test_spu_interpreter_handoff.py b/tools/test_spu_interpreter_handoff.py
+--- a/tools/test_spu_interpreter_handoff.py
++++ b/tools/test_spu_interpreter_handoff.py
+@@ -23,7 +23,7 @@ with tempfile.TemporaryDirectory(prefix='spu-interp-handoff-') as tmp:
+                     str(root/'runtime/platform/win32_compat.c'), '-pthread', '-lm',
+                     '-o', str(binary)], check=True)
+     failed = []
+-    for mode in ['top', 'top-zero', 'nested-return', 'nested-return-unlifted', 'nested-return-indirect-call', 'nested-calls', 'stop-zero',
++    for mode in ['top', 'top-zero', 'nested-return', 'nested-return-unlifted', 'nested-return-indirect-call', 'nested-return-recursive', 'nested-indirect-restores-outer', 'nested-calls', 'stop-zero',
+                  'nested-stop', 'stop-code', 'halt', 'smc', 'smc-ldst', 'smc-ldst-diag', 'pure-interpreter', 'stepcap', 'negative-stepcap']:
+         env = {k: v for k, v in os.environ.items()
+                if not k.startswith(('SPU_', 'SPURS_', 'YDKJ_', 'LBP_', 'GH3_'))}
+diff --git a/tools/test_spu_smc_lqa_stqa.py b/tools/test_spu_smc_lqa_stqa.py
+--- a/tools/test_spu_smc_lqa_stqa.py
++++ b/tools/test_spu_smc_lqa_stqa.py
+@@ -53,6 +53,8 @@ void spu_ls_watch_slow(uint32_t lsa, int is_write, const uint8_t* p, uint32_t pc
+ void spu_indirect_branch(spu_context* ctx) { (void)ctx; }
+ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t a, uint32_t b)
+ { (void)ctx; (void)a; (void)b; return 0; }
++uint32_t spu_interp_run_until_frame(spu_context* ctx, uint32_t a, uint32_t b, uint32_t c)
++{ (void)ctx; (void)a; (void)b; (void)c; return 0; }
+ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)   /* #266's rejoin check */
+ { (void)ctx; (void)lsa; return NULL; }
+ 
+diff --git a/runtime/syscalls/sys_mmapper_pf.c b/runtime/syscalls/sys_mmapper_pf.c
+--- a/runtime/syscalls/sys_mmapper_pf.c
++++ b/runtime/syscalls/sys_mmapper_pf.c
+@@ -92,12 +92,12 @@ enum {
+     PF_FREEING   = 4,   /* being freed by a 57 or a destroy */
+ };
+ #define PF_STATE(w) ((w) & 0xFF)
+-#define PF_GEN      0x100
++#define PF_GEN      0x100u
+ typedef struct pf_fault {
+     volatile uint64_t tid;        /* 0 = free slot */
+     volatile uint32_t addr;
+     volatile uint32_t qid;        /* the queue its event went to */
+-    volatile int      state;
++    volatile uint32_t state;      /* unsigned: the claim count above the state byte wraps (batch 10 review M-4) */
+ } pf_fault;
+ 
+ static mm_object s_obj[MM_OBJ_MAX];
+@@ -274,23 +274,27 @@ static void pf_nap_ms(void)
+ }
+ 
+ #ifdef PS3_PF_TEST
+-void (*ps3_pf_test_57_hook)(int where);
+-#define PF_TEST_HOOK(w) do { if (ps3_pf_test_57_hook) ps3_pf_test_57_hook(w); } while (0)
++void (*ps3_pf_test_57_hook)(int where, int slot);
++#define PF_TEST_HOOK(w, k) do { if (ps3_pf_test_57_hook) ps3_pf_test_57_hook(w, k); } while (0)
++uint64_t ps3_pf_test_slot_tid(int slot)
++{
++    return (slot >= 0 && slot < PF_FAULT_MAX) ? __atomic_load_n(&s_fault[slot].tid, __ATOMIC_ACQUIRE) : 0;
++}
+ #else
+-#define PF_TEST_HOOK(w) do { } while (0)
++#define PF_TEST_HOOK(w, k) do { } while (0)
+ #endif
+ 
+ /* Move the slot from the word `seen` (as read) to state `to`, keeping its
+  * claim count. Fails if anything changed the word since it was read. */
+-static int pf_cas_word(pf_fault* f, int seen, int to)
++static int pf_cas_word(pf_fault* f, uint32_t seen, uint32_t to)
+ {
+-    return __atomic_compare_exchange_n(&f->state, &seen, (seen & ~0xFF) | to, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
++    return __atomic_compare_exchange_n(&f->state, &seen, (seen & ~0xFFu) | to, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+ }
+ 
+ /* Move the slot from state `from` to `to` within its current claim. */
+-static int pf_cas_state(pf_fault* f, int from, int to)
++static int pf_cas_state(pf_fault* f, uint32_t from, uint32_t to)
+ {
+-    int w = __atomic_load_n(&f->state, __ATOMIC_ACQUIRE);
++    uint32_t w = __atomic_load_n(&f->state, __ATOMIC_ACQUIRE);
+     return PF_STATE(w) == from && pf_cas_word(f, w, to);
+ }
+ 
+@@ -362,7 +366,7 @@ static LONG WINAPI pf_veh(EXCEPTION_POINTERS* ep)
+     /* A new claim: the next claim count, WAITING. Only the claimant writes a
+      * slot whose tid it has just taken; a scanner holding a word from before
+      * the free cannot CAS it any more. */
+-    __atomic_store_n(&f->state, (int)((__atomic_load_n(&f->state, __ATOMIC_RELAXED) & ~0xFF) + PF_GEN) | PF_WAITING,
++    __atomic_store_n(&f->state, ((__atomic_load_n(&f->state, __ATOMIC_RELAXED) & ~0xFFu) + PF_GEN) | PF_WAITING,
+                      __ATOMIC_RELEASE);
+     /* A full queue refuses the event: wait and send again, as RPCS3 models
+      * lv2 (every 1 ms, RPCS3's interval). Never map zeros. A queue that is gone can never be
+@@ -481,7 +485,7 @@ int64_t sys_ppu_thread_recover_page_fault(ppu_context* ctx)
+      * event was sent first, and the pager answers events in order. */
+     if (!tid) return (int64_t)(int32_t)CELL_EINVAL;
+     for (int pass = 0; pass < 2; pass++) {
+-        if (pass) PF_TEST_HOOK(0);
++        if (pass) PF_TEST_HOOK(0, -1);
+         for (int i = 0; i < PF_FAULT_MAX; i++) {
+             pf_fault* f = &s_fault[i];
+             if ((__atomic_load_n(&f->tid, __ATOMIC_ACQUIRE) & 0xFFFFFFFFull) != tid) continue;
+@@ -491,7 +495,7 @@ int64_t sys_ppu_thread_recover_page_fault(ppu_context* ctx)
+              * newer claim's shows that claim's tid on the re-read; and a free and
+              * re-claim after the read moves the claim count, so the CAS fails. */
+             if (!pass) {   /* detached: nobody waits on it, free the slot */
+-                int w = __atomic_load_n(&f->state, __ATOMIC_ACQUIRE);
++                uint32_t w = __atomic_load_n(&f->state, __ATOMIC_ACQUIRE);
+                 if ((__atomic_load_n(&f->tid, __ATOMIC_ACQUIRE) & 0xFFFFFFFFull) != tid) continue;
+                 if (PF_STATE(w) == PF_DETACHED && pf_cas_word(f, w, PF_FREEING)) { pf_free(f); return CELL_OK; }
+                 continue;
+@@ -502,9 +506,9 @@ int64_t sys_ppu_thread_recover_page_fault(ppu_context* ctx)
+              * moved (WAITING to DETACHED or ORPHANED): look again. Bounded:
+              * a slot's state only moves forward until it is freed. */
+             for (;;) {
+-                int w = __atomic_load_n(&f->state, __ATOMIC_ACQUIRE), st = PF_STATE(w);
++                uint32_t w = __atomic_load_n(&f->state, __ATOMIC_ACQUIRE), st = PF_STATE(w);
+                 if ((__atomic_load_n(&f->tid, __ATOMIC_ACQUIRE) & 0xFFFFFFFFull) != tid) break;
+-                PF_TEST_HOOK(1);
++                PF_TEST_HOOK(1, i);
+                 if (st == PF_WAITING) {
+                     if (pf_cas_word(f, w, PF_RECOVERED)) return CELL_OK;
+                 } else if (st == PF_DETACHED) {
+diff --git a/runtime/syscalls/sys_mmapper_pf.h b/runtime/syscalls/sys_mmapper_pf.h
+--- a/runtime/syscalls/sys_mmapper_pf.h
++++ b/runtime/syscalls/sys_mmapper_pf.h
+@@ -44,10 +44,12 @@ void ps3_pf_queue_destroyed(uint32_t queue_id);
+ 
+ #ifdef PS3_PF_TEST
+ /* Test builds only (built with -DPS3_PF_TEST; not in a title's build): lv2 57
+- * calls it between its two scans (0) and in its second scan between reading a
+- * slot's state and its CAS (1), so a test can force a host thread's detach
+- * into exactly those windows. */
+-extern void (*ps3_pf_test_57_hook)(int where);
++ * calls it between its two scans (0, slot -1) and in its second scan between
++ * reading a slot's state and its CAS (1, the slot's index), so a test can
++ * force a host thread's detach into exactly those windows. */
++extern void (*ps3_pf_test_57_hook)(int where, int slot);
++/* The fault id holding a slot (0 = free), for a test hook to name the slot. */
++uint64_t ps3_pf_test_slot_tid(int slot);
+ #endif
+ 
+ void sys_mmapper_pf_init(lv2_syscall_table* tbl);
+diff --git a/tests/test_mmapper_page_fault.c b/tests/test_mmapper_page_fault.c
+--- a/tests/test_mmapper_page_fault.c
++++ b/tests/test_mmapper_page_fault.c
+@@ -57,6 +57,31 @@ PVOID AddVectoredExceptionHandler(ULONG first, PVECTORED_EXCEPTION_HANDLER h)
+  * writes no report for it (it reports every death by SIGABRT/SIGSEGV). */
+ static void quiet_abort(int sig) { _exit(128 + sig); }
+ 
++/* fork() with the child's stderr going to a pipe, so the parent can require
++ * the diagnostic of the abort it expects: exit status 134 alone would also
++ * pass an unrelated assert() or abort() in the child (batch 10 review M-6). */
++static pid_t fork_err(int* rd)
++{
++    int p[2];
++    assert(pipe(p) == 0);
++    fflush(stdout); fflush(stderr);
++    pid_t pid = fork();
++    if (pid == 0) { close(p[0]); dup2(p[1], 2); close(p[1]); return 0; }
++    close(p[1]);
++    *rd = p[0];
++    return pid;
++}
++static int wait_err(pid_t pid, int rd, char* buf, size_t cap)
++{
++    size_t n = 0; ssize_t r;
++    while (n + 1 < cap && (r = read(rd, buf + n, cap - 1 - n)) > 0) n += (size_t)r;
++    buf[n] = 0;
++    close(rd);
++    int st = 0;
++    waitpid(pid, &st, 0);
++    return st;
++}
++
+ static int fails;
+ #define CHECK(c, ...) do { const int ok_ = (c); printf(ok_ ? "[PASS] " : "[FAIL] "); printf(__VA_ARGS__); \
+                            printf("\n"); if (!ok_) fails++; } while (0)
+@@ -221,6 +246,7 @@ static void* ppu_round(void* arg)
+ static uint32_t g_aba_page_t, g_aba_page_u, g_aba_tid;
+ static volatile uint32_t g_aba_seen_t = 0xFFFFFFFFu, g_aba_seen_u = 0xFFFFFFFFu;
+ static int g_aba_fired;
++static uint64_t g_aba_slot_owner = ~0ull;   /* who holds the slot 57(T) was scanning, once U claimed */
+ static pthread_t g_aba_t, g_aba_u;
+ static void* aba_ppu(void* arg)
+ {
+@@ -233,7 +259,7 @@ static void* aba_ppu(void* arg)
+     if (self.thread_id == 21) g_aba_seen_t = v; else g_aba_seen_u = v;
+     return NULL;
+ }
+-static void hook_aba(int where)
++static void hook_aba(int where, int slot)
+ {
+     if (where != 1 || g_aba_fired) return;
+     g_aba_fired = 1;
+@@ -244,6 +270,7 @@ static void hook_aba(int where)
+     pthread_create(&g_aba_u, NULL, aba_ppu, (void*)(uintptr_t)22);
+     uint64_t e[4];
+     if (receive_into(g_q4, e) == CELL_OK && (e[2] & 0xFFFFFFFFu) == 22) g_aba_fired = 2;
++    g_aba_slot_owner = ps3_pf_test_slot_tid(slot);
+ }
+ 
+ /* Batch 8 review I-1, forced: the hook runs inside 57 at the window under
+@@ -252,8 +279,9 @@ static void hook_aba(int where)
+ static int g_hook_where = -1, g_hook_fired;
+ static pthread_t g_hook_thread;
+ static uint32_t g_hook_page;
+-static void hook_detach_now(int where)
++static void hook_detach_now(int where, int slot)
+ {
++    (void)slot;
+     if (where != g_hook_where || g_hook_fired) return;
+     g_hook_fired = 1;
+     ps3_mm_map(g_hook_page, ps3_mm_object_create(0x10000));
+@@ -386,7 +414,8 @@ int main(void)
+         assert(sys_event_queue_create(&c) == CELL_OK);
+         uint32_t qn = rd32(SCRATCH + 8);
+         fflush(stdout);
+-        pid_t pid = fork();
++        int rd = -1; char err[4096];
++        pid_t pid = fork_err(&rd);
+         if (pid == 0) {
+             signal(SIGABRT, quiet_abort);
+             ppu_context self; memset(&self, 0, sizeof self);
+@@ -397,10 +426,10 @@ int main(void)
+             (void)v;
+             _exit(0);                     /* reached only if the fault was answered */
+         }
+-        int st = 0;
+-        waitpid(pid, &st, 0);
++        int st = wait_err(pid, rd, err, sizeof err);
+         CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 128 + SIGABRT, "a fault after that stops the process (status 0x%X), new queue %u%s", st, qn,
+               qn == g_q3 ? " reused the id" : "");
++        CHECK(strstr(err, "[pf] FATAL") && strstr(err, "is gone"), "and it stopped on the queue-gone diagnostic");
+         uint64_t stray[4];
+         memset(&c, 0, sizeof c);
+         c.gpr[3] = qn; c.gpr[4] = SCRATCH + 0x300; c.gpr[5] = 1;   /* 1 us timeout */
+@@ -475,6 +504,10 @@ int main(void)
+             int64_t rc = recover(21);
+             ps3_pf_test_57_hook = NULL;
+             CHECK(g_aba_fired == 2, "m3: the hook ran the second 57 and U claimed a slot (%d)", g_aba_fired);
++            /* Batch 10 review M-5: U must hold the very slot 57(T) was scanning,
++             * or the EINVAL below would not prove the claim-count check. */
++            CHECK((g_aba_slot_owner & 0xFFFFFFFFull) == 22, "m3: U took the slot T freed (owner 0x%llX)",
++                  (unsigned long long)g_aba_slot_owner);
+             CHECK((uint32_t)rc == CELL_EINVAL, "m3: the first 57 for T does not answer U's reused slot (rc=0x%llX)", (unsigned long long)rc);
+             CHECK(g_aba_seen_u == 0xFFFFFFFFu, "m3: U is still waiting (seen 0x%X)", g_aba_seen_u);
+             ps3_mm_map(g_aba_page_u, ps3_mm_object_create(0x10000));
+@@ -488,7 +521,8 @@ int main(void)
+     {   /* M-2: a destroy with a PPU thread's event still queued stops the process;
+          * afterwards 327 can arm the area again. */
+         fflush(stdout);
+-        pid_t pid = fork();
++        int rd = -1; char err[4096];
++        pid_t pid = fork_err(&rd);
+         if (pid == 0) {
+             signal(SIGABRT, quiet_abort);
+             g_round_addr = g_area4 + 0x800010u;
+@@ -501,9 +535,10 @@ int main(void)
+             pthread_join(t, NULL);
+             _exit(0);
+         }
+-        int st = 0;
+-        waitpid(pid, &st, 0);
++        int st = wait_err(pid, rd, err, sizeof err);
+         CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 128 + SIGABRT, "M-2: the waiting thread takes the abort path (status 0x%X)", st);
++        CHECK(strstr(err, "[pf] FATAL") && strstr(err, "destroyed with the event in it"),
++              "M-2: and it stopped on the destroyed-queue diagnostic");
+         ppu_context c; memset(&c, 0, sizeof c);
+         c.gpr[3] = g_q4; c.gpr[4] = 0;
+         CHECK(sys_event_queue_destroy(&c) == CELL_OK, "M-2: the area's queue is destroyed");

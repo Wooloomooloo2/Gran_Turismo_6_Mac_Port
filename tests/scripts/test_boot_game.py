@@ -131,6 +131,9 @@ def test_boot_records_itself_and_warns_on_a_used_play_folder(tree, tmp_path, cap
     assert rec["booted"] == run
     assert rep["play_reused"] is None
     assert "prepare_play.py" not in capsys.readouterr().err
+    # The pad mode is recorded (batch 10 review M-7): host controllers ignored by default.
+    assert rep["host_pad"] is False
+    assert "Host controllers: ignored (D65)" in (Path(rep["run"]) / "summary.md").read_text()
     # A second boot on the same play folder still runs, but warns and says so in the report.
     rec["booted"] = "20000101-000000"
     (tree / "play" / "prepare.json").write_text(json.dumps(rec))
@@ -164,6 +167,10 @@ def test_host_pads_are_ignored_unless_asked(tree, tmp_path, monkeypatch):
     monkeypatch.delenv("PAD_NO_HOST", raising=False)
     assert boot_game.build_env(tree, tmp_path, True, None)["PAD_NO_HOST"] == "1"
     assert "PAD_NO_HOST" not in boot_game.build_env(tree, tmp_path, True, None, host_pad=True)
+    # An inherited PAD_NO_HOST does not override --host-pad (batch 10 review M-7).
+    monkeypatch.setenv("PAD_NO_HOST", "1")
+    assert "PAD_NO_HOST" not in boot_game.build_env(tree, tmp_path, True, None, host_pad=True)
+    assert boot_game.build_env(tree, tmp_path, True, None)["PAD_NO_HOST"] == "1"
 
 
 def test_play_option_runs_on_a_sibling_folder(tree, tmp_path):

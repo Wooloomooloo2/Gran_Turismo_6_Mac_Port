@@ -1,0 +1,70 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] RSX fragment programs: 64 temporary registers of each precision
+
+Upstream: not yet submitted; written to be upstreamed (generic)
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0043)
+
+What: the fragment-program decompiler declared its register files as
+r[48] and h[48], but an instruction's destination and source register
+fields are 6 bits wide, and real programs use the top of that range. Every
+program that names r48-r63 or h48-h63 failed HLSL parsing ("array index out
+of range") and its draws were dropped. Both files are now 64 deep (and
+zero-initialised as before).
+Tests: libs/video/tests/test_fp_decompiler.c, regs_64 (a program using r63
+and h62 declares both files 64 deep; fails on the old code).
+diff --git a/libs/video/rsx_fp_decompiler.c b/libs/video/rsx_fp_decompiler.c
+--- a/libs/video/rsx_fp_decompiler.c
++++ b/libs/video/rsx_fp_decompiler.c
+@@ -667,12 +667,16 @@ static int rsx_fp_decompile_internal(
+     Out o = { out, out_size, 0, 1 };
+     out[0] = '\0';
+     int uses_pack = 0;   /* a pack or unpack opcode was decoded: the preamble gets its helpers */
++    /* 64 of each: an instruction's register fields are 6 bits (OUT_REG,
++     * SRC_REG), and programs use the top of the range (Gran Turismo 6's
++     * scene shaders write r48-r63). With 48, HLSL rejected every such
++     * program ("array index out of range") and its draws were skipped. */
+     out_puts(&o,
+-        "    float4 r[48]; float4 h[48];\n"
++        "    float4 r[64]; float4 h[64];\n"
+         /* Fully initialise both register files: RSX programs routinely read a
+          * register lane before writing it (the hardware reads undefined), but
+          * HLSL rejects use-before-init (error X4000). Zero everything. */
+-        "    [unroll] for (int _i = 0; _i < 48; _i++) { r[_i] = (float4)0; h[_i] = (float4)0; }\n"
++        "    [unroll] for (int _i = 0; _i < 64; _i++) { r[_i] = (float4)0; h[_i] = (float4)0; }\n"
+         /* Condition-code registers for exec_if predication / set_cond. Reset
+          * to 0 (NV40 CC power-up state). Dead in non-predicated programs. */
+         "    float4 cc0 = (float4)0; float4 cc1 = (float4)0;\n");
+diff --git a/libs/video/tests/test_fp_decompiler.c b/libs/video/tests/test_fp_decompiler.c
+--- a/libs/video/tests/test_fp_decompiler.c
++++ b/libs/video/tests/test_fp_decompiler.c
+@@ -591,6 +591,29 @@ int main(void)
+ 
+     }
+ 
++    /* Register fields are 6 bits: r63 and h63 are real registers, and the
++     * register files must hold them (they were 48 deep, and HLSL rejected
++     * the program). MOV r63, COL0; MOV h62, r63; MOV r0, h62. */
++    {
++        u8 prog[48];
++        put_word(prog + 0, OPC(0x01) | OUTMASK_ALL | OUTREG(63) | INSRC(1)); /* MOV r63, COL0 */
++        put_word(prog + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
++        put_word(prog + 8, 0);
++        put_word(prog + 12, 0);
++        put_word(prog + 16, OPC(0x01) | OUTMASK_ALL | OUTREG(62) | OUTHALF); /* MOV h62, r63 */
++        put_word(prog + 20, T_TEMP | REG(63) | SWZ_IDENT | EXEC_ALWAYS);
++        put_word(prog + 24, 0);
++        put_word(prog + 28, 0);
++        put_word(prog + 32, OPC(0x01) | OUTMASK_ALL | OUTREG(0) | END);     /* MOV r0, h62 */
++        put_word(prog + 36, T_TEMP | REG(62) | (1u << 7) | SWZ_IDENT | EXEC_ALWAYS);
++        put_word(prog + 40, 0);
++        put_word(prog + 44, 0);
++        rsx_fp_decompile(prog, sizeof prog, CTRL_32BIT, hlsl, sizeof hlsl);
++        check("regs_64_decl", hlsl, "float4 r[64]; float4 h[64];");
++        check("regs_64_r63", hlsl, "r[63]");
++        check("regs_64_h62", hlsl, "h[62]");
++    }
++
+     printf("\n===========================================\n");
+     printf("Results: %d passed, %d failed\n", g_pass, g_fail);
+     return g_fail ? 1 : 0;

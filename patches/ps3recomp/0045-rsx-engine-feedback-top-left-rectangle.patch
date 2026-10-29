@@ -1,0 +1,204 @@
+From: Gran Turismo 6 for Mac <https://github.com/Wooloomooloo2/Gran-Turismo-6-Mac>
+Subject: [PATCH] RSX engine: a texture over the top-left rectangle of the target being drawn
+
+Upstream: not yet submitted; written to be upstreamed (generic)
+Licence: MIT, as ps3recomp (see its LICENSE); offered under the same terms
+Base: ps3recomp 4e8f3ca87a3e1d87bb83b8b7e9348fe2685cd514 (after 0001-0044)
+
+What: a texture at the current colour target's own address, with the
+target's pitch and a compatible format but smaller than the target, reads
+the target's top-left w x h pixels (on a target without antialiasing, a
+texel is a pixel). The engine accepted only a texture of the target's full
+extent as same-target feedback and dropped every other such draw ("rejected
+colour feedback"). A new optional backend call, color_snapshot_rect, copies
+that rectangle in command order (Metal: a blit of the top-left region into
+a texture of that size); the engine binds it for that draw and owns it
+(eng_surface.feedback_rect). Antialiased targets, and backends without the
+call, still reject the read as before.
+Tests: libs/video/tests/test_color_feedback_engine.c, a 128x64 read of a
+256x256 target is copied and bound, and is still rejected on a 2x1
+antialiased target.
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -106,6 +106,7 @@ typedef struct {
+     rsx_be_format fmt;
+     u32 handle;
+     u32 feedback;          /* last immutable own-target copy, engine-owned */
++    u32 feedback_rect;     /* last top-left rectangle copy (eng_color_feedback_subrect) */
+     u64 color_serial;       /* g.write_serial of the last colour write, or 0 */
+     int guest_dirty;        /* rendered since guest memory last got a copy   */
+     u32 last_use;           /* g.frames when last bound, sampled or presented */
+@@ -701,6 +702,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
+ 
+     eng_surface* s = &g.surfaces[slot];
+     if (s->feedback) { g.be->texture_release(g.be->user, s->feedback); s->feedback = 0; }
++    if (s->feedback_rect) { g.be->texture_release(g.be->user, s->feedback_rect); s->feedback_rect = 0; }
+     if (s->handle) g.be->color_target_release(g.be->user, s->handle);
+     s->location = location; s->offset = offset;
+     s->w = want_w; s->h = want_h; s->fmt = want_fmt; s->aa_grid = aa_grid;
+@@ -2452,6 +2454,24 @@ static int eng_color_feedback_compatible(const eng_surface* s,
+     return row && sp >= row && tp == sp;
+ }
+ 
++/* A texture at a non-antialiased target's own address, with the same pitch
++ * and a compatible format, that is smaller than the target: its texel (x, y)
++ * is the target's pixel (x, y), so it reads the target's top-left w x h.
++ * Gran Turismo 6 samples 362x22 and 234x71 rectangles of the 2048x2176 target
++ * it is drawing into (and 1216x684 of its 1440x1080 display buffer). On an
++ * antialiased target a texel is not a sample, so that stays rejected. */
++static int eng_color_feedback_subrect(const eng_surface* s, const rsx_dsp_texture* t,
++                                      const rsx_dsp_surface* sf)
++{
++    if (sf->aa_sx > 1 || sf->aa_sy > 1) return 0;
++    if (!t->width || !t->height || t->width > s->w || t->height > s->h ||
++        (t->width == s->w && t->height == s->h)) return 0;
++    eng_surface full = *s;
++    rsx_dsp_texture whole = *t;
++    whole.width = s->w; whole.height = s->h;
++    return eng_color_feedback_compatible(&full, &whole, sf);
++}
++
+ static u32 eng_color_feedback_failure(u32 unit, const eng_surface* s,
+                                        const rsx_dsp_texture* t)
+ {
+@@ -2544,11 +2564,25 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+             eng_surface* s = &g.surfaces[surface_at];
+             rsx_dsp_surface sf;
+             rsx_dsp_get_surface(&g.rsx, &sf);
+-            if (!eng_color_feedback_compatible(s, &t, &sf))
+-                return eng_color_feedback_failure(u, s, &t);
+             u32 k = 0;
+             while (k < n_targets && target_slots[k] != (u32)surface_at) k++;
+             if (k == n_targets) return eng_color_feedback_failure(u, s, &t);
++            if (!eng_color_feedback_compatible(s, &t, &sf)) {
++                /* A smaller rectangle at the target's address: its own copy,
++                 * this draw only (the engine owns it, as s->feedback). */
++                if (!g.be->color_snapshot_rect || !eng_color_feedback_subrect(s, &t, &sf))
++                    return eng_color_feedback_failure(u, s, &t);
++                const u32 copy = g.be->color_snapshot_rect(g.be->user, s->handle,
++                                                           t.width, t.height, s->w, s->h);
++                if (!copy) return eng_color_feedback_failure(u, s, &t);
++                if (s->feedback_rect) g.be->texture_release(g.be->user, s->feedback_rect);
++                s->feedback_rect = copy;
++                textures[u] = g.be->surface_view
++                    ? g.be->surface_view(g.be->user, copy, t.remap & 0xffffu, t.format)
++                    : ((t.remap & 0xffffu) == 0xaae4u ? copy : 0);
++                if (!textures[u]) return eng_color_feedback_failure(u, s, &t);
++                continue;
++            }
+             if (!feedback[k]) {
+                 const u32 copy = g.be->color_snapshot(g.be->user, s->handle);
+                 if (!copy) return eng_color_feedback_failure(u, s, &t);
+@@ -3473,6 +3507,7 @@ void rsx_draw_engine_shutdown(void)
+         if (g.pipelines[i].handle) g.be->pipeline_release(g.be->user, g.pipelines[i].handle);
+     for (u32 i = 0; i < g.n_surfaces; i++) {
+         if (g.surfaces[i].feedback) g.be->texture_release(g.be->user, g.surfaces[i].feedback);
++        if (g.surfaces[i].feedback_rect) g.be->texture_release(g.be->user, g.surfaces[i].feedback_rect);
+         if (g.surfaces[i].handle) g.be->color_target_release(g.be->user, g.surfaces[i].handle);
+     }
+     for (u32 i = 0; i < g.n_zdepths; i++) {
+diff --git a/libs/video/rsx_draw_engine.h b/libs/video/rsx_draw_engine.h
+--- a/libs/video/rsx_draw_engine.h
++++ b/libs/video/rsx_draw_engine.h
+@@ -252,6 +252,12 @@ typedef struct rsx_draw_backend {
+      * engine owns the returned handle and releases it with texture_release.
+      * 0 rejects the consuming draw; NULL retains the legacy guest-upload route. */
+     u32 (*color_snapshot)(void* user, u32 surface);
++    /* Optional. As color_snapshot, but of the target's top-left w x h
++     * (guest pixels of a target whose full guest extent is full_w x full_h):
++     * a texture at the target's own address, with its pitch, that is
++     * smaller than the target reads exactly that rectangle. 0 rejects the
++     * consuming draw; NULL keeps rejecting such reads. */
++    u32 (*color_snapshot_rect)(void* user, u32 surface, u32 w, u32 h, u32 full_w, u32 full_h);
+ 
+     /* Optional. 3D textures (SET_TEXTURE_FORMAT dimension 3, CONTROL3 depth):
+      * a volume of `depth` slices per level, each slice one upload of decoded
+diff --git a/libs/video/rsx_metal_backend.m b/libs/video/rsx_metal_backend.m
+--- a/libs/video/rsx_metal_backend.m
++++ b/libs/video/rsx_metal_backend.m
+@@ -3196,6 +3196,33 @@ static u32 eng_color_snapshot(void* user, u32 surface)
+     return copy;
+ }
+ 
++/* The target's top-left w x h guest pixels (full_w x full_h is the whole
++ * target), scaled to the host texture's extent; copied in command order like
++ * eng_color_snapshot. */
++static u32 eng_color_snapshot_rect(void* user, u32 surface, u32 w, u32 h, u32 full_w, u32 full_h)
++{
++    (void)user;
++    id<MTLTexture> src = eng_obj(surface);
++    if (!src || [src textureType] != MTLTextureType2D || [src sampleCount] != 1 ||
++        !w || !h || !full_w || !full_h || w > full_w || h > full_h ||
++        s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return 0; }
++    const NSUInteger dw = MAX((NSUInteger)1, (NSUInteger)(((u64)w * [src width]) / full_w));
++    const NSUInteger dh = MAX((NSUInteger)1, (NSUInteger)(((u64)h * [src height]) / full_h));
++    MTLTextureDescriptor* td =
++        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:[src pixelFormat]
++                         width:dw height:dh mipmapped:NO];
++    td.storageMode = MTLStorageModePrivate;
++    td.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
++    const u32 copy = eng_obj_add([s_dev newTextureWithDescriptor:td]);
++    if (!copy) { s_eng_dropped++; return 0; }
++    EngRecord* r = &s_eng_rec[s_eng_rec_count++];
++    memset(r, 0, sizeof *r);
++    r->kind = ENG_REC_COLOR_SNAPSHOT;
++    r->rt[0] = surface;
++    r->resolve_dst = copy;
++    return copy;
++}
++
+ static u32 eng_depth_target_create(void* user, u32 w, u32 h)
+ {
+     (void)user;
+@@ -3928,8 +3955,10 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+             const EngRecord* r = &s_eng_rec[i++];
+             id<MTLTexture> src = eng_obj(r->rt[0]);
+             id<MTLTexture> dst = eng_obj(r->resolve_dst);
+-            if (!src || !dst || [src width] != [dst width] ||
+-                [src height] != [dst height] || [src pixelFormat] != [dst pixelFormat]) {
++            /* dst is the whole target, or its top-left rectangle
++             * (eng_color_snapshot_rect). */
++            if (!src || !dst || [dst width] > [src width] ||
++                [dst height] > [src height] || [src pixelFormat] != [dst pixelFormat]) {
+                 s_eng_dropped++; continue;
+             }
+             id<MTLBlitCommandEncoder> copy = [cb blitCommandEncoder];
+@@ -3937,7 +3966,7 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+             s_ft_copies++;
+             [copy copyFromTexture:src sourceSlice:0 sourceLevel:0
+                    sourceOrigin:MTLOriginMake(0, 0, 0)
+-                     sourceSize:MTLSizeMake([src width], [src height], 1)
++                     sourceSize:MTLSizeMake([dst width], [dst height], 1)
+                       toTexture:dst destinationSlice:0 destinationLevel:0
+               destinationOrigin:MTLOriginMake(0, 0, 0)];
+             [copy endEncoding];
+@@ -4519,6 +4548,7 @@ static const rsx_draw_backend s_engine_backend = {
+     .depth_snapshot       = eng_depth_snapshot,
+     .depth_readback       = eng_depth_readback,
+     .color_snapshot       = eng_color_snapshot,
++    .color_snapshot_rect  = eng_color_snapshot_rect,
+     .depth_as_color       = eng_depth_as_color,
+     .pipeline_create      = eng_pipeline_create,
+     .pipeline_release     = eng_pipeline_release,
+diff --git a/libs/video/tests/test_color_feedback_engine.c b/libs/video/tests/test_color_feedback_engine.c
+--- a/libs/video/tests/test_color_feedback_engine.c
++++ b/libs/video/tests/test_color_feedback_engine.c
+@@ -12,6 +12,8 @@ static u32 snapshot(void* user,u32 src){(void)user;copies++;source_seen=src;retu
+ static u32 view(void* user,u32 src,u32 remap,u32 fmt){return fail_view?0:stub_surface_view(user,src,remap,fmt);}
+ static void up(void){engine_up();feedback_backend=g_stub_backend;rsx_draw_engine_set_backend(&feedback_backend);copies=0;fail_copy=fail_view=0;feedback_backend.color_snapshot=snapshot;feedback_backend.surface_view=view;m(M_SURFACE_FORMAT,0x148);m(M_COLOR_A_PITCH,1024);bind_texture_unit(RSX_LOCATION_LOCAL,0x40000);m(M_TEX_UNIT+0x18,(256<<16)|256);m(0x1840,1024);}
+ static void down(void){engine_down();feedback_backend.color_snapshot=NULL;feedback_backend.surface_view=stub_surface_view;}
++static unsigned rect_copies; static u32 rect_w, rect_h, rect_fw, rect_fh;
++static u32 snap_rect(void* user,u32 src,u32 w,u32 h,u32 fw,u32 fh){(void)user;(void)src;rect_copies++;rect_w=w;rect_h=h;rect_fw=fw;rect_fh=fh;return stub_handle();}
+ static void rejection(u32 method,u32 value){up();m(method,value);draw_triangle();T(!stub.n_draw&&copies==0,"unsupported layout rejects before draw or copy");down();}
+ int main(void){vm_base=calloc(1,GUEST_BYTES);ppu_vm_size=GUEST_BYTES;
+  up();draw_triangle();T(copies==1&&stub.n_draw==1,"own target snapshots before emitted draw");T(source_seen==stub.bound_surface&&snapshot_seen==stub.bound_tex[0]&&source_seen!=snapshot_seen,"own target binds distinct copied texture");T(stub.n_texture_create==0,"own target avoids stale guest upload");u32 prior=snapshot_seen;draw_triangle();T(copies==2&&snapshot_seen!=prior&&!stub.alive[prior],"next draw has fresh copy and retires old one");u32 last=snapshot_seen;down();T(!stub.alive[last],"shutdown releases last copy");
+@@ -37,4 +39,8 @@ int main(void){vm_base=calloc(1,GUEST_BYTES);ppu_vm_size=GUEST_BYTES;
+  up();nt=eng_current_target_set(targets);zs=eng_zdepth_get(RSX_LOCATION_LOCAL,0x40000,256,256);g.zdepths[zs].depth_serial=2;g.zdepths[zs].had_write=1;g.zdepths[zs].snapshot_valid=0;m(M_TEX_UNIT+4,1|(2<<4)|(0xB0<<8)|(1<<16));m(M_TEX_UNIT+0x18,(128<<16)|160);memset(tx,0,sizeof tx);T(g.zdepths[zs].w>128&&sink_bind_textures(targets,nt,ENG_INVALID,1,tx,ss)==1&&stub.snapshot_w==128&&stub.snapshot_h==160,"depth snapshot cropped to the sampled texture");down();
+  /* Full physical layouts and matching formats, without reinterpretation. */
+  const rsx_be_format f[]={RSX_BE_FMT_R8G8B8A8,RSX_BE_FMT_R16G16B16A16F,RSX_BE_FMT_R32G32B32A32F,RSX_BE_FMT_R32F};const u32 b[]={0xA5,0xBA,0xBB,0xBC},bp[]={4,8,16,4};for(unsigned i=0;i<4;i++){const u32 cf[4]={8,11,12,13};rsx_dsp_surface sf={.color_format=cf[i],.raster_type=1};eng_surface s={.w=128,.h=64,.fmt=f[i],.pitch=128*bp[i]};rsx_dsp_texture t={.format=b[i],.dimension=2,.width=128,.height=64,.mipmaps=1,.pitch=128*bp[i],.depth=1};T(eng_color_feedback_compatible(&s,&t,&sf),"compatible integer/float full physical layout");t.width=64;T(!eng_color_feedback_compatible(&s,&t,&sf),"logical width must not replace AA physical width");t.width=128;s.pitch=t.pitch=0;T(eng_color_feedback_compatible(&s,&t,&sf),"zero pitch means matching packed rows");s.pitch=t.pitch=128*bp[i]+64;T(eng_color_feedback_compatible(&s,&t,&sf),"matching padded pitch supported");}
++ /* A smaller texture at the target's own address and pitch reads the target's top-left
++  * rectangle: copied and bound when the backend can copy one, rejected on an AA target. */
++ up();rect_copies=0;feedback_backend.color_snapshot_rect=snap_rect;m(M_TEX_UNIT+0x18,(128<<16)|64);draw_triangle();T(rect_copies==1&&rect_w==128&&rect_h==64&&rect_fw==256&&rect_fh==256&&copies==0&&stub.n_draw==1,"top-left rectangle of the own target is copied and bound");feedback_backend.color_snapshot_rect=NULL;down();
++ up();rect_copies=0;feedback_backend.color_snapshot_rect=snap_rect;m(M_SURFACE_FORMAT,0x148|(3u<<12));m(M_TEX_UNIT+0x18,(128<<16)|64);draw_triangle();T(rect_copies==0&&!stub.n_draw,"antialiased target keeps rejecting rectangle reads");feedback_backend.color_snapshot_rect=NULL;down();
+  free(vm_base);printf("engine feedback checks=%u failures=%u\n",checks,failures);return failures?1:0;}
